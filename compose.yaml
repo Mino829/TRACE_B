@@ -1,0 +1,14 @@
+services:
+  backend:
+    build: .
+    env_file: .env
+    environment:
+      TRACE_DATABASE_PATH: /app/data/trace.db
+    ports:
+      - "8080:8080"
+    volumes:
+      - trace-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  trace-data:
