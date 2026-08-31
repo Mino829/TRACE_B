@@ -5,6 +5,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:17-alpine
@@ -19,11 +20,116 @@ jobs:
     env:
       TRACE_TEST_DATABASE_URL: postgresql://trace_test:local-ci-only@localhost:5432/trace_test?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.x"
           cache: true
       - run: go vet ./...
       - run: make integration
       - run: go build ./cmd/server
+      - name: Test staging deployment safety checks (no cloud access)
+        run: python3 -m unittest discover -s deploy/gcp/tests -v
+
+  deploy_staging:
+    name: Deploy staging after tests
+    needs: test
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      github.repository == 'Mino829/TRACE_B' && vars.STAGING_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    # Do not interrupt an in-flight traffic switch/rollback. Intermediate pending
+    # runs can be superseded; the script also rejects stale commits before release.
+    concurrency:
+      group: trace-staging-deploy
+      cancel-in-progress: false
+    env:
+      GCP_PROJECT_ID: trace-staging-507216
+      GCP_DEPLOY_SA: trace-github-deploy@trace-staging-507216.iam.gserviceaccount.com
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      # This revision's schema was manually applied and verified during initial setup.
+      STAGING_SCHEMA_BASELINE: ${{ vars.STAGING_SCHEMA_BASELINE || '624ecc1bba4a7c61529b609a1110facf58d38746' }}
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check trusted branch, latest commit, and unchanged DB schema
+        run: python3 deploy/gcp/ci_staging.py guard
+      - name: Authenticate without a service account key
+        id: gcp_access
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SA }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Keep the short-lived access token outside the source upload
+        env:
+          GCLOUD_ACCESS_TOKEN: ${{ steps.gcp_access.outputs.access_token }}
+        run: |
+          umask 077
+          token_file="$RUNNER_TEMP/trace-gcloud-access-token"
+          printf '%s' "$GCLOUD_ACCESS_TOKEN" > "$token_file"
+          printf 'CLOUDSDK_AUTH_ACCESS_TOKEN_FILE=%s\n' "$token_file" >> "$GITHUB_ENV"
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Validate and remember the existing private staging configuration
+        id: prepare
+        run: python3 deploy/gcp/ci_staging.py prepare
+      - name: Build an immutable image using the build-only service account
+        run: python3 deploy/gcp/ci_staging.py build
+      - name: Deploy a candidate without moving service traffic
+        run: python3 deploy/gcp/ci_staging.py candidate
+      - name: Obtain a fresh ID token for private health checks
+        id: candidate_token
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SA }}
+          token_format: id_token
+          id_token_audience: ${{ steps.prepare.outputs.service_url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Verify candidate DB readiness and closed registration
+        env:
+          TRACE_ID_TOKEN: ${{ steps.candidate_token.outputs.id_token }}
+        run: python3 deploy/gcp/ci_staging.py verify
+      - name: Update and execute the cleanup job
+        run: python3 deploy/gcp/ci_staging.py cleanup_job
+      - name: Refresh the ID token after the cleanup execution
+        id: release_token
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SA }}
+          token_format: id_token
+          id_token_audience: ${{ steps.prepare.outputs.service_url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Switch traffic and verify the service URL
+        env:
+          TRACE_ID_TOKEN: ${{ steps.release_token.outputs.id_token }}
+        run: python3 deploy/gcp/ci_staging.py promote
+      - name: Restore the previous traffic and cleanup image on failure
+        if: ${{ failure() || cancelled() }}
+        run: python3 deploy/gcp/ci_staging.py rollback
+      - name: Remove this run's temporary tag and credential file
+        if: ${{ always() }}
+        run: |
+          trap 'rm -f -- "$RUNNER_TEMP/trace-gcloud-access-token"' EXIT
+          python3 deploy/gcp/ci_staging.py finish

@@ -111,6 +111,10 @@ GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合�
 
 [Google Cloud構築・公開手順](docs/google-cloud.md)を参照してください。
 
+初回デプロイ後の自動更新は[検証環境のCI/CD手順](docs/staging-cicd.md)を参照してください。
+既存PostgreSQLテストの成功後だけ、mainの変更をCloud Runへ反映できます。初期状態は無効で、WIF・必要なIAM権限とGitHub変数の設定後に有効化します。
+DB構造変更は手動確認が必要です。自動更新では現在の環境設定を保持し、一般公開・参加受付開始を行いません。
+
 - API：Cloud Run（東京、最小1・最大3インスタンス、CPU常時割当）
 - DB：Cloud SQL for PostgreSQL 17（東京）
 - 接続秘密：Secret Manager、実行用サービスアカウント

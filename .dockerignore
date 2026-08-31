@@ -10,3 +10,5 @@ data/
 *.db-wal
 coverage.out
 bin/
+gha-creds-*.json
+__pycache__/

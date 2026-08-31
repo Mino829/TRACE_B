@@ -1,0 +1,9 @@
+# GitHub Actions has already passed the PostgreSQL integration tests.
+# This identity can build/push only; it cannot deploy or access DB secrets.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "--platform=linux/amd64", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1200s

@@ -9,3 +9,5 @@ bin/
 coverage.out
 deploy/gcp/runtime.env.yaml
 deploy/gcp/settings.env
+gha-creds-*.json
+__pycache__/
