@@ -1,0 +1,29 @@
+name: PostgreSQL tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: trace_test
+          POSTGRES_PASSWORD: local-ci-only
+          POSTGRES_DB: trace_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U trace_test -d trace_test"
+          --health-interval 5s --health-timeout 3s --health-retries 15
+    env:
+      TRACE_TEST_DATABASE_URL: postgresql://trace_test:local-ci-only@localhost:5432/trace_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: go vet ./...
+      - run: make integration
+      - run: go build ./cmd/server

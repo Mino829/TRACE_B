@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"math"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -10,7 +12,8 @@ import (
 
 type Config struct {
 	Address                    string
-	DatabasePath               string
+	DatabaseURL                string
+	DatabaseMaxConnections     int
 	AllowedOrigins             []string
 	RegistrationOpen           bool
 	MemoryConsentVersion       string
@@ -38,8 +41,35 @@ type Config struct {
 
 func FromEnv() (Config, error) {
 	cfg := Default()
+	if port := os.Getenv("PORT"); port != "" {
+		value, err := strconv.Atoi(port)
+		if err != nil || value < 1 || value > 65535 {
+			return Config{}, fmt.Errorf("PORT must be a valid port number")
+		}
+		cfg.Address = ":" + port
+	}
 	cfg.Address = env("TRACE_ADDRESS", cfg.Address)
-	cfg.DatabasePath = env("TRACE_DATABASE_PATH", cfg.DatabasePath)
+	if os.Getenv("TRACE_DATABASE_PATH") != "" {
+		return Config{}, fmt.Errorf("TRACE_DATABASE_PATH is no longer supported; configure PostgreSQL")
+	}
+	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
+	if cfg.DatabaseURL == "" {
+		host, user, name := os.Getenv("DB_HOST"), os.Getenv("DB_USER"), os.Getenv("DB_NAME")
+		if host == "" || user == "" || name == "" || os.Getenv("DB_PASSWORD") == "" {
+			return Config{}, fmt.Errorf("set DATABASE_URL or DB_HOST, DB_USER, DB_NAME and DB_PASSWORD")
+		}
+		u := url.URL{Scheme: "postgresql", Host: "localhost", Path: "/" + name, User: url.UserPassword(user, os.Getenv("DB_PASSWORD"))}
+		q := url.Values{"host": {host}, "sslmode": {env("DB_SSLMODE", "verify-full")}}
+		u.RawQuery = q.Encode()
+		cfg.DatabaseURL = u.String()
+	}
+	if raw := os.Getenv("TRACE_DB_MAX_CONNECTIONS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 100 {
+			return Config{}, fmt.Errorf("TRACE_DB_MAX_CONNECTIONS must be between 1 and 100")
+		}
+		cfg.DatabaseMaxConnections = n
+	}
 	cfg.MemoryConsentVersion = env("TRACE_MEMORY_CONSENT_VERSION", cfg.MemoryConsentVersion)
 	cfg.LiveConsentVersion = env("TRACE_LIVE_CONSENT_VERSION", cfg.LiveConsentVersion)
 	cfg.OnSiteConsentVersion = env("TRACE_ON_SITE_CONSENT_VERSION", cfg.OnSiteConsentVersion)
@@ -83,13 +113,20 @@ func FromEnv() (Config, error) {
 	if cfg.PositionQuantizationMeters <= 0 || cfg.MaxPositionAccuracyMeters <= 0 {
 		return Config{}, fmt.Errorf("position limits must be positive")
 	}
+	if cfg.MinLatitude < -90 || cfg.MaxLatitude > 90 || cfg.MinLongitude < -180 || cfg.MaxLongitude > 180 ||
+		cfg.OriginLatitude < cfg.MinLatitude || cfg.OriginLatitude > cfg.MaxLatitude || cfg.OriginLongitude < cfg.MinLongitude || cfg.OriginLongitude > cfg.MaxLongitude {
+		return Config{}, fmt.Errorf("geofence must be valid coordinates and contain the origin")
+	}
+	if cfg.LivePositionTTL < 30*time.Second || cfg.LivePositionTTL > 60*time.Second {
+		return Config{}, fmt.Errorf("TRACE_LIVE_POSITION_TTL must be between 30s and 60s")
+	}
 	return cfg, nil
 }
 
 func Default() Config {
 	return Config{
 		Address:                    ":8080",
-		DatabasePath:               "trace.db",
+		DatabaseMaxConnections:     5,
 		AllowedOrigins:             []string{"http://localhost:3000"},
 		RegistrationOpen:           true,
 		MemoryConsentVersion:       "2026-memory-01",
@@ -152,8 +189,8 @@ func floatEnv(name string, target *float64) error {
 		return nil
 	}
 	value, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("%s must be a finite number", name)
 	}
 	*target = value
 	return nil

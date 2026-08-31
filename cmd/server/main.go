@@ -16,18 +16,56 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	cfg, err := config.FromEnv()
 	if err != nil {
 		slog.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
 
-	db, err := store.Open(cfg.DatabasePath)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelStartup()
+	db, err := store.Open(startupCtx, cfg.DatabaseURL, cfg.DatabaseMaxConnections)
 	if err != nil {
 		slog.Error("open database", "error", err)
 		os.Exit(1)
 	}
 	defer db.Close()
+	mode := "serve"
+	if len(os.Args) > 1 {
+		mode = os.Args[1]
+	}
+	switch mode {
+	case "migrate":
+		if err := db.Migrate(startupCtx); err != nil {
+			slog.Error("migration failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("database migration complete")
+		return
+	case "cleanup":
+		if err := db.Cleanup(startupCtx, time.Now().UTC()); err != nil {
+			slog.Error("cleanup failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("database cleanup complete")
+		return
+	case "serve":
+	default:
+		slog.Error("usage: trace-backend [serve|migrate|cleanup]")
+		os.Exit(1)
+	}
+	if err := db.Ping(startupCtx); err != nil {
+		slog.Error("schema not ready; run migrate first")
+		os.Exit(1)
+	}
+	if err := db.Cleanup(startupCtx, time.Now().UTC()); err != nil {
+		slog.Error("startup cleanup failed", "error", err)
+		os.Exit(1)
+	}
+	cancelStartup()
 
 	server := &http.Server{
 		Addr:              cfg.Address,
@@ -38,10 +76,10 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go cleanupExpired(ctx, db)
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -55,6 +93,7 @@ func main() {
 		slog.Error("serve", "error", err)
 		os.Exit(1)
 	}
+	<-shutdownDone
 }
 
 func cleanupExpired(ctx context.Context, db *store.Store) {
@@ -65,9 +104,11 @@ func cleanupExpired(ctx context.Context, db *store.Store) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if err := db.Cleanup(ctx, now.UTC()); err != nil && ctx.Err() == nil {
+			cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := db.Cleanup(cleanupCtx, now.UTC()); err != nil && ctx.Err() == nil {
 				slog.Error("cleanup expired data", "error", err)
 			}
+			cancel()
 		}
 	}
 }

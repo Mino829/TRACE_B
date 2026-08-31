@@ -1,14 +1,47 @@
 services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: trace
+      POSTGRES_USER: trace
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set a local password}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - trace-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trace -d trace"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+  migrate:
+    build: .
+    env_file: .env
+    environment: &database
+      DATABASE_URL: ""
+      DB_HOST: db
+      DB_NAME: trace
+      DB_USER: trace
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      DB_SSLMODE: disable
+    command: ["migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
   backend:
     build: .
     env_file: .env
     environment:
-      TRACE_DATABASE_PATH: /app/data/trace.db
+      <<: *database
+      PORT: "8080"
     ports:
-      - "8080:8080"
-    volumes:
-      - trace-data:/app/data
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:
-  trace-data:
+  trace-postgres-data:

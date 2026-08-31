@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+data/
+bin/
+coverage.out
+deploy/gcp/runtime.env.yaml
+deploy/gcp/settings.env

@@ -2,16 +2,20 @@ package api_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Mino829/trace_Backend/internal/api"
 	"github.com/Mino829/trace_Backend/internal/config"
 	"github.com/Mino829/trace_Backend/internal/store"
+	"github.com/Mino829/trace_Backend/internal/testdb"
 )
 
 type createdExperience struct {
@@ -26,12 +30,126 @@ type createdExperience struct {
 	} `json:"livePresenceSession"`
 }
 
-func TestExperiencePositionStopAndDelete(t *testing.T) {
-	db, err := store.Open(":memory:")
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func TestConcurrentDeleteAcrossInstancesAndCredentialBinding(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := config.Default()
+	handler := api.New(cfg, f.Store)
+	second, err := store.Open(t.Context(), f.URL, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	defer second.Close()
+	other := api.New(cfg, second)
+	created := createExperience(t, handler, cfg)
+	headers := map[string]string{"Authorization": "Bearer " + created.Live.ParticipantToken, "Idempotency-Key": "same-delete"}
+	path := "/v1/live-presence-sessions/" + created.Live.SessionID
+	var wg sync.WaitGroup
+	results := make(chan int, 12)
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			h := handler
+			if i%2 == 0 {
+				h = other
+			}
+			results <- request(t, h, "DELETE", path, "", headers).Code
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	for status := range results {
+		if status != 204 {
+			t.Fatalf("concurrent delete: %d", status)
+		}
+	}
+	for _, token := range []string{"", created.Memory.ParticipantToken, "wrong"} {
+		r := request(t, handler, "DELETE", path, "", map[string]string{"Authorization": "Bearer " + token, "Idempotency-Key": "same-delete"})
+		if r.Code != 401 {
+			t.Fatalf("unauthorized replay status %d", r.Code)
+		}
+	}
+	if err := f.Store.AuthenticateMemory(t.Context(), created.Memory.SessionID, tokenHash(created.Memory.ParticipantToken), time.Now()); err != nil {
+		t.Fatal("live deletion removed memory session")
+	}
+}
+
+func TestStopRaceAndRollback(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := config.Default()
+	h := api.New(cfg, f.Store)
+	c := createExperience(t, h, cfg)
+	path := "/v1/live-presence-sessions/" + c.Live.SessionID
+	start := make(chan struct{})
+	done := make(chan int, 2)
+	body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, time.Now().UTC().Format(time.RFC3339Nano))
+	go func() {
+		<-start
+		done <- request(t, h, "POST", path+"/position", body, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken}).Code
+	}()
+	go func() {
+		<-start
+		done <- request(t, h, "POST", path+"/stop", `{"reason":"participant_request"}`, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken, "Idempotency-Key": "stop-race"}).Code
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		status := <-done
+		if status != 200 && status != 409 {
+			t.Fatalf("race status %d", status)
+		}
+	}
+	session, p, err := f.Store.LiveSession(t.Context(), c.Live.SessionID)
+	if err != nil || p != nil || session.TrackingStatus != "stopped" {
+		t.Fatal("position survived stop")
+	}
+	// Deliberately force receipt insertion to fail. The DELETE must roll back.
+	if _, err := f.SQL.ExecContext(t.Context(), `ALTER TABLE idempotency_records ADD CONSTRAINT reject_delete CHECK (response_status <> 204)`); err != nil {
+		t.Fatal(err)
+	}
+	r := request(t, h, "DELETE", "/v1/memory-sessions/"+c.Memory.SessionID, "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken, "Idempotency-Key": "rollback"})
+	if r.Code != 500 {
+		t.Fatalf("failed receipt status %d", r.Code)
+	}
+	if err := f.Store.AuthenticateMemory(t.Context(), c.Memory.SessionID, tokenHash(c.Memory.ParticipantToken), time.Now()); err != nil {
+		t.Fatal("mutation committed without receipt")
+	}
+}
+
+func TestPositionValidationAndSessionIsolation(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := config.Default()
+	h := api.New(cfg, f.Store)
+	c := createExperience(t, h, cfg)
+	path := "/v1/live-presence-sessions/" + c.Live.SessionID + "/position"
+	for _, tt := range []struct {
+		lat, accuracy float64
+		at            time.Time
+		code          string
+	}{
+		{36, 8, time.Now(), "OUTSIDE_GEOFENCE"}, {35, 200, time.Now(), "LOW_ACCURACY"},
+		{35, 8, time.Now().Add(-3 * time.Minute), "TOO_OLD"}, {35, 8, time.Now().Add(time.Minute), "FUTURE_TIME"},
+	} {
+		body := fmt.Sprintf(`{"point":{"latitude":%v,"longitude":135,"accuracyM":%v,"recordedAt":%q}}`, tt.lat, tt.accuracy, tt.at.UTC().Format(time.RFC3339Nano))
+		r := request(t, h, "POST", path, body, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken})
+		var response struct{ Error struct{ Code string } }
+		json.Unmarshal(r.Body.Bytes(), &response)
+		if r.Code != 422 || response.Error.Code != tt.code {
+			t.Fatalf("validation: %d %s", r.Code, r.Body.String())
+		}
+	}
+	r := request(t, h, "POST", path, "{}", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
+	if r.Code != 401 {
+		t.Fatal("memory credential accepted by live API")
+	}
+}
+
+func TestExperiencePositionStopAndDelete(t *testing.T) {
+	db := testdb.Open(t).Store
 	cfg := config.Default()
 	handler := api.New(cfg, db)
 
@@ -92,11 +210,7 @@ func TestExperiencePositionStopAndDelete(t *testing.T) {
 }
 
 func TestConsentAndAuthenticationFailures(t *testing.T) {
-	db, err := store.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := testdb.Open(t).Store
 	cfg := config.Default()
 	handler := api.New(cfg, db)
 

@@ -45,11 +45,11 @@ func New(cfg config.Config, db *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/public/config", server.publicConfig)
 	mux.HandleFunc("POST /v1/experiences", server.createExperience)
 	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.experienceState)
-	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.updatePosition)
-	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.onSite)
-	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.stopLive)
-	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.deleteMemory)
-	mux.HandleFunc("DELETE /v1/live-presence-sessions/{liveSessionId}", server.deleteLive)
+	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.atomic((*Server).updatePosition))
+	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.atomic((*Server).onSite))
+	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.atomic((*Server).stopLive))
+	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.atomic((*Server).deleteMemory))
+	mux.HandleFunc("DELETE /v1/live-presence-sessions/{liveSessionId}", server.atomic((*Server).deleteLive))
 	return server.middleware(mux)
 }
 
@@ -79,8 +79,9 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 				s.writeError(w, requestID, &apiError{Code: "INTERNAL_ERROR", Message: "internal server error", Status: http.StatusInternalServerError})
 			}
 		}()
-		_ = s.store.Cleanup(r.Context(), s.now().UTC())
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, requestID)))
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, requestIDKey{}, requestID)))
 	})
 }
 
@@ -276,7 +277,7 @@ func (s *Server) updatePosition(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, r, storeErr)
 		return
 	}
-	if session.TrackingStatus != "tracking" || now.After(session.ExpiresAt) {
+	if session.TrackingStatus != "tracking" || !now.Before(session.ExpiresAt) {
 		s.writeError(w, requestID(r), &apiError{Code: "TRACKING_STOPPED", Message: "tracking is not active", Status: http.StatusConflict})
 		return
 	}
@@ -297,11 +298,13 @@ func (s *Server) updatePosition(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	expires := now.Add(s.cfg.LivePositionTTL)
+	if expires.After(session.ExpiresAt) {
+		expires = session.ExpiresAt
+	}
 	if err := s.store.SavePosition(r.Context(), liveID, store.Position{
 		X: x, Z: z, AccuracyM: point.AccuracyM, RecordedAt: point.RecordedAt.UTC(), ReceivedAt: now, ExpiresAt: expires,
 	}); err != nil {
-		slog.Error("save position", "requestId", requestID(r), "error", err)
-		s.writeError(w, requestID(r), internalError())
+		s.writeStoreError(w, r, err)
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "latestRecordedAt": point.RecordedAt.UTC(), "expiresAt": expires})
@@ -407,7 +410,10 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, kind, id 
 		s.writeStoreError(w, r, err)
 		return
 	}
-	s.saveIdempotency(r, scope, nil, http.StatusNoContent, nil)
+	if err := s.saveIdempotency(r, scope, nil, http.StatusNoContent, nil); err != nil {
+		s.writeError(w, requestID(r), internalError())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -449,12 +455,18 @@ func (s *Server) toLocal(latitude, longitude float64) (float64, float64) {
 }
 
 func (s *Server) replayIdempotent(w http.ResponseWriter, r *http.Request, scope string, body []byte) bool {
+	token, authErr := bearerToken(r)
+	if authErr != nil {
+		s.writeError(w, requestID(r), authErr)
+		return true
+	}
 	key := r.Header.Get("Idempotency-Key")
 	if key == "" || len(key) > 200 {
 		s.writeError(w, requestID(r), &apiError{Code: "IDEMPOTENCY_KEY_REQUIRED", Message: "a valid Idempotency-Key header is required", Status: http.StatusBadRequest})
 		return true
 	}
-	record, err := s.store.GetIdempotency(r.Context(), scope, hash(key), s.now().UTC())
+	// Binding the receipt to credentials allows safe replay after the session was deleted.
+	record, err := s.store.GetIdempotency(r.Context(), hash(scope), hash(key+"\x00"+token), s.now().UTC())
 	if errors.Is(err, store.ErrNotFound) {
 		return false
 	}
@@ -481,20 +493,25 @@ func (s *Server) writeIdempotentJSON(w http.ResponseWriter, r *http.Request, sco
 		return
 	}
 	body = append(body, '\n')
-	s.saveIdempotency(r, scope, requestBody, status, body)
+	if err := s.saveIdempotency(r, scope, requestBody, status, body); err != nil {
+		s.writeError(w, requestID(r), internalError())
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
 }
 
-func (s *Server) saveIdempotency(r *http.Request, scope string, requestBody []byte, status int, responseBody []byte) {
+func (s *Server) saveIdempotency(r *http.Request, scope string, requestBody []byte, status int, responseBody []byte) error {
 	if responseBody == nil {
 		responseBody = []byte{}
 	}
-	if err := s.store.SaveIdempotency(r.Context(), scope, hash(r.Header.Get("Idempotency-Key")),
-		hashBytes(requestBody), status, responseBody, s.now().UTC().Add(24*time.Hour)); err != nil {
-		slog.Error("save idempotency", "requestId", requestID(r), "error", err)
+	token, err := bearerToken(r)
+	if err != nil {
+		return err
 	}
+	return s.store.SaveIdempotency(r.Context(), hash(scope), hash(r.Header.Get("Idempotency-Key")+"\x00"+token),
+		hashBytes(requestBody), status, responseBody, s.now().UTC().Add(24*time.Hour))
 }
 
 func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
