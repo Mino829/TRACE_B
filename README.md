@@ -12,6 +12,7 @@
 - 複数プロセスをまたぐDBロックとトランザクション。停止・削除と再送用記録を一括確定
 - PostgreSQLの時刻型・外部キー・索引、上限付き接続プール
 - CORS応答、16KB JSON上限、ヘルスチェック、JSONログ
+- CloudflareサイトWorker向けの共有シークレット検証（設定時、`/v1/*`のみ）
 - 明示的なDBマイグレーションと期限削除コマンド
 
 | メソッド | エンドポイント |
@@ -110,6 +111,7 @@ GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合�
 ## Google Cloudへ配置
 
 [Google Cloud構築・公開手順](docs/google-cloud.md)を参照してください。
+[Cloudflare参加者サイトからの接続条件](docs/cloudflare-origin.md)には、公開経路を有効化する前の条件をまとめています。現在のstagingはIAM保護されたままです。
 
 初回デプロイ後の自動更新は[検証環境のCI/CD手順](docs/staging-cicd.md)を参照してください。
 既存PostgreSQLテストの成功後だけ、mainの変更をCloud Runへ反映できます。初期状態は無効で、WIF・必要なIAM権限とGitHub変数の設定後に有効化します。

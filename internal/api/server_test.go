@@ -35,6 +35,31 @@ func tokenHash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func TestEdgeSecretProtectsPublicAPIWithoutBlockingLiveness(t *testing.T) {
+	cfg := config.Default()
+	cfg.EdgeSharedSecret = "a-32-byte-secret-for-cloudflare-edge"
+	handler := api.New(cfg, nil)
+	for _, tt := range []struct {
+		path, secret string
+		status       int
+	}{
+		{"/v1/public/config", "", http.StatusForbidden},
+		{"/v1/public/config", "wrong", http.StatusForbidden},
+		{"/v1/public/config", cfg.EdgeSharedSecret, http.StatusOK},
+		{"/health/live", "", http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+		if tt.secret != "" {
+			req.Header.Set("X-Trace-Edge-Secret", tt.secret)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != tt.status {
+			t.Errorf("%s with secret %t: got %d, want %d", tt.path, tt.secret != "", response.Code, tt.status)
+		}
+	}
+}
+
 func TestConcurrentDeleteAcrossInstancesAndCredentialBinding(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
