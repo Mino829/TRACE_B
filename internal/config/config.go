@@ -15,6 +15,7 @@ type Config struct {
 	DatabaseURL                string
 	DatabaseMaxConnections     int
 	AllowedOrigins             []string
+	EdgeSharedSecret           string
 	RegistrationOpen           bool
 	MemoryConsentVersion       string
 	LiveConsentVersion         string
@@ -49,6 +50,10 @@ func FromEnv() (Config, error) {
 		cfg.Address = ":" + port
 	}
 	cfg.Address = env("TRACE_ADDRESS", cfg.Address)
+	cfg.EdgeSharedSecret = os.Getenv("TRACE_EDGE_SHARED_SECRET")
+	if cfg.EdgeSharedSecret != "" && len(cfg.EdgeSharedSecret) < 32 {
+		return Config{}, fmt.Errorf("TRACE_EDGE_SHARED_SECRET must have at least 32 bytes")
+	}
 	if os.Getenv("TRACE_DATABASE_PATH") != "" {
 		return Config{}, fmt.Errorf("TRACE_DATABASE_PATH is no longer supported; configure PostgreSQL")
 	}

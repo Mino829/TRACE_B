@@ -1,0 +1,31 @@
+# Cloudflare参加者サイトからGo APIへの接続
+
+- 状態: staging統合向け実装。一般参加者への公開手順ではない
+- Web: `TRACE_F`の静的サイト用`trace-log` Worker
+- API: このリポジトリのGoサーバーをCloud Run東京で実行
+- 正本DB: Cloud SQL for PostgreSQL東京
+
+## 認証境界
+
+サイトWorkerは許可した`/api/backend/*`だけをGoの`/v1/*`などへ転送し、`X-Trace-Edge-Secret`を追加する。Goは`TRACE_EDGE_SHARED_SECRET`が設定されている場合、すべての`/v1/*`リクエストで一致を要求する。値が未設定なら既存のAPI動作を維持するため、**公開用Cloud RunではSecret Managerから設定することが必須**。32バイト未満の値では起動を拒否する。
+
+これはWorkerとGoの間のアクセス制限であり、参加者のBearer token、CORS、受付停止、レート制限の代わりにはならない。`/health/live`と`/health/ready`は監視用にこのヘッダーを要求しない。Workerのsecretをブラウザへ渡さず、Goもヘッダー値をログへ出さない。
+
+既存のstagingはCloud Run IAMで非公開にしている。共有ヘッダーだけではIAM認証を通過できないため、stagingの公開権限を変更せず、検証用の接続経路を別途設計する。本番用サービスも`--allow-unauthenticated`を設定する前に、以下を完了する。既存の`deploy/gcp/deploy.sh`は非公開設定のまま維持する。
+
+## 公開経路を有効化する前の条件
+
+1. stagingとproductionのCloud Run、Cloud SQL、Secret Manager、Worker、ドメイン、データを分離する。
+2. Web側の`TRACE_BACKEND_URL`とGo側のsecretを設定し、Worker経由は成功、Goへの直接リクエストは403になることを確認する。
+3. `TRACE_REGISTRATION_OPEN=false`で起動し、承認済み同意文、連絡先、保存期間、豊洲キャンパスのgeofenceと原点を設定する。コードの初期座標はサンプル値である。
+4. 匿名のセッション作成と位置送信へ、共有IPを考慮したレート制限と監視を用意する。現行APIにレート制限はない。
+5. Cloudflareサイトからの参加開始、位置送信、停止、両セッション削除を実機と検証DBで通す。写真、到着QR、描画WebSocketは実装後に別途試験する。
+6. 期限削除ジョブ、DB接続上限、障害時の受付停止、WebとGoのロールバック手順を確認する。
+
+Cloud RunのWebSocketにはリクエスト時間の上限がある。描画用APIを追加するときは、会場クライアントの再接続と状態再同期を検証する。
+
+## 参照
+
+- [Google Cloudの既存配置手順](google-cloud.md)
+- [staging CI/CD](staging-cicd.md)
+- [Cloud Run WebSocket仕様](https://docs.cloud.google.com/run/docs/triggering/websockets)
