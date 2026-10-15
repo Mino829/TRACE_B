@@ -81,8 +81,21 @@ func Open(ctx context.Context, dsn string, maxConnections int) (*Store, error) {
 }
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Ping(ctx context.Context) error {
-	var version int
-	return s.q.QueryRowContext(ctx, "SELECT version FROM schema_migrations WHERE version=1").Scan(&version)
+	if migrationsErr != nil {
+		return migrationsErr
+	}
+	return s.pingVersion(ctx, len(migrations))
+}
+
+func (s *Store) pingVersion(ctx context.Context, version int) error {
+	count, oldest, newest, err := schemaVersion(ctx, s.q)
+	if err != nil {
+		return err
+	}
+	if count != version || oldest != 1 || newest != count {
+		return errors.New("database schema does not match this application; run migrate or deploy a compatible version")
+	}
+	return nil
 }
 
 // Transaction serializes operations on a session across Cloud Run instances.

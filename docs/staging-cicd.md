@@ -174,7 +174,7 @@ GitHub Actionsの設定だけでなく、Google側でも特定リポジトリ・
 6. Actionsの `Deploy staging after tests` が成功し、Summaryにコミット・digest・リビジョンが表示されることを確認する。
 7. Cloud Runの配信先がそのリビジョンであること、削除ジョブが同じdigestで動くことを確認する。
 
-`STAGING_SCHEMA_BASELINE` は通常は未設定で構いません。手動のDB変更を検証した後だけ、そのDB構造に対応するフルコミットSHAへ変更します。
+`STAGING_SCHEMA_BASELINE` は通常は未設定で構いません。migration実装・SQL・権限SQLに変更がある場合は自動デプロイを止め、手動適用・権限・ready・旧版互換性を確認した後に限り、そのDB構造に対応するmainのフルコミットSHAへ更新します。コード変更をマージしただけではbaselineを進めません。
 GitHub Environmentの有料プラン機能には依存していません。利用できる場合はmainの保護ルールとCIファイルへのレビュー要件を追加してください。
 依存Actionsは検証時のコミットSHAで固定しているため、更新はレビューして行います。
 
@@ -183,7 +183,13 @@ GitHub Environmentの有料プラン機能には依存していません。利�
 - 自動化を止める：Repository variable `STAGING_DEPLOY_ENABLED=false`。実行中のジョブは止まらず、新しい実行から無効になる。
 - デプロイは直列実行。新しいmainがある古い実行は安全側に倒して失敗終了する。途中のpending実行はGitHubによって置き換えられることがある。
 - 手動デプロイやDB変更は同じタイミングで行わない。自動化を無効化し、実行中デプロイが完了してから作業する。
-- DB変更：自動化を止め、レビュー済みの後方互換マイグレーション・必要な権限付与を手動で行い、旧APIと新APIの互換性を確認してからbaselineを進める。schema versionを増やす実装自体も別途必要。
+- DB変更：自動化を止め、レビュー済みの後方互換migration・必要な権限付与を手動で行い、旧APIと新APIの互換性を確認してからbaselineを進める。適用済みSQLの編集やDBの自動ダウングレードは行わない。
+  1. `STAGING_DEPLOY_ENABLED=false`にし、進行中の配信・清掃ジョブが終わったことを確認する。DBをバックアップし、停止できる旧API・清掃ジョブ、直前イメージとschema版を記録する。version 1の存在しか調べない以前のバイナリは新版schemaを検知できないため、非互換変更の前に停止・置換する。
+  2. 適用済み`001_initial.sql`は改変せず、`002_名前.sql`以降を連番で追加する。まず専用DBで初回/追加/再実行/競合/失敗時のrollbackを検証し、stagingでトランザクションとロック時間を確認する。DDLはexpand-contractとし、非互換の旧アプリを同じDBで稼働させない。DB更新後、互換性のある旧版へしかアプリを戻せない。
+  3. migration用の新しいイメージを手動ビルドして`GCP_IMAGE`へ指定し、所有者の`bash deploy/gcp/deploy.sh migrate`を実行する。`schema_migrations`の版が1から連続し、期待版まで適用されたことを確認する。失敗したら旧APIへトラフィックを移さず原因を調べる（DDLはトランザクションごとrollback、DBを自動で巻き戻さない）。
+  4. `trace_owner`で`deploy/gcp/runtime-grants.sql`を適用し、追加テーブルには明示的に必要な`trace_app`権限だけを付与する。`trace_app`接続で`schema_migrations`のSELECT、新規テーブルの必要操作、DDL不可を確認する。DB接続が成功しても権限の誤設定はready検査だけでは見つからない。
+  5. 同じ版に対応する新APIを一時タグへデプロイし、`/health/ready`と受付停止設定、既存E2Eを確認した後に昇格する。新しいschemaを扱えない旧API/清掃ジョブはready/起動に失敗する（新版判定実装済みのバイナリのみ）。再実行は適用済み版を飛ばす。
+  6. 手動検証を記録して`STAGING_SCHEMA_BASELINE`を対応するmainのフルSHAへ更新し、自動化を再開する。単なるアプリrollbackはDBを戻さないため、直前イメージが現行schemaに対応できない場合は切り戻さず受付停止を維持し、forward migrationなどの復旧計画を決める。
 - スクリプトはmigration実装・SQLディレクトリ・権限SQLの差分を検知するもので、任意のGoコードが行うDB変更を完全に検知するセキュリティ境界ではない。
 - 候補起動で失敗：通常のAPIトラフィックは旧版のまま。一時タグは終了処理で外す。
 - 削除ジョブまたは切替後の確認で失敗：旧配信先・旧削除イメージへ復旧を試みる。元の失敗はActions上で失敗のまま残す。
