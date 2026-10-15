@@ -104,6 +104,8 @@ def check_runtime(spec, mode):
             raise RefuseRelease(f"Review existing runtime setting: {key}")
     if "DATABASE_URL" in env:
         raise RefuseRelease("DATABASE_URL overrides DB_*; review it manually before enabling CI")
+    if "TRACE_SESSION_TTL" in env:
+        raise RefuseRelease("TRACE_SESSION_TTL is obsolete; migrate service environment first")
     secret = env.get("DB_PASSWORD", {}).get("valueFrom", {}).get("secretKeyRef", {})
     if secret.get("name") != "trace-app-db-password" or not re.fullmatch(r"[1-9][0-9]*", secret.get("key", "")):
         raise RefuseRelease("DB_PASSWORD must reference a numbered app-password Secret version")
@@ -160,6 +162,10 @@ class Release:
         if any(member in ("allUsers", "allAuthenticatedUsers")
                for binding in policy.get("bindings", []) for member in binding.get("members", [])):
             raise RefuseRelease("Public IAM binding found; review it manually")
+        max_scale = (service.get("spec", {}).get("template", {}).get("metadata", {})
+                     .get("annotations", {}).get("autoscaling.knative.dev/maxScale"))
+        if max_scale != "1":
+            raise RefuseRelease("Go-memory positions require a Cloud Run maximum of one API instance")
         check_runtime(service["spec"]["template"]["spec"], "serve")
         check_runtime(job_spec(job), "cleanup")
 

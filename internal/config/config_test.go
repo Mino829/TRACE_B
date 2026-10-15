@@ -8,7 +8,7 @@ import (
 
 func baseEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_EDGE_SHARED_SECRET"} {
+	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_SESSION_TTL", "TRACE_MEMORY_SESSION_TTL", "TRACE_LIVE_SESSION_TTL", "TRACE_DATA_RETENTION", "TRACE_EDGE_SHARED_SECRET"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgresql://local:local@localhost/trace?sslmode=disable")
@@ -52,7 +52,8 @@ func TestRejectInvalidConfiguration(t *testing.T) {
 	for _, tt := range []struct{ key, value string }{
 		{"PORT", "0"}, {"PORT", "abc"}, {"TRACE_DB_MAX_CONNECTIONS", "0"},
 		{"TRACE_DATABASE_PATH", "trace.db"}, {"TRACE_MIN_LATITUDE", "NaN"}, {"TRACE_MIN_LATITUDE", "-91"},
-		{"TRACE_LIVE_POSITION_TTL", "5m"}, {"DATABASE_URL", ""},
+		{"TRACE_LIVE_POSITION_TTL", "5m"}, {"TRACE_MEMORY_SESSION_TTL", "0s"},
+		{"TRACE_LIVE_SESSION_TTL", "-1h"}, {"TRACE_SESSION_TTL", "6h"}, {"DATABASE_URL", ""},
 		{"TRACE_EDGE_SHARED_SECRET", "too-short"},
 	} {
 		t.Run(tt.key+tt.value, func(t *testing.T) {
@@ -62,6 +63,15 @@ func TestRejectInvalidConfiguration(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+func TestIndependentSessionDurations(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("TRACE_MEMORY_SESSION_TTL", "2h")
+	t.Setenv("TRACE_LIVE_SESSION_TTL", "45m")
+	cfg, err := FromEnv()
+	if err != nil || cfg.MemorySessionTTL.Hours() != 2 || cfg.LiveSessionTTL.Minutes() != 45 {
+		t.Fatalf("independent session lifetimes: %+v, %v", cfg, err)
 	}
 }
 func TestDatabaseMissingDoesNotExposeSecrets(t *testing.T) {

@@ -25,7 +25,8 @@ type Config struct {
 	Contact                    string
 	PositionIntervalSeconds    int
 	LivePositionTTL            time.Duration
-	SessionTTL                 time.Duration
+	MemorySessionTTL           time.Duration
+	LiveSessionTTL             time.Duration
 	DataRetention              time.Duration
 	CoordinateVersion          string
 	CampusGraphVersion         string
@@ -58,6 +59,9 @@ func FromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("TRACE_DATABASE_PATH is no longer supported; configure PostgreSQL")
 	}
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
+	if os.Getenv("TRACE_SESSION_TTL") != "" {
+		return Config{}, fmt.Errorf("TRACE_SESSION_TTL is obsolete; set TRACE_MEMORY_SESSION_TTL and TRACE_LIVE_SESSION_TTL")
+	}
 	if cfg.DatabaseURL == "" {
 		host, user, name := os.Getenv("DB_HOST"), os.Getenv("DB_USER"), os.Getenv("DB_NAME")
 		if host == "" || user == "" || name == "" || os.Getenv("DB_PASSWORD") == "" {
@@ -90,9 +94,10 @@ func FromEnv() (Config, error) {
 		return Config{}, err
 	}
 	for name, target := range map[string]*time.Duration{
-		"TRACE_LIVE_POSITION_TTL": &cfg.LivePositionTTL,
-		"TRACE_SESSION_TTL":       &cfg.SessionTTL,
-		"TRACE_DATA_RETENTION":    &cfg.DataRetention,
+		"TRACE_LIVE_POSITION_TTL":  &cfg.LivePositionTTL,
+		"TRACE_MEMORY_SESSION_TTL": &cfg.MemorySessionTTL,
+		"TRACE_LIVE_SESSION_TTL":   &cfg.LiveSessionTTL,
+		"TRACE_DATA_RETENTION":     &cfg.DataRetention,
 	} {
 		if err := durationEnv(name, target); err != nil {
 			return Config{}, err
@@ -125,6 +130,9 @@ func FromEnv() (Config, error) {
 	if cfg.LivePositionTTL < 30*time.Second || cfg.LivePositionTTL > 60*time.Second {
 		return Config{}, fmt.Errorf("TRACE_LIVE_POSITION_TTL must be between 30s and 60s")
 	}
+	if cfg.MemorySessionTTL <= 0 || cfg.LiveSessionTTL <= 0 || cfg.DataRetention <= 0 {
+		return Config{}, fmt.Errorf("session and retention durations must be positive")
+	}
 	return cfg, nil
 }
 
@@ -142,7 +150,8 @@ func Default() Config {
 		Contact:                    "運営担当者へお問い合わせください",
 		PositionIntervalSeconds:    5,
 		LivePositionTTL:            60 * time.Second,
-		SessionTTL:                 6 * time.Hour,
+		MemorySessionTTL:           6 * time.Hour,
+		LiveSessionTTL:             6 * time.Hour,
 		DataRetention:              24 * time.Hour,
 		CoordinateVersion:          "campus-2026-01",
 		CampusGraphVersion:         "graph-2026-01",

@@ -102,11 +102,15 @@ func main() {
 
 func cleanupExpired(ctx context.Context, db *store.Store) {
 	ticker := time.NewTicker(30 * time.Second)
+	positionTicker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	defer positionTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case now := <-positionTicker.C:
+			db.PurgePositions(now.UTC())
 		case now := <-ticker.C:
 			cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			if err := db.Ping(cleanupCtx); err != nil {

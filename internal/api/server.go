@@ -46,6 +46,7 @@ func New(cfg config.Config, db *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/public/config", server.publicConfig)
 	mux.HandleFunc("POST /v1/experiences", server.createExperience)
 	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.experienceState)
+	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.deleteExperience)
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.atomic((*Server).updatePosition))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.atomic((*Server).onSite))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.atomic((*Server).stopLive))
@@ -187,15 +188,18 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 	experienceID := randomID("exp")
 	memoryID := randomID("mem")
 	liveID := randomID("live")
-	expires := now.Add(s.cfg.SessionTTL)
-	deleteAfter := expires.Add(s.cfg.DataRetention)
+	memoryExpires := now.Add(s.cfg.MemorySessionTTL)
+	memoryDeleteAfter := memoryExpires.Add(s.cfg.DataRetention)
+	liveExpires := now.Add(s.cfg.LiveSessionTTL)
+	liveDeleteAfter := liveExpires.Add(s.cfg.DataRetention)
 	color, symbol := displayAlias(experienceID)
 	value := store.NewExperience{
 		ExperienceID: experienceID, MemorySessionID: memoryID, LiveSessionID: liveID, LinkID: randomID("link"),
 		MemoryTokenHash: hash(memoryToken), LiveTokenHash: hash(liveToken), LinkTokenHash: hash(linkToken),
 		MemoryConsent: input.MemoryConsentVersion, LiveConsent: input.LivePresenceConsentVersion,
 		ConsentLanguage: input.ConsentLanguage, DisplayColor: color, DisplaySymbol: symbol,
-		CreatedAt: now, ExpiresAt: expires, DeleteAfter: deleteAfter, LivePresence: input.EnableLivePresence,
+		CreatedAt: now, MemoryExpiresAt: memoryExpires, MemoryDeleteAfter: memoryDeleteAfter,
+		LiveExpiresAt: liveExpires, LiveDeleteAfter: liveDeleteAfter, LivePresence: input.EnableLivePresence,
 	}
 	if err := s.store.CreateExperience(r.Context(), value); err != nil {
 		slog.Error("create experience", "requestId", requestID(r), "error", err)
@@ -203,17 +207,18 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := map[string]any{
-		"experienceId":            experienceID,
-		"memorySession":           map[string]string{"sessionId": memoryID, "participantToken": memoryToken},
+		"experienceId": experienceID,
+		"memorySession": map[string]any{
+			"sessionId": memoryID, "participantToken": memoryToken, "expiresAt": memoryExpires, "deleteAfter": memoryDeleteAfter,
+		},
 		"displayAlias":            map[string]string{"color": color, "symbol": symbol},
-		"expiresAt":               expires,
-		"deleteAfter":             deleteAfter,
 		"positionIntervalSeconds": s.cfg.PositionIntervalSeconds,
 	}
 	if input.EnableLivePresence {
 		response["experienceLinkToken"] = linkToken
-		response["livePresenceSession"] = map[string]string{
+		response["livePresenceSession"] = map[string]any{
 			"sessionId": liveID, "participantToken": liveToken, "trackingStatus": "tracking", "presencePhase": "approaching",
+			"expiresAt": liveExpires, "deleteAfter": liveDeleteAfter,
 		}
 	}
 	s.writeJSON(w, http.StatusCreated, response)
@@ -231,14 +236,17 @@ func (s *Server) experienceState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := map[string]any{
-		"memorySessionId":       state.MemorySessionID,
-		"livePresenceSessionId": nullableString(state.LiveSessionID),
-		"trackingStatus":        nullableString(state.TrackingStatus),
-		"presencePhase":         nullableString(state.PresencePhase),
-		"displayAlias":          map[string]string{"color": state.DisplayColor, "symbol": state.DisplaySymbol},
-		"photoSummary":          map[string]int{"ready": 0, "pending": 0, "failed": 0, "maxCount": 12},
-		"expiresAt":             state.ExpiresAt,
-		"deleteAfter":           state.DeleteAfter,
+		"memorySession": map[string]any{
+			"sessionId": state.MemorySessionID, "expiresAt": state.MemoryExpiresAt, "deleteAfter": state.MemoryDeleteAfter,
+		},
+		"displayAlias": map[string]string{"color": state.DisplayColor, "symbol": state.DisplaySymbol},
+		"photoSummary": map[string]int{"ready": 0, "pending": 0, "failed": 0, "maxCount": 12},
+	}
+	if state.LiveSessionID != "" {
+		response["livePresenceSession"] = map[string]any{
+			"sessionId": state.LiveSessionID, "trackingStatus": state.TrackingStatus, "presencePhase": state.PresencePhase,
+			"expiresAt": state.LiveExpiresAt, "deleteAfter": state.LiveDeleteAfter,
+		}
 	}
 	s.writeJSON(w, http.StatusOK, response)
 }
@@ -385,6 +393,45 @@ func (s *Server) stopLive(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]string{"trackingStatus": "stopped", "presencePhase": "ended"}
 	s.writeIdempotentJSON(w, r, scope, body, http.StatusOK, response)
+}
+
+// deleteExperience commits the live deletion before the memory deletion. A
+// failed second half leaves a durable receipt for a retry with the same key.
+func (s *Server) deleteExperience(w http.ResponseWriter, r *http.Request) {
+	memoryToken, authErr := bearerToken(r)
+	if authErr != nil {
+		s.writeError(w, requestID(r), authErr)
+		return
+	}
+	liveToken := r.Header.Get("X-Trace-Live-Token")
+	key := r.Header.Get("Idempotency-Key")
+	if liveToken == "" {
+		s.writeError(w, requestID(r), &apiError{Code: "UNAUTHORIZED", Message: "live participant credentials are required", Status: http.StatusUnauthorized})
+		return
+	}
+	if key == "" || len(key) > 200 {
+		s.writeError(w, requestID(r), &apiError{Code: "IDEMPOTENCY_KEY_REQUIRED", Message: "a valid Idempotency-Key header is required", Status: http.StatusBadRequest})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1))
+	if err != nil || len(body) != 0 {
+		s.writeError(w, requestID(r), &apiError{Code: "INVALID_REQUEST", Message: "request body must be empty", Status: http.StatusBadRequest})
+		return
+	}
+	id := r.PathValue("experienceId")
+	now := s.now().UTC()
+	receiptKey := hash(key + "\x00" + memoryToken + "\x00" + liveToken)
+	memoryHash, liveHash := hash(memoryToken), hash(liveToken)
+	if err := s.store.DeleteExperiencePart(r.Context(), id, memoryHash, liveHash, receiptKey, false, now); err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	response := map[string]any{"memory": "pending", "live": "deleted", "complete": false}
+	if err := s.store.DeleteExperiencePart(r.Context(), id, memoryHash, liveHash, receiptKey, true, now); err == nil {
+		response["memory"] = "deleted"
+		response["complete"] = true
+	}
+	s.writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
