@@ -87,6 +87,10 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		}()
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
+		if strings.HasPrefix(r.URL.Path, "/v1/") && s.store.Ping(ctx) != nil {
+			s.writeError(w, requestID, &apiError{Code: "NOT_READY", Message: "required services are unavailable", Status: http.StatusServiceUnavailable})
+			return
+		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, requestIDKey{}, requestID)))
 	})
 }

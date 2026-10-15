@@ -45,7 +45,6 @@ func TestEdgeSecretProtectsPublicAPIWithoutBlockingLiveness(t *testing.T) {
 	}{
 		{"/v1/public/config", "", http.StatusForbidden},
 		{"/v1/public/config", "wrong", http.StatusForbidden},
-		{"/v1/public/config", cfg.EdgeSharedSecret, http.StatusOK},
 		{"/health/live", "", http.StatusOK},
 	} {
 		req := httptest.NewRequest(http.MethodGet, tt.path, nil)
@@ -57,6 +56,48 @@ func TestEdgeSecretProtectsPublicAPIWithoutBlockingLiveness(t *testing.T) {
 		if response.Code != tt.status {
 			t.Errorf("%s with secret %t: got %d, want %d", tt.path, tt.secret != "", response.Code, tt.status)
 		}
+	}
+}
+
+func TestEdgeSecretAllowsReadyAPI(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := config.Default()
+	cfg.EdgeSharedSecret = "a-32-byte-secret-for-cloudflare-edge"
+	handler := api.New(cfg, f.Store)
+	response := request(t, handler, http.MethodGet, "/v1/public/config", "", map[string]string{
+		"X-Trace-Edge-Secret": cfg.EdgeSharedSecret,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid edge secret and ready schema: %d", response.Code)
+	}
+}
+
+func TestNewSchemaBlocksOldAPIWhileLivenessStaysAvailable(t *testing.T) {
+	f := testdb.Open(t)
+	handler := api.New(config.Default(), f.Store)
+	if got := request(t, handler, http.MethodGet, "/v1/public/config", "", nil).Code; got != http.StatusOK {
+		t.Fatalf("initial config status: %d", got)
+	}
+	if _, err := f.SQL.ExecContext(t.Context(), "INSERT INTO schema_migrations (version) VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		method, path, body string
+		want               int
+	}{
+		{http.MethodGet, "/health/live", "", http.StatusOK},
+		{http.MethodGet, "/health/ready", "", http.StatusServiceUnavailable},
+		{http.MethodGet, "/v1/public/config", "", http.StatusServiceUnavailable},
+		{http.MethodPost, "/v1/experiences", `{}`, http.StatusServiceUnavailable},
+	} {
+		response := request(t, handler, test.method, test.path, test.body, nil)
+		if response.Code != test.want {
+			t.Errorf("%s %s: got %d, want %d", test.method, test.path, response.Code, test.want)
+		}
+	}
+	var count int
+	if err := f.SQL.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM experiences").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("outdated API modified data: count=%d err=%v", count, err)
 	}
 }
 

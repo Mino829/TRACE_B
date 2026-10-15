@@ -46,6 +46,10 @@ func main() {
 		slog.Info("database migration complete")
 		return
 	case "cleanup":
+		if err := db.Ping(startupCtx); err != nil {
+			slog.Error("schema not ready; run migrate first")
+			os.Exit(1)
+		}
 		if err := db.Cleanup(startupCtx, time.Now().UTC()); err != nil {
 			slog.Error("cleanup failed", "error", err)
 			os.Exit(1)
@@ -105,6 +109,11 @@ func cleanupExpired(ctx context.Context, db *store.Store) {
 			return
 		case now := <-ticker.C:
 			cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := db.Ping(cleanupCtx); err != nil {
+				slog.Error("schema not ready; skipping cleanup", "error", err)
+				cancel()
+				continue
+			}
 			if err := db.Cleanup(cleanupCtx, now.UTC()); err != nil && ctx.Err() == nil {
 				slog.Error("cleanup expired data", "error", err)
 			}

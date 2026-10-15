@@ -50,8 +50,8 @@ ALTER DATABASE trace OWNER TO trace_owner;
 
 psqlの`\password trace_owner`と`\password trace_app`でパスワードを対話入力し、同じ値をそれぞれSecret Managerへ登録します。パスワードをSQLファイル、シェル履歴、Git、チャットへ書かないでください。
 
-マイグレーションは所有者ユーザー、API・清掃ジョブはアプリユーザーで実行します。初期マイグレーション後に、`trace_owner`として`deploy/gcp/runtime-grants.sql`を実行して必要な表権限だけを付与します。
-アプリユーザーにDDL権限がなくても、API・清掃・readinessは動作します。将来テーブルを追加する際は、必要な権限も明示的に追加してください。
+マイグレーションは所有者ユーザー、API・清掃ジョブはアプリユーザーで実行します。初回と以降のschema migration後には`trace_owner`として`deploy/gcp/runtime-grants.sql`を実行してください。新しいruntimeテーブルを追加した場合は、このファイルへ必要なテーブル権限を個別に追記し、`trace_app`でアクセスを確認してから新アプリを配信します。
+アプリユーザーにDDL権限がなくても、API・清掃・readinessは動作します。readinessはDBへの接続だけでなく、埋め込みmigrationと適用済み連番の一致も確認します（個別テーブルの権限試験は別途必要）。
 
 ## 4. 設定とビルド
 
@@ -83,8 +83,7 @@ gcloud builds submit --project="$GCP_PROJECT_ID" \
 bash deploy/gcp/deploy.sh migrate
 ```
 
-所有者用Secretを使う`trace-migrate`ジョブを作成・更新し、成功まで待ちます。失敗したらAPIを更新せずログを確認します。
-初回はこの後、前述の`runtime-grants.sql`を実行してください。
+所有者用Secretを使う`trace-migrate`ジョブを作成・更新し、成功まで待ちます。初回と新規migration適用後はこの後、前述の`runtime-grants.sql`を実行し、`trace_app`で必要なテーブル操作と`schema_migrations`の参照を確認してください。失敗したらAPIを更新せずログを確認します。
 
 ```sh
 bash deploy/gcp/deploy.sh serve
