@@ -11,7 +11,7 @@
 - MemorySession / LivePresenceSessionごとの有効期限と削除期限。期限後も各`deleteAfter`までは本人の状態取得・削除が可能
 - 個別削除と両トークンによる体験単位削除。後者はLive側から順に個別に確定し、部分成功を24時間の記録と同じキーで再試行
 - DBロックとトランザクションで各削除・冪等性記録を一括確定
-- CORS応答、16KB JSON上限、ヘルスチェック、JSONログ
+- CORS応答（許可Originへのプリフライトでは一括削除用`X-Trace-Live-Token`も許可）、16KB JSON上限、ヘルスチェック、JSONログ
 - CloudflareサイトWorker向けの共有シークレット検証（設定時、`/v1/*`のみ）
 - 明示的なDBマイグレーションと期限削除コマンド
 
@@ -29,8 +29,22 @@
 | DELETE | /v1/memory-sessions/{memorySessionId} |
 | DELETE | /v1/live-presence-sessions/{liveSessionId} |
 
-写真アップロード、経路再構成、到着QR、描画WebSocket、運営API、レート制限は未実装です。
+写真アップロード、経路再構成、到着QR、描画WebSocket、運営APIは未実装です。
 公開設定の写真機能はfalseのままです。現段階は限定検証用MVPで、無制限な一般公開の準備完了を意味しません。
+
+### 公開APIのレート制限
+
+| 対象 | 1プロセスでの上限（token bucket） |
+|---|---:|
+| 参加作成 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
+| 公開設定取得 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
+| 位置送信 | Live参加トークンごとに12回/分・burst 5 |
+| 本人状態取得、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
+| 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
+
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真・Push・描画・運営の制限は該当APIの実装時に追加します。
+IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
+カウンターは最大10,000件を1プロセスのメモリに保持し、2分以上使われていないものを消去します。容量超過は`429`（`Retry-After: 60`）で安全側に拒否します。再起動でリセットされ、複数インスタンス間では共有されません。`deploy/gcp/deploy.sh`の最大1インスタンスを維持し、新旧revisionの並存も避けてください。増設する場合は共有レート制限ストアまたは信頼できる共通edgeの制限へ移行します。
 
 ## 最短のローカル起動
 
@@ -119,7 +133,7 @@ GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合�
 既存PostgreSQLテストの成功後だけ、mainの変更をCloud Runへ反映できます。初期状態は無効で、WIF・必要なIAM権限とGitHub変数の設定後に有効化します。
 DB構造変更は手動確認が必要です。自動更新では現在の環境設定を保持し、一般公開・参加受付開始を行いません。
 
-- API：Cloud Run（東京、最小1・最大3インスタンス、CPU常時割当）
+- API：Cloud Run（東京、最小1・最大1インスタンス、CPU常時割当）
 - DB：Cloud SQL for PostgreSQL 17（東京）
 - 接続秘密：Secret Manager、実行用サービスアカウント
 - イメージ：Artifact Registry、Cloud Build
