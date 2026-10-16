@@ -41,7 +41,7 @@ case "$mode" in
       --execution-environment=gen2 --set-cloudsql-instances="$GCP_SQL_CONNECTION" \
       --env-vars-file="$env_file" --set-secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET" \
       --port=8080 --cpu=1 --memory=512Mi --concurrency=40 --timeout=30s \
-      --min=1 --max=3 --no-cpu-throttling --no-allow-unauthenticated --invoker-iam-check \
+      --min=1 --max=1 --no-cpu-throttling --no-allow-unauthenticated --invoker-iam-check \
       --startup-probe="httpGet.path=/health/ready,httpGet.port=8080,initialDelaySeconds=0,periodSeconds=5,timeoutSeconds=2,failureThreshold=12" \
       --liveness-probe="httpGet.path=/health/live,httpGet.port=8080,periodSeconds=30,timeoutSeconds=2,failureThreshold=3"
     ;;

@@ -69,9 +69,16 @@ func migrationSteps(t *testing.T, extras ...string) []migration {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files := fstest.MapFS{"migrations/001_initial.sql": &fstest.MapFile{Data: initial}}
+	second, err := fs.ReadFile(migrationFiles, "migrations/002_remove_live_positions.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := fstest.MapFS{
+		"migrations/001_initial.sql":               &fstest.MapFile{Data: initial},
+		"migrations/002_remove_live_positions.sql": &fstest.MapFile{Data: second},
+	}
 	for i, statement := range extras {
-		name := fmt.Sprintf("migrations/%03d_test.sql", i+2)
+		name := fmt.Sprintf("migrations/%03d_test.sql", i+3)
 		files[name] = &fstest.MapFile{Data: []byte(statement)}
 	}
 	steps, err := loadMigrations(files)
@@ -101,7 +108,7 @@ func TestMigrationIncrementalAndReadiness(t *testing.T) {
 		t.Fatal("repeat migration:", err)
 	}
 	var count, probe int
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != 3 {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != 4 {
 		t.Fatalf("migration history: count=%d err=%v", count, err)
 	}
 	if err := db.QueryRowContext(ctx, "SELECT id FROM migration_probe").Scan(&probe); err != nil || probe != 1 {
@@ -114,10 +121,10 @@ func TestMigrationIncrementalAndReadiness(t *testing.T) {
 	if err := store.Ping(ctx); err == nil {
 		t.Fatal("older application reported ready against a newer schema")
 	}
-	if err := store.pingVersion(ctx, 3); err != nil {
+	if err := store.pingVersion(ctx, 4); err != nil {
 		t.Fatal("matching application should be ready:", err)
 	}
-	if err := store.migrate(ctx, steps[:2]); err == nil {
+	if err := store.migrate(ctx, steps[:3]); err == nil {
 		t.Fatal("older migration binary accepted a newer schema")
 	}
 }
@@ -151,7 +158,7 @@ func TestMigrationFailureRollsBackAndRetries(t *testing.T) {
 		t.Fatal("broken migration committed")
 	}
 	var count int
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != 1 {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != 2 {
 		t.Fatalf("migration history changed: count=%d err=%v", count, err)
 	}
 	var table sql.NullString
@@ -165,7 +172,7 @@ func TestMigrationFailureRollsBackAndRetries(t *testing.T) {
 	if err := store.migrate(ctx, fixed); err != nil {
 		t.Fatal("retry:", err)
 	}
-	if err := store.pingVersion(ctx, 3); err != nil {
+	if err := store.pingVersion(ctx, 4); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -190,17 +197,62 @@ func TestConcurrentMigrationAndCorruptHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.pingVersion(ctx, 2); err != nil {
+	if err := store.pingVersion(ctx, 3); err != nil {
 		t.Fatal("concurrent migration left invalid schema:", err)
 	}
 	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version=1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.pingVersion(ctx, 2); err == nil {
+	if err := store.pingVersion(ctx, 3); err == nil {
 		t.Fatal("missing migration version reported ready")
 	}
 	if err := store.migrate(ctx, steps); err == nil {
 		t.Fatal("migration advanced past missing history")
+	}
+}
+
+func TestExistingSessionsSurviveVolatilePositionMigration(t *testing.T) {
+	store, db := migrationTestStore(t)
+	ctx := t.Context()
+	if err := store.migrate(ctx, migrationSteps(t)[:1]); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	memoryExpiry, liveExpiry := now.Add(2*time.Hour), now.Add(time.Hour)
+	memoryDelete, liveDelete := now.Add(4*time.Hour), now.Add(3*time.Hour)
+	if _, err := db.ExecContext(ctx, `INSERT INTO memory_sessions
+ (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after)
+ VALUES ('mem_old','m1','ja','mh',$1,$2,$3)`, now, memoryExpiry, memoryDelete); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO live_presence_sessions
+ (id,consent_version,token_hash,tracking_status,presence_phase,display_color,display_symbol,created_at,expires_at,delete_after)
+ VALUES ('live_old','l1','lh','tracking','approaching','cyan','circle',$1,$2,$3)`, now, liveExpiry, liveDelete); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO experience_links (id,memory_session_id,live_session_id,token_hash,expires_at)
+ VALUES ('link_old','mem_old','live_old','linkhash',$1)`, liveExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO live_positions
+ (live_session_id,accuracy_m,local_x,local_z,recorded_at,received_at,expires_at)
+ VALUES ('live_old',8,10,20,$1,$1,$2)`, now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal("existing schema migration:", err)
+	}
+	var tokenExpiry, linkExpiry time.Time
+	if err := db.QueryRowContext(ctx, "SELECT token_expires_at,expires_at FROM experience_links WHERE id='link_old'").Scan(&tokenExpiry, &linkExpiry); err != nil ||
+		!tokenExpiry.Equal(liveExpiry) || !linkExpiry.Equal(liveDelete) {
+		t.Fatal("existing association deadlines not migrated:", err)
+	}
+	if err := store.AuthenticateMemory(ctx, "mem_old", "mh", now); err != nil {
+		t.Fatal("existing memory session lost:", err)
+	}
+	var oldPositions sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT to_regclass('live_positions')").Scan(&oldPositions); err != nil || oldPositions.Valid {
+		t.Fatal("legacy display locations survived migration:", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -21,12 +22,16 @@ import (
 type createdExperience struct {
 	ExperienceID string `json:"experienceId"`
 	Memory       struct {
-		SessionID        string `json:"sessionId"`
-		ParticipantToken string `json:"participantToken"`
+		SessionID        string    `json:"sessionId"`
+		ParticipantToken string    `json:"participantToken"`
+		ExpiresAt        time.Time `json:"expiresAt"`
+		DeleteAfter      time.Time `json:"deleteAfter"`
 	} `json:"memorySession"`
 	Live struct {
-		SessionID        string `json:"sessionId"`
-		ParticipantToken string `json:"participantToken"`
+		SessionID        string    `json:"sessionId"`
+		ParticipantToken string    `json:"participantToken"`
+		ExpiresAt        time.Time `json:"expiresAt"`
+		DeleteAfter      time.Time `json:"deleteAfter"`
 	} `json:"livePresenceSession"`
 }
 
@@ -78,7 +83,7 @@ func TestNewSchemaBlocksOldAPIWhileLivenessStaysAvailable(t *testing.T) {
 	if got := request(t, handler, http.MethodGet, "/v1/public/config", "", nil).Code; got != http.StatusOK {
 		t.Fatalf("initial config status: %d", got)
 	}
-	if _, err := f.SQL.ExecContext(t.Context(), "INSERT INTO schema_migrations (version) VALUES (2)"); err != nil {
+	if _, err := f.SQL.ExecContext(t.Context(), "INSERT INTO schema_migrations (version) VALUES (3)"); err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
@@ -299,6 +304,73 @@ func TestConsentAndAuthenticationFailures(t *testing.T) {
 	})
 	if authorized.Code != http.StatusOK {
 		t.Fatalf("state status=%d body=%s", authorized.Code, authorized.Body.String())
+	}
+}
+
+func TestCombinedDeletionRetainsPartialSuccessForRetry(t *testing.T) {
+	f := testdb.Open(t)
+	handler := api.New(config.Default(), f.Store)
+	created := createExperience(t, handler, config.Default())
+	path := "/v1/experiences/" + created.ExperienceID
+	headers := map[string]string{
+		"Authorization":      "Bearer " + created.Memory.ParticipantToken,
+		"X-Trace-Live-Token": created.Live.ParticipantToken,
+		"Idempotency-Key":    "delete-both",
+	}
+	if response := request(t, handler, http.MethodDelete, path, "{}", headers); response.Code != 400 {
+		t.Fatalf("DELETE body accepted: %d", response.Code)
+	}
+	wrong := map[string]string{
+		"Authorization":      headers["Authorization"],
+		"X-Trace-Live-Token": "incorrect",
+		"Idempotency-Key":    headers["Idempotency-Key"],
+	}
+	if response := request(t, handler, http.MethodDelete, path, "", wrong); response.Code != 404 {
+		t.Fatalf("wrong live credential removed a session: %d", response.Code)
+	}
+	if _, err := f.SQL.ExecContext(t.Context(), `CREATE FUNCTION reject_memory_deletion() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'deletion temporarily unavailable'; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.SQL.ExecContext(t.Context(), `CREATE TRIGGER reject_memory_deletion BEFORE DELETE ON memory_sessions
+FOR EACH ROW EXECUTE FUNCTION reject_memory_deletion()`); err != nil {
+		t.Fatal(err)
+	}
+	first := request(t, handler, http.MethodDelete, path, "", headers)
+	var partial struct {
+		Memory, Live string
+		Complete     bool
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &partial); err != nil ||
+		first.Code != 200 || partial.Memory != "pending" || partial.Live != "deleted" || partial.Complete {
+		t.Fatalf("partial deletion: %d %s: %v", first.Code, first.Body.String(), err)
+	}
+	if err := f.Store.AuthenticateMemory(t.Context(), created.Memory.SessionID, tokenHash(created.Memory.ParticipantToken), time.Now()); err != nil {
+		t.Fatal("first half deleted memory:", err)
+	}
+	if err := f.Store.AuthenticateLive(t.Context(), created.Live.SessionID, tokenHash(created.Live.ParticipantToken), time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("successful live deletion rolled back:", err)
+	}
+	if _, err := f.SQL.ExecContext(t.Context(), "DROP TRIGGER reject_memory_deletion ON memory_sessions"); err != nil {
+		t.Fatal(err)
+	}
+	replayed := request(t, handler, http.MethodDelete, path, "", headers)
+	var completed struct {
+		Memory, Live string
+		Complete     bool
+	}
+	if err := json.Unmarshal(replayed.Body.Bytes(), &completed); err != nil ||
+		replayed.Code != 200 || completed.Memory != "deleted" || completed.Live != "deleted" || !completed.Complete {
+		t.Fatalf("retry did not complete: %d %s: %v", replayed.Code, replayed.Body.String(), err)
+	}
+	if response := request(t, handler, http.MethodDelete, path, "", headers); response.Code != 200 {
+		t.Fatalf("completed retry changed status: %d", response.Code)
+	}
+	if response := request(t, handler, http.MethodDelete, path, "", wrong); response.Code != 404 {
+		t.Fatalf("wrong credentials replayed deletion: %d", response.Code)
+	}
+	if err := f.Store.AuthenticateMemory(t.Context(), created.Memory.SessionID, tokenHash(created.Memory.ParticipantToken), time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("memory remains after completed deletion:", err)
 	}
 }
 

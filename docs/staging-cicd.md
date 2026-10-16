@@ -190,6 +190,7 @@ GitHub Environmentの有料プラン機能には依存していません。利�
   4. `trace_owner`で`deploy/gcp/runtime-grants.sql`を適用し、追加テーブルには明示的に必要な`trace_app`権限だけを付与する。`trace_app`接続で`schema_migrations`のSELECT、新規テーブルの必要操作、DDL不可を確認する。DB接続が成功しても権限の誤設定はready検査だけでは見つからない。
   5. 同じ版に対応する新APIを一時タグへデプロイし、`/health/ready`と受付停止設定、既存E2Eを確認した後に昇格する。新しいschemaを扱えない旧API/清掃ジョブはready/起動に失敗する（新版判定実装済みのバイナリのみ）。再実行は適用済み版を飛ばす。
   6. 手動検証を記録して`STAGING_SCHEMA_BASELINE`を対応するmainのフルSHAへ更新し、自動化を再開する。単なるアプリrollbackはDBを戻さないため、直前イメージが現行schemaに対応できない場合は切り戻さず受付停止を維持し、forward migrationなどの復旧計画を決める。
+  今回の`002_remove_live_positions.sql`は例外として旧APIと非互換で、位置テーブルの既存データを破棄する。追跡受付を停止し、旧APIと旧清掃ジョブの稼働・トラフィックを止めてから適用する。`TRACE_SESSION_TTL`を削除し、`TRACE_MEMORY_SESSION_TTL`/`TRACE_LIVE_SESSION_TTL`を設定した新APIだけを起動する。旧イメージへの自動rollbackはできない。APIの最大インスタンス数を1へ変更してからCIを再開する。
 - スクリプトはmigration実装・SQLディレクトリ・権限SQLの差分を検知するもので、任意のGoコードが行うDB変更を完全に検知するセキュリティ境界ではない。
 - 候補起動で失敗：通常のAPIトラフィックは旧版のまま。一時タグは終了処理で外す。
 - 削除ジョブまたは切替後の確認で失敗：旧配信先・旧削除イメージへ復旧を試みる。元の失敗はActions上で失敗のまま残す。
@@ -198,6 +199,8 @@ GitHub Environmentの有料プラン機能には依存していません。利�
 - 本番、一般公開、受付開始、ドメイン/CORS/同意文/座標の変更、Secretローテーション、Scheduler設定変更、監視アラート作成はこの自動化の対象外。
 - Cloud BuildのビルドログはCloud Loggingで確認する。CIアカウントはログ本文の閲覧権限を持たず、ビルド結果だけ参照する。
 - ビルド、ソース保管、候補リビジョンの起動、ジョブ実行等に料金が発生する。現在の最小1台・CPU常時割当は維持する。
+
+Goメモリの最新位置は清掃ジョブや別revisionと共有できない。CIの候補revisionと旧revisionが一時的に並存するため、stagingの`TRACE_REGISTRATION_OPEN=false`を維持し、追跡利用者がいない時間に配信する。本番は追跡中の段階的配信・スケールアウトを行わず、位置の欠落を許容できる停止窓で切り替える。
 
 ## 7. ローカル検証
 

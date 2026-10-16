@@ -41,7 +41,7 @@ class ReleaseTests(unittest.TestCase):
         self.env_patch = patch.dict(os.environ, env)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
-        self.service = {"metadata": {"annotations": {}}, "spec": {"template": {"spec": runtime("serve")}},
+        self.service = {"metadata": {"annotations": {}}, "spec": {"template": {"metadata": {"annotations": {"autoscaling.knative.dev/maxScale": "1"}}, "spec": runtime("serve")}},
                         "status": {"url": URL, "conditions": [{"type": "Ready", "status": "True"}],
                                    "latestCreatedRevisionName": "old-revision", "latestReadyRevisionName": "old-revision",
                                    "traffic": [{"revisionName": "old-revision", "percent": 100}]}}
@@ -184,6 +184,15 @@ class ReleaseTests(unittest.TestCase):
         spec["containers"][0]["env"][-1]["valueFrom"]["secretKeyRef"]["key"] = "latest"
         with self.assertRaisesRegex(ci.RefuseRelease, "numbered"):
             ci.check_runtime(spec, "serve")
+
+    def test_multi_instance_service_and_old_session_setting_are_rejected(self):
+        self.service["spec"]["template"]["metadata"]["annotations"]["autoscaling.knative.dev/maxScale"] = "3"
+        with self.assertRaisesRegex(ci.RefuseRelease, "maximum of one"):
+            self.release.prepare()
+        self.service["spec"]["template"]["metadata"]["annotations"]["autoscaling.knative.dev/maxScale"] = "1"
+        self.service["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "TRACE_SESSION_TTL", "value": "6h"})
+        with self.assertRaisesRegex(ci.RefuseRelease, "obsolete"):
+            self.release.prepare()
 
     def test_split_traffic_requires_manual_review(self):
         self.service["status"]["traffic"] = [{"revisionName": "old", "percent": 90}, {"revisionName": "other", "percent": 10}]
