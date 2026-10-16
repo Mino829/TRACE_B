@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +62,23 @@ func TestEdgeSecretProtectsPublicAPIWithoutBlockingLiveness(t *testing.T) {
 		if response.Code != tt.status {
 			t.Errorf("%s with secret %t: got %d, want %d", tt.path, tt.secret != "", response.Code, tt.status)
 		}
+	}
+}
+
+func TestExperienceDeleteCORSPreflight(t *testing.T) {
+	cfg := config.Default()
+	cfg.AllowedOrigins = []string{"https://participant.example"}
+	handler := api.New(cfg, nil)
+	req := httptest.NewRequest(http.MethodOptions, "/v1/experiences/exp_example", nil)
+	req.Header.Set("Origin", cfg.AllowedOrigins[0])
+	req.Header.Set("Access-Control-Request-Method", http.MethodDelete)
+	req.Header.Set("Access-Control-Request-Headers", "authorization,x-trace-live-token,idempotency-key")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusNoContent ||
+		response.Header().Get("Access-Control-Allow-Origin") != cfg.AllowedOrigins[0] ||
+		!strings.Contains(strings.ToLower(response.Header().Get("Access-Control-Allow-Headers")), "x-trace-live-token") {
+		t.Fatalf("delete preflight: status=%d headers=%v", response.Code, response.Header())
 	}
 }
 
@@ -371,6 +389,49 @@ FOR EACH ROW EXECUTE FUNCTION reject_memory_deletion()`); err != nil {
 	}
 	if err := f.Store.AuthenticateMemory(t.Context(), created.Memory.SessionID, tokenHash(created.Memory.ParticipantToken), time.Now()); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("memory remains after completed deletion:", err)
+	}
+}
+
+func TestRateLimitSeparatesSessionQuotasAndReturnsRetryAfter(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := config.Default()
+	handler := api.New(cfg, f.Store)
+	first := createExperience(t, handler, cfg)
+	second := createExperience(t, handler, cfg)
+	base := time.Now().Add(-10 * time.Second).UTC()
+	path := "/v1/live-presence-sessions/" + first.Live.SessionID + "/position"
+	for i := range 6 {
+		body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`,
+			base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano))
+		r := request(t, handler, http.MethodPost, path, body, map[string]string{
+			"Authorization": "Bearer " + first.Live.ParticipantToken, "X-Forwarded-For": fmt.Sprintf("192.0.2.%d", i+1),
+		})
+		if i < 5 && r.Code != http.StatusOK {
+			t.Fatalf("normal position %d: %d %s", i, r.Code, r.Body.String())
+		}
+		if i == 5 && (r.Code != http.StatusTooManyRequests || r.Header().Get("Retry-After") == "" ||
+			!bytes.Contains(r.Body.Bytes(), []byte(`"code":"RATE_LIMITED"`))) {
+			t.Fatalf("excess position: %d %s headers=%v", r.Code, r.Body.String(), r.Header())
+		}
+	}
+	otherPath := "/v1/live-presence-sessions/" + second.Live.SessionID + "/position"
+	body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, base.Format(time.RFC3339Nano))
+	if r := request(t, handler, http.MethodPost, otherPath, body,
+		map[string]string{"Authorization": "Bearer " + second.Live.ParticipantToken}); r.Code != http.StatusOK {
+		t.Fatalf("another participant blocked by same network: %d %s", r.Code, r.Body.String())
+	}
+	statePath := "/v1/experiences/" + first.ExperienceID
+	for range 30 {
+		if r := request(t, handler, http.MethodGet, statePath, "", map[string]string{
+			"Authorization": "Bearer " + first.Memory.ParticipantToken,
+		}); r.Code != http.StatusOK {
+			t.Fatalf("normal state request: %d %s", r.Code, r.Body.String())
+		}
+	}
+	if r := request(t, handler, http.MethodGet, statePath, "", map[string]string{
+		"Authorization": "Bearer " + first.Memory.ParticipantToken,
+	}); r.Code != http.StatusTooManyRequests || r.Header().Get("Retry-After") == "" {
+		t.Fatalf("excess state request: %d %s", r.Code, r.Body.String())
 	}
 }
 

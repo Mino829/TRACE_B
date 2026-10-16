@@ -25,9 +25,10 @@ import (
 const maxJSONBody = 16 << 10
 
 type Server struct {
-	cfg   config.Config
-	store *store.Store
-	now   func() time.Time
+	cfg     config.Config
+	store   *store.Store
+	limiter *rateLimiter
+	now     func() time.Time
 }
 
 type apiError struct {
@@ -39,19 +40,19 @@ type apiError struct {
 func (e *apiError) Error() string { return e.Code }
 
 func New(cfg config.Config, db *store.Store) http.Handler {
-	server := &Server{cfg: cfg, store: db, now: time.Now}
+	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.live)
 	mux.HandleFunc("GET /health/ready", server.ready)
-	mux.HandleFunc("GET /v1/public/config", server.publicConfig)
-	mux.HandleFunc("POST /v1/experiences", server.createExperience)
-	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.experienceState)
-	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.deleteExperience)
-	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.atomic((*Server).updatePosition))
-	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.atomic((*Server).onSite))
-	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.atomic((*Server).stopLive))
-	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.atomic((*Server).deleteMemory))
-	mux.HandleFunc("DELETE /v1/live-presence-sessions/{liveSessionId}", server.atomic((*Server).deleteLive))
+	mux.HandleFunc("GET /v1/public/config", server.limitedPublic("config", server.publicConfig))
+	mux.HandleFunc("POST /v1/experiences", server.limitedPublic("create", server.createExperience))
+	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.limitedSession("session", server.experienceState))
+	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.limitedSession("session", server.deleteExperience))
+	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.limitedSession("position", server.atomic((*Server).updatePosition)))
+	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.limitedSession("session", server.atomic((*Server).onSite)))
+	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopLive)))
+	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.limitedSession("session", server.atomic((*Server).deleteMemory)))
+	mux.HandleFunc("DELETE /v1/live-presence-sessions/{liveSessionId}", server.limitedSession("session", server.atomic((*Server).deleteLive)))
 	return server.middleware(mux)
 }
 
@@ -69,7 +70,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		if origin := r.Header.Get("Origin"); origin != "" && s.originAllowed(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Trace-Live-Token")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		}
 		if r.Method == http.MethodOptions {
