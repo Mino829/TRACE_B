@@ -77,6 +77,22 @@ gcloud builds submit --project="$GCP_PROJECT_ID" \
 
 このコマンドはソースをGoogle Cloudへアップロードします。`.gcloudignore`は環境設定・DB・Git情報を除外しますが、初回は必ずアップロード対象を確認してください。Cloud Buildはイメージ作成だけを行い、デプロイやDB更新はしません。タグはリリースごとに変え、同じタグを別内容で上書きしないでください。
 
+### 任意の写真用Cloud Storage
+
+写真は既定で無効です。設計Issue #9/#10の承認前に実参加者データを保存したり、ここに記載しただけでbucket作成・権限付与済みと扱ったりしないでください。写真を使わない最初の非公開Backend配備は`TRACE_PHOTO_ENABLED=false`、写真保存先未設定で進められます。
+
+有効にする場合は承認済みの専用bucketを東京`ASIA-NORTHEAST1`に配置し、Uniform bucket-level access、Public access preventionを有効にします。versioning、soft delete、retention/hold、object retention、独立したlifecycleルールを無効にします。soft deleteは新規bucketで既定有効となる場合があるため、明示的に確認してください。アプリはこれらを起動時に検査し、不一致なら停止します。稼働中に変更しないでください。
+
+API・清掃ジョブの両方へ`TRACE_PHOTO_BUCKET`と`TRACE_PHOTO_SIGNER_EMAIL`を設定し、新規写真を許可する段階だけ`TRACE_PHOTO_ENABLED=true`にします。無効化後も既存写真の本人閲覧・削除・清掃に同じ保存先が必要です。写真や短期アップロードフェンスが残る間は保存先を外さないでください。
+
+ADCを使う実行アカウントには、対象bucketだけの`storage.buckets.get`と、必要なobjectのget/create/delete/update/dropContexts権限を付けます。世代を固定した昇格コピーでは、クライアント由来metadata/contextを引き継がないため`storage.objects.dropContexts`も必要です。署名用アカウントにはURL対象のobjectのcreate/get権限、実行アカウントからその署名用アカウントへ`iam.serviceAccounts.signBlob`が必要です。同じ実行アカウントを署名用にする場合も自己署名のIAM権限を確認してください。Secretの読み取り権限とは別であり、Owner/Editorや長期秘密鍵ファイルを使いません。権限付与は管理者のレビュー・承認後に行います。
+
+bucket CORSは承認済み参加画面のoriginと`PUT`/`GET`に限定し、実ブラウザで`Content-Type`、自動設定される`Content-Length`、`x-goog-if-generation-match`、`Cache-Control`を含む署名付きPUTのプリフライトを確認します。`uploadHeaders`は変更せず、5分以内のURLを使用します。画像アクセスログ・監査ログの保持と削除、署名URLの非記録も個人情報責任者と確認してください。SDK独自のclient metricsは無効化しています。
+
+DBは`003_photos.sql`を追加します。自動デプロイを止め、移行窓で手動migration・`runtime-grants.sql`・実行ユーザー権限・readyを確認し、APIと清掃ジョブを同じschema対応版へ更新してからbaselineを進めます。写真の完了・削除・フェンス清掃は承認済みMVP例外として外部I/O中もDB lockを保持するため、10秒のAPI/定期清掃deadlineと接続プールへの影響を実負荷で確認してください。写真の消去成功前にMemorySessionを削除せず、失敗時は`deleting`から再試行します。独立lifecycleでフェンスを早く消すと削除後のPUT再作成を許すため禁止します。
+
+ローカルでは専用PostgreSQLと一時object emulatorによる実HTTP導線、公式SDKのHTTP fixtureで検証しています。実GCSのIAM signBlob・世代条件・CORS・物理消去・清掃ジョブ・負荷/復旧は未検証であり、承認済みstagingで合格するまで写真機能を公開しません。
+
 ## 5. マイグレーション → 権限付与 → API
 
 ```sh

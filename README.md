@@ -14,6 +14,7 @@
 - CORS応答（許可Originへのプリフライトでは一括削除用`X-Trace-Live-Token`も許可）、16KB JSON上限、ヘルスチェック、JSONログ
 - CloudflareサイトWorker向けの共有シークレット検証（設定時、`/v1/*`のみ）
 - 明示的なDBマイグレーションと期限削除コマンド
+- 任意有効化する非公開写真API：メタデータ登録、署名付きPUT、検証完了、本人ストーリー、写真・セッション・期限削除
 
 | メソッド | エンドポイント |
 |---|---|
@@ -28,9 +29,14 @@
 | POST | /v1/live-presence-sessions/{liveSessionId}/stop |
 | DELETE | /v1/memory-sessions/{memorySessionId} |
 | DELETE | /v1/live-presence-sessions/{liveSessionId} |
+| GET / POST | /v1/memory-sessions/{memorySessionId}/photos |
+| POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/upload-url |
+| POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete |
+| DELETE | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
+| GET | /v1/memory-sessions/{memorySessionId}/memory |
 
-写真アップロード、経路再構成、到着QR、描画WebSocket、運営APIは未実装です。
-公開設定の写真機能はfalseのままです。現段階は限定検証用MVPで、無制限な一般公開の準備完了を意味しません。
+経路再構成、到着QR、描画WebSocket、写真ピン・フォトスポット、運営APIは未実装です。写真ストーリーの`segments`は経路実装まで空配列とし、仮の経路を生成しません。
+写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
 
@@ -40,11 +46,35 @@
 | 公開設定取得 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
 | 位置送信 | Live参加トークンごとに12回/分・burst 5 |
 | 本人状態取得、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
+| 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
-超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真・Push・描画・運営の制限は該当APIの実装時に追加します。
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有します。Push・描画・運営の制限は該当APIの実装時に追加します。
 IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
 カウンターは最大10,000件を1プロセスのメモリに保持し、2分以上使われていないものを消去します。容量超過は`429`（`Retry-After: 60`）で安全側に拒否します。再起動でリセットされ、複数インスタンス間では共有されません。`deploy/gcp/deploy.sh`の最大1インスタンスを維持し、新旧revisionの並存も避けてください。増設する場合は共有レート制限ストアまたは信頼できる共通edgeの制限へ移行します。
+
+## 非公開写真の設定とライフサイクル
+
+- `TRACE_PHOTO_ENABLED=false`が既定です。`true`にするには`TRACE_PHOTO_BUCKET`と`TRACE_PHOTO_SIGNER_EMAIL`の両方が必要です。
+- 保存先設定があれば、新規写真を無効にしても既存写真の本人閲覧・削除と清掃は継続します。写真・アップロード枠が残る間に保存先設定を外すと、起動・清掃コマンドは拒否します。
+- bucketは東京`ASIA-NORTHEAST1`、Uniform bucket-level accessとPublic access preventionを有効にし、versioning・soft delete・retention/hold・独立したlifecycleルールを無効にします。起動時に検査し、稼働中に変更しないでください。
+- ADCとIAM `signBlob`を使用し、秘密鍵ファイルやローカルファイル保存へのフォールバックはありません。APIと清掃ジョブへ同じ保存先を設定します。必要権限とCORSは[配置手順](docs/google-cloud.md)を参照してください。
+
+写真はJPEG/WebP、5MiB以下、長辺1920px以下、1セッション12枚までです。登録時に撮影時GPSを省略でき、通常GPSから補完しません。保存後にサイズ・SHA-256・実形式・寸法・画像全体の復号・EXIF等の不在を検証するまで、画像URLは返しません。ブラウザの構造的なJFIF/Adobe情報は許可しますが、埋め込みサムネイル・任意メタデータ・アニメーションは拒否します。
+
+WebPのVP8Lには小入力から巨大なHuffman表を確保できるため、`x/image v0.43.0`のVP8L/WebP処理だけをBSDライセンス付きで限定保持し、画像・ALPHの両方でentropy groupを256未満のindexへ制限します。固定表は1MiB未満となり、上限を超える画像は検証失敗として消去します。VP8/RIFFは公式`x/image`を使い、依存更新時には限定保持した処理と境界テストも照合してください。
+
+登録の同じ`clientPhotoId`と同じ内容は同じPhotoMomentへ集約します。同じ冪等性キーで異なる内容は409です。削除済み写真の登録再送は404となり、復活させません。登録の再送でURL期限が切れていた場合は`uploadUrl`を省略するため、`pending`に対して`upload-url`を要求します。再発行は初回を含め5回まで、上限到達は409です。
+
+アップロードURLは最大5分（Memoryの`expiresAt`以下）の新規作成専用PUTです。返却する`uploadHeaders`の`Content-Type`、`x-goog-if-generation-match: 0`、`Cache-Control`を送信し、`Content-Length`はブラウザがBlobサイズから自動設定します。上書き・読み取り・一覧には使えません。`complete`はbodyなしで何度送っても同じ写真の状態へ収束します。未アップロードは409、不正画像は消去後`failed`となり、消去に失敗した間は`deleting`で新しいURLを発行しません。
+
+本人memoryは検証済み`ready`だけを撮影時刻順に返し、画像URLは5分と`deleteAfter`の早い方までです。`locationConfidence`はGPSなし/精度100m超をlow、30m超〜100mをmedium、30m以下をhighとする暫定値で、経路の信頼度ではありません。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
+
+削除はまず永続的な`deleting`を確定し、画像の消去が成功するまで参照・認証材料を捨てません。写真DELETE成功は204、写真・Memoryの消去失敗は503となり、同じ冪等性キーで再試行します。体験単位削除は従来どおりLive削除後にMemoryを処理し、写真消去失敗時は`memory: pending`です。期限切れはAPI常駐清掃と清掃ジョブで同じ処理を再開します。
+
+署名付きPUTは削除後も期限まで生きるため、アップロード先はゼロバイトで占有し、期限後だけoutboxから消去します。これにより削除後の再送で画像が復活しません。画像バイト・GPS・PhotoMoment参照は削除対象となり、この短期outboxにはランダムなobject keyと期限だけを保持します。写真の派生特徴・別サムネイル・経路・ピンはまだ生成しないため、その隠れた複製はありません。
+
+DBは`003_photos.sql`を追加します。適用後に`runtime-grants.sql`を実行し、APIと清掃ジョブを同じschema対応版へ更新してください。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
 
 ## 最短のローカル起動
 
@@ -67,7 +97,7 @@ ComposeのDB管理者兼アプリユーザーはローカル検証専用です�
 
 ## Goで起動する場合
 
-Go 1.25以降（検証・Dockerビルドは1.26系）、PostgreSQL 17を用意します。
+Go 1.26.9以降、PostgreSQL 17を用意します。CI・Dockerも1.26.9へ揃え、標準ライブラリと写真SDKの間接依存の既知脆弱性を修正した版で検証します。
 
 ```sh
 # 先にComposeでローカルDBだけを起動

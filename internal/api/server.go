@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Mino829/trace_Backend/internal/config"
+	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/store"
 )
 
@@ -29,6 +30,7 @@ type Server struct {
 	store   *store.Store
 	limiter *rateLimiter
 	now     func() time.Time
+	photos  *photo.Service
 }
 
 type apiError struct {
@@ -39,8 +41,8 @@ type apiError struct {
 
 func (e *apiError) Error() string { return e.Code }
 
-func New(cfg config.Config, db *store.Store) http.Handler {
-	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter()}
+func New(cfg config.Config, db *store.Store, photos *photo.Service) http.Handler {
+	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter(), photos: photos}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.live)
 	mux.HandleFunc("GET /health/ready", server.ready)
@@ -51,8 +53,14 @@ func New(cfg config.Config, db *store.Store) http.Handler {
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.limitedSession("position", server.atomic((*Server).updatePosition)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.limitedSession("session", server.atomic((*Server).onSite)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopLive)))
-	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.limitedSession("session", server.atomic((*Server).deleteMemory)))
+	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.limitedSession("session", server.prepareMemoryPhotoDeletion(server.atomic((*Server).deleteMemory))))
 	mux.HandleFunc("DELETE /v1/live-presence-sessions/{liveSessionId}", server.limitedSession("session", server.atomic((*Server).deleteLive)))
+	mux.HandleFunc("GET /v1/memory-sessions/{memorySessionId}/photos", server.limitedSession("session", server.listPhotos))
+	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/photos", server.limitedSession("photo-metadata", server.createPhoto))
+	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/upload-url", server.limitedSession("session", server.renewPhotoUpload))
+	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete", server.limitedSession("session", server.completePhoto))
+	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}", server.limitedSession("session", server.deletePhoto))
+	mux.HandleFunc("GET /v1/memory-sessions/{memorySessionId}/memory", server.limitedSession("session", server.photoMemory))
 	return server.middleware(mux)
 }
 
@@ -141,7 +149,7 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 			"threeDMapVersion":   s.cfg.ThreeDMapVersion,
 		},
 		"photo": map[string]any{
-			"enabled":           false,
+			"enabled":           s.cfg.PhotoEnabled && s.photos != nil,
 			"maxCount":          12,
 			"maxUploadBytes":    5 * 1024 * 1024,
 			"maxLongEdgePixels": 1920,
@@ -236,12 +244,17 @@ func (s *Server) experienceState(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, r, storeErr)
 		return
 	}
+	summary, storeErr := s.store.PhotoSummary(r.Context(), state.MemorySessionID)
+	if storeErr != nil {
+		s.photoError(w, r, storeErr)
+		return
+	}
 	response := map[string]any{
 		"memorySession": map[string]any{
 			"sessionId": state.MemorySessionID, "expiresAt": state.MemoryExpiresAt, "deleteAfter": state.MemoryDeleteAfter,
 		},
 		"displayAlias": map[string]string{"color": state.DisplayColor, "symbol": state.DisplaySymbol},
-		"photoSummary": map[string]int{"ready": 0, "pending": 0, "failed": 0, "maxCount": 12},
+		"photoSummary": map[string]int{"ready": summary.Ready, "pending": summary.Pending, "failed": summary.Failed, "maxCount": 12},
 	}
 	if state.LiveSessionID != "" {
 		response["livePresenceSession"] = map[string]any{
@@ -428,6 +441,18 @@ func (s *Server) deleteExperience(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := map[string]any{"memory": "pending", "live": "deleted", "complete": false}
+	if s.photos != nil {
+		state, stateErr := s.store.ExperienceByMemoryToken(r.Context(), id, memoryHash, now)
+		if stateErr == nil {
+			if err := s.photos.DeleteMemoryPhotos(r.Context(), state.MemorySessionID); err != nil {
+				s.writeJSON(w, http.StatusOK, response)
+				return
+			}
+		} else if !errors.Is(stateErr, store.ErrNotFound) {
+			s.writeJSON(w, http.StatusOK, response)
+			return
+		}
+	}
 	if err := s.store.DeleteExperiencePart(r.Context(), id, memoryHash, liveHash, receiptKey, true, now); err == nil {
 		response["memory"] = "deleted"
 		response["complete"] = true

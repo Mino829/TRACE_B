@@ -136,6 +136,8 @@ func (s *Server) limitedSession(kind string, next http.HandlerFunc) http.Handler
 		rate, burst := 0.5, 30.0
 		if kind == "position" {
 			rate, burst = 0.2, 5
+		} else if kind == "photo-metadata" {
+			rate, burst = 0.1, 6
 		}
 		if wait := s.limiter.allow(s.now(),
 			rateRule{key: kind + "/" + identity, rate: rate, burst: burst},

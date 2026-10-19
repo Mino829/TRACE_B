@@ -65,20 +65,20 @@ func migrationTestStore(t *testing.T) (*Store, *sql.DB) {
 
 func migrationSteps(t *testing.T, extras ...string) []migration {
 	t.Helper()
-	initial, err := fs.ReadFile(migrationFiles, "migrations/001_initial.sql")
+	names, err := fs.Glob(migrationFiles, "migrations/*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := fs.ReadFile(migrationFiles, "migrations/002_remove_live_positions.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := fstest.MapFS{
-		"migrations/001_initial.sql":               &fstest.MapFile{Data: initial},
-		"migrations/002_remove_live_positions.sql": &fstest.MapFile{Data: second},
+	files := fstest.MapFS{}
+	for _, name := range names {
+		data, err := fs.ReadFile(migrationFiles, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[name] = &fstest.MapFile{Data: data}
 	}
 	for i, statement := range extras {
-		name := fmt.Sprintf("migrations/%03d_test.sql", i+3)
+		name := fmt.Sprintf("migrations/%03d_test.sql", i+len(names)+1)
 		files[name] = &fstest.MapFile{Data: []byte(statement)}
 	}
 	steps, err := loadMigrations(files)
@@ -108,7 +108,7 @@ func TestMigrationIncrementalAndReadiness(t *testing.T) {
 		t.Fatal("repeat migration:", err)
 	}
 	var count, probe int
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != 4 {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != len(steps) {
 		t.Fatalf("migration history: count=%d err=%v", count, err)
 	}
 	if err := db.QueryRowContext(ctx, "SELECT id FROM migration_probe").Scan(&probe); err != nil || probe != 1 {
@@ -121,10 +121,10 @@ func TestMigrationIncrementalAndReadiness(t *testing.T) {
 	if err := store.Ping(ctx); err == nil {
 		t.Fatal("older application reported ready against a newer schema")
 	}
-	if err := store.pingVersion(ctx, 4); err != nil {
+	if err := store.pingVersion(ctx, len(steps)); err != nil {
 		t.Fatal("matching application should be ready:", err)
 	}
-	if err := store.migrate(ctx, steps[:3]); err == nil {
+	if err := store.migrate(ctx, steps[:len(steps)-1]); err == nil {
 		t.Fatal("older migration binary accepted a newer schema")
 	}
 }
@@ -158,7 +158,7 @@ func TestMigrationFailureRollsBackAndRetries(t *testing.T) {
 		t.Fatal("broken migration committed")
 	}
 	var count int
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != 2 {
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil || count != len(migrations) {
 		t.Fatalf("migration history changed: count=%d err=%v", count, err)
 	}
 	var table sql.NullString
@@ -172,7 +172,7 @@ func TestMigrationFailureRollsBackAndRetries(t *testing.T) {
 	if err := store.migrate(ctx, fixed); err != nil {
 		t.Fatal("retry:", err)
 	}
-	if err := store.pingVersion(ctx, 4); err != nil {
+	if err := store.pingVersion(ctx, len(fixed)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -197,13 +197,13 @@ func TestConcurrentMigrationAndCorruptHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.pingVersion(ctx, 3); err != nil {
+	if err := store.pingVersion(ctx, len(steps)); err != nil {
 		t.Fatal("concurrent migration left invalid schema:", err)
 	}
 	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version=1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.pingVersion(ctx, 3); err == nil {
+	if err := store.pingVersion(ctx, len(steps)); err == nil {
 		t.Fatal("missing migration version reported ready")
 	}
 	if err := store.migrate(ctx, steps); err == nil {
@@ -249,6 +249,14 @@ func TestExistingSessionsSurviveVolatilePositionMigration(t *testing.T) {
 	}
 	if err := store.AuthenticateMemory(ctx, "mem_old", "mh", now); err != nil {
 		t.Fatal("existing memory session lost:", err)
+	}
+	memory, err := store.MemorySession(ctx, "mem_old")
+	if err != nil || memory.Deleting || !memory.CreatedAt.Equal(now) ||
+		!memory.ExpiresAt.Equal(memoryExpiry) || !memory.DeleteAfter.Equal(memoryDelete) {
+		t.Fatal("photo migration changed an existing memory session:", err)
+	}
+	if required, err := store.PhotoStorageRequired(ctx); err != nil || required {
+		t.Fatal("photo migration fabricated retained assets:", err)
 	}
 	var oldPositions sql.NullString
 	if err := db.QueryRowContext(ctx, "SELECT to_regclass('live_positions')").Scan(&oldPositions); err != nil || oldPositions.Valid {

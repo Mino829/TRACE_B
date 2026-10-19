@@ -22,6 +22,7 @@ var (
 
 type executor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 type Store struct {
@@ -126,6 +127,9 @@ func (s *Store) pingVersion(ctx context.Context, version int) error {
 // Cache updates become visible only after the matching DB transaction commits.
 func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) error) error {
 	if s.inTx {
+		if err := s.lockTransaction(ctx, key); err != nil {
+			return err
+		}
 		return fn(s)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -133,13 +137,10 @@ func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) err
 		return err
 	}
 	defer tx.Rollback()
-	if key != "" {
-		digest := sha256.Sum256([]byte(key))
-		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", int64(binary.BigEndian.Uint64(digest[:8]))); err != nil {
-			return err
-		}
-	}
 	work := &Store{db: s.db, q: tx, inTx: true, positions: s.positions}
+	if err := work.lockTransaction(ctx, key); err != nil {
+		return err
+	}
 	if err := fn(work); err != nil {
 		return err
 	}
@@ -157,6 +158,15 @@ func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) err
 		delete(s.positions.latest, work.pending.id)
 	}
 	return nil
+}
+
+func (s *Store) lockTransaction(ctx context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
+	digest := sha256.Sum256([]byte(key))
+	_, err := s.q.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", int64(binary.BigEndian.Uint64(digest[:8])))
+	return err
 }
 func (s *Store) CreateExperience(ctx context.Context, v NewExperience) error {
 	return s.Transaction(ctx, "", func(tx *Store) error {
@@ -344,7 +354,21 @@ func (s *Store) SetOnSite(ctx context.Context, id, consent string, continuing bo
 	})
 }
 func (s *Store) DeleteMemory(ctx context.Context, id string) error {
-	return s.deleteSession(ctx, "DELETE FROM memory_sessions WHERE id=$1", id)
+	return s.Transaction(ctx, id, func(tx *Store) error {
+		var pending bool
+		err := tx.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM photos WHERE memory_session_id=$1)
+ FROM memory_sessions WHERE id=$1 FOR UPDATE`, id).Scan(&pending)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if pending {
+			return ErrPhotoPending
+		}
+		return tx.deleteSession(ctx, "DELETE FROM memory_sessions WHERE id=$1", id)
+	})
 }
 func (s *Store) DeleteLive(ctx context.Context, id string) error {
 	return s.Transaction(ctx, id, func(tx *Store) error {
@@ -418,8 +442,8 @@ func hashScope(scope string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func (s *Store) deleteSession(ctx context.Context, query, id string) error {
-	result, err := s.q.ExecContext(ctx, query, id)
+func (s *Store) deleteSession(ctx context.Context, query string, args ...any) error {
+	result, err := s.q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -458,11 +482,14 @@ func (s *Store) SaveIdempotency(ctx context.Context, scope, key, requestHash str
 func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	s.PurgePositions(now)
 	return s.Transaction(ctx, "trace:cleanup", func(tx *Store) error {
+		if err := tx.queueExpiredPhotoMemories(ctx, now); err != nil {
+			return err
+		}
 		for _, query := range []string{
 			"UPDATE live_presence_sessions SET tracking_status='expired',presence_phase='ended' WHERE expires_at<=$1 AND tracking_status='tracking'",
 			"DELETE FROM experience_links WHERE expires_at<=$1",
 			"DELETE FROM experiences WHERE delete_after<=$1",
-			"DELETE FROM memory_sessions WHERE delete_after<=$1",
+			"DELETE FROM memory_sessions WHERE delete_after<=$1 AND NOT EXISTS (SELECT 1 FROM photos WHERE memory_session_id=memory_sessions.id)",
 			"DELETE FROM live_presence_sessions WHERE delete_after<=$1",
 			"DELETE FROM idempotency_records WHERE expires_at<=$1",
 		} {

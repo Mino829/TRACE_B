@@ -44,7 +44,7 @@ func tokenHash(token string) string {
 func TestEdgeSecretProtectsPublicAPIWithoutBlockingLiveness(t *testing.T) {
 	cfg := config.Default()
 	cfg.EdgeSharedSecret = "a-32-byte-secret-for-cloudflare-edge"
-	handler := api.New(cfg, nil)
+	handler := api.New(cfg, nil, nil)
 	for _, tt := range []struct {
 		path, secret string
 		status       int
@@ -68,7 +68,7 @@ func TestEdgeSecretProtectsPublicAPIWithoutBlockingLiveness(t *testing.T) {
 func TestExperienceDeleteCORSPreflight(t *testing.T) {
 	cfg := config.Default()
 	cfg.AllowedOrigins = []string{"https://participant.example"}
-	handler := api.New(cfg, nil)
+	handler := api.New(cfg, nil, nil)
 	req := httptest.NewRequest(http.MethodOptions, "/v1/experiences/exp_example", nil)
 	req.Header.Set("Origin", cfg.AllowedOrigins[0])
 	req.Header.Set("Access-Control-Request-Method", http.MethodDelete)
@@ -86,7 +86,7 @@ func TestEdgeSecretAllowsReadyAPI(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
 	cfg.EdgeSharedSecret = "a-32-byte-secret-for-cloudflare-edge"
-	handler := api.New(cfg, f.Store)
+	handler := api.New(cfg, f.Store, nil)
 	response := request(t, handler, http.MethodGet, "/v1/public/config", "", map[string]string{
 		"X-Trace-Edge-Secret": cfg.EdgeSharedSecret,
 	})
@@ -97,11 +97,11 @@ func TestEdgeSecretAllowsReadyAPI(t *testing.T) {
 
 func TestNewSchemaBlocksOldAPIWhileLivenessStaysAvailable(t *testing.T) {
 	f := testdb.Open(t)
-	handler := api.New(config.Default(), f.Store)
+	handler := api.New(config.Default(), f.Store, nil)
 	if got := request(t, handler, http.MethodGet, "/v1/public/config", "", nil).Code; got != http.StatusOK {
 		t.Fatalf("initial config status: %d", got)
 	}
-	if _, err := f.SQL.ExecContext(t.Context(), "INSERT INTO schema_migrations (version) VALUES (3)"); err != nil {
+	if _, err := f.SQL.ExecContext(t.Context(), "INSERT INTO schema_migrations (version) SELECT MAX(version)+1 FROM schema_migrations"); err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
@@ -127,13 +127,13 @@ func TestNewSchemaBlocksOldAPIWhileLivenessStaysAvailable(t *testing.T) {
 func TestConcurrentDeleteAcrossInstancesAndCredentialBinding(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
-	handler := api.New(cfg, f.Store)
+	handler := api.New(cfg, f.Store, nil)
 	second, err := store.Open(t.Context(), f.URL, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	other := api.New(cfg, second)
+	other := api.New(cfg, second, nil)
 	created := createExperience(t, handler, cfg)
 	headers := map[string]string{"Authorization": "Bearer " + created.Live.ParticipantToken, "Idempotency-Key": "same-delete"}
 	path := "/v1/live-presence-sessions/" + created.Live.SessionID
@@ -171,7 +171,7 @@ func TestConcurrentDeleteAcrossInstancesAndCredentialBinding(t *testing.T) {
 func TestStopRaceAndRollback(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
-	h := api.New(cfg, f.Store)
+	h := api.New(cfg, f.Store, nil)
 	c := createExperience(t, h, cfg)
 	path := "/v1/live-presence-sessions/" + c.Live.SessionID
 	start := make(chan struct{})
@@ -212,7 +212,7 @@ func TestStopRaceAndRollback(t *testing.T) {
 func TestPositionValidationAndSessionIsolation(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
-	h := api.New(cfg, f.Store)
+	h := api.New(cfg, f.Store, nil)
 	c := createExperience(t, h, cfg)
 	path := "/v1/live-presence-sessions/" + c.Live.SessionID + "/position"
 	for _, tt := range []struct {
@@ -240,7 +240,7 @@ func TestPositionValidationAndSessionIsolation(t *testing.T) {
 func TestExperiencePositionStopAndDelete(t *testing.T) {
 	db := testdb.Open(t).Store
 	cfg := config.Default()
-	handler := api.New(cfg, db)
+	handler := api.New(cfg, db, nil)
 
 	created := createExperience(t, handler, cfg)
 	if created.ExperienceID == "" || created.Memory.SessionID == "" || created.Live.SessionID == "" {
@@ -301,7 +301,7 @@ func TestExperiencePositionStopAndDelete(t *testing.T) {
 func TestConsentAndAuthenticationFailures(t *testing.T) {
 	db := testdb.Open(t).Store
 	cfg := config.Default()
-	handler := api.New(cfg, db)
+	handler := api.New(cfg, db, nil)
 
 	wrongConsent := fmt.Sprintf(`{"memoryConsentVersion":"old","livePresenceConsentVersion":%q,"enableLivePresence":true,"consentLanguage":"ja","clientTime":%q}`,
 		cfg.LiveConsentVersion, time.Now().UTC().Format(time.RFC3339Nano))
@@ -327,7 +327,7 @@ func TestConsentAndAuthenticationFailures(t *testing.T) {
 
 func TestCombinedDeletionRetainsPartialSuccessForRetry(t *testing.T) {
 	f := testdb.Open(t)
-	handler := api.New(config.Default(), f.Store)
+	handler := api.New(config.Default(), f.Store, nil)
 	created := createExperience(t, handler, config.Default())
 	path := "/v1/experiences/" + created.ExperienceID
 	headers := map[string]string{
@@ -395,7 +395,7 @@ FOR EACH ROW EXECUTE FUNCTION reject_memory_deletion()`); err != nil {
 func TestRateLimitSeparatesSessionQuotasAndReturnsRetryAfter(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
-	handler := api.New(cfg, f.Store)
+	handler := api.New(cfg, f.Store, nil)
 	first := createExperience(t, handler, cfg)
 	second := createExperience(t, handler, cfg)
 	base := time.Now().Add(-10 * time.Second).UTC()
