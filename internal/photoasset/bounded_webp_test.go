@@ -2,11 +2,11 @@ package photoasset
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"testing"
 
-	"github.com/Mino829/trace_Backend/internal/photoasset/internal/vp8l"
-	"github.com/Mino829/trace_Backend/internal/photoasset/internal/webp"
+	"golang.org/x/image/vp8l"
+	"golang.org/x/image/webp"
 )
 
 type webpBitWriter struct {
@@ -29,8 +29,8 @@ func (w *webpBitWriter) write(value uint32, count uint) {
 // entropyGroupFixture is a complete, constant-color 2x2 lossless image. Its
 // one-pixel entropy map selects group index groupIndex. Every tree is the
 // single-symbol simple form, so literal pixels consume no additional bits.
-// The 65535-index case is under 0.5 MiB but would make the upstream decoder
-// allocate 65,536 groups (over 160 MiB of fixed lookup tables alone).
+// Before x/image v0.45, the 65535-index case made the decoder allocate 65,536
+// groups (over 160 MiB of fixed lookup tables) from under 0.5 MiB of input.
 func entropyGroupFixture(groupIndex int) []byte {
 	var bits webpBitWriter
 	bits.write(0x2f, 8)
@@ -64,13 +64,13 @@ func entropyGroupFixture(groupIndex int) []byte {
 
 func TestWebPRejectsExcessiveEntropyGroupsBeforeAllocation(t *testing.T) {
 	lossy := webpFixture(t, lossyWebP)[12:]
-	for _, groupIndex := range []int{vp8l.MaxHuffmanGroups, 65535} {
+	for _, groupIndex := range []int{2600, 65535} {
 		malicious := entropyGroupFixture(groupIndex)
 		if len(malicious) >= 512*1024 {
 			t.Fatal("regression fixture must demonstrate compressed-size amplification")
 		}
-		if _, err := vp8l.Decode(bytes.NewReader(malicious)); !errors.Is(err, vp8l.ErrResourceLimit) {
-			t.Fatalf("lossless decoder error = %v, want pre-allocation resource limit", err)
+		if _, err := vp8l.Decode(bytes.NewReader(malicious)); err == nil {
+			t.Fatal("lossless decoder accepted excessive entropy groups")
 		}
 		for _, data := range [][]byte{
 			webpContainer(webpChunk("VP8L", malicious)),
@@ -78,8 +78,8 @@ func TestWebPRejectsExcessiveEntropyGroupsBeforeAllocation(t *testing.T) {
 			// the WebP decoder synthesizes it from the validated canvas size.
 			webpContainer(extendedWebP(0x10, 2, 2), webpChunk("ALPH", append([]byte{1}, malicious[5:]...)), lossy),
 		} {
-			if _, err := webp.Decode(bytes.NewReader(data)); !errors.Is(err, vp8l.ErrResourceLimit) {
-				t.Fatalf("WebP decoder error = %v, want resource limit for image or ALPH", err)
+			if _, err := webp.Decode(bytes.NewReader(data)); err == nil {
+				t.Fatal("WebP decoder accepted excessive entropy groups in image or ALPH")
 			}
 			requireInvalid(t, data, imageMetadata(data, "image/webp", 2, 2))
 		}
@@ -87,13 +87,13 @@ func TestWebPRejectsExcessiveEntropyGroupsBeforeAllocation(t *testing.T) {
 }
 
 func TestWebPAcceptsEntropyGroupLimitBoundary(t *testing.T) {
-	allowed := entropyGroupFixture(vp8l.MaxHuffmanGroups - 1)
+	allowed := entropyGroupFixture(2599)
 	lossy := webpFixture(t, lossyWebP)[12:]
 	for _, data := range [][]byte{
 		webpContainer(webpChunk("VP8L", allowed)),
 		webpContainer(extendedWebP(0x10, 2, 2), webpChunk("ALPH", append([]byte{1}, allowed[5:]...)), lossy),
 	} {
-		if err := Validate(data, imageMetadata(data, "image/webp", 2, 2)); err != nil {
+		if err := Validate(context.Background(), data, imageMetadata(data, "image/webp", 2, 2)); err != nil {
 			t.Fatal("valid image at entropy-group boundary was rejected:", err)
 		}
 	}

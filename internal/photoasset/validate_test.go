@@ -2,6 +2,7 @@ package photoasset
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"image/jpeg"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Real libwebp-encoded 2x2 RGB fixtures; the four pixels are the ASCII byte
@@ -47,7 +49,7 @@ func imageMetadata(data []byte, mime string, width, height int) Metadata {
 
 func requireInvalid(t *testing.T, data []byte, meta Metadata) {
 	t.Helper()
-	if err := Validate(data, meta); !errors.Is(err, ErrInvalidImage) {
+	if err := Validate(context.Background(), data, meta); !errors.Is(err, ErrInvalidImage) {
 		t.Fatalf("Validate error = %v, want invalid image", err)
 	}
 }
@@ -65,11 +67,11 @@ func TestValidateAllowedImages(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			meta := imageMetadata(tc.data, tc.mime, tc.width, tc.height)
-			if err := Validate(tc.data, meta); err != nil {
+			if err := Validate(context.Background(), tc.data, meta); err != nil {
 				t.Fatal(err)
 			}
 			meta.SHA256 = strings.ToUpper(meta.SHA256)
-			if err := Validate(tc.data, meta); err != nil {
+			if err := Validate(context.Background(), tc.data, meta); err != nil {
 				t.Fatal("hexadecimal hash should be case insensitive")
 			}
 		})
@@ -161,7 +163,7 @@ func TestValidateJPEGMetadata(t *testing.T) {
 	requireInvalid(t, encoded, imageMetadata(encoded, "image/jpeg", 7, 11))
 	for _, segment := range [][]byte{jpegSegment(0xe0, jfif), jpegSegment(0xee, adobe)} {
 		encoded := withJPEGSegment(data, segment)
-		if err := Validate(encoded, imageMetadata(encoded, "image/jpeg", 7, 11)); err != nil {
+		if err := Validate(context.Background(), encoded, imageMetadata(encoded, "image/jpeg", 7, 11)); err != nil {
 			t.Fatal("fixed structural browser header rejected:", err)
 		}
 	}
@@ -173,7 +175,7 @@ func TestValidateJPEGMetadata(t *testing.T) {
 		t.Fatal("fixture has no quantization table")
 	}
 	copy(encoded[dqt+5:], "Exif")
-	if err := Validate(encoded, imageMetadata(encoded, "image/jpeg", 7, 11)); err != nil {
+	if err := Validate(context.Background(), encoded, imageMetadata(encoded, "image/jpeg", 7, 11)); err != nil {
 		t.Fatal("nonmetadata byte sequence rejected:", err)
 	}
 }
@@ -227,7 +229,7 @@ func TestValidateWebPMetadataAndContainers(t *testing.T) {
 		webpContainer(extendedWebP(0x10, 2, 2), alpha, lossy),
 		webpContainer(extendedWebP(0, 2, 2), lossless),
 	} {
-		if err := Validate(data, imageMetadata(data, "image/webp", 2, 2)); err != nil {
+		if err := Validate(context.Background(), data, imageMetadata(data, "image/webp", 2, 2)); err != nil {
 			t.Fatal("structural extended WebP rejected:", err)
 		}
 	}
@@ -308,9 +310,28 @@ func FuzzValidate(f *testing.F) {
 		}
 		// Every candidate has a matching digest and length, so fuzzing reaches
 		// structural parsing and real decoders rather than just the hash guard.
-		err := Validate(data, imageMetadata(data, mime, 2, 2))
+		err := Validate(context.Background(), data, imageMetadata(data, mime, 2, 2))
 		if err != nil && !errors.Is(err, ErrInvalidImage) {
 			t.Fatal("unexpected validator error")
 		}
 	})
+}
+
+func TestWebPValidationWaitCanBeCancelled(t *testing.T) {
+	data := webpFixture(t, losslessWebP)
+	webpDecodeSlot <- struct{}{}
+	defer func() { <-webpDecodeSlot }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- Validate(ctx, data, imageMetadata(data, "image/webp", 2, 2)) }()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled validation returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled validation remained blocked behind the decoder")
+	}
 }

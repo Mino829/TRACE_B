@@ -119,15 +119,25 @@ func (s *Service) Complete(ctx context.Context, memoryID, photoID string, now ti
 			result.Status = "ready"
 			return nil
 		}
+		want := metadata(p)
+		validate := func(object photoasset.Object) error {
+			if object.ContentType != p.MIMEType {
+				return photoasset.ErrInvalidImage
+			}
+			return photoasset.Validate(ctx, object.Data, want)
+		}
 		object, readErr := s.assets.Read(ctx, p.StageKey, photoasset.MaxBytes)
+		if readErr == nil {
+			readErr = validate(object)
+		}
 		if readErr != nil && !errors.Is(readErr, photoasset.ErrInvalidImage) && !errors.Is(readErr, photoasset.ErrNotFound) {
 			return ErrStorage
 		}
-		if readErr != nil || object.ContentType != p.MIMEType || photoasset.Validate(object.Data, metadata(p)) != nil {
+		if readErr != nil {
 			// The process may have crashed after fencing the upload but before
 			// committing ready. Recover only from the validated final copy.
 			final, finalErr := s.assets.Read(ctx, p.ObjectKey, photoasset.MaxBytes)
-			if finalErr == nil && final.ContentType == p.MIMEType && photoasset.Validate(final.Data, metadata(p)) == nil {
+			if finalErr == nil && validate(final) == nil {
 				return ready()
 			}
 			if !errors.Is(finalErr, photoasset.ErrNotFound) {
@@ -139,10 +149,10 @@ func (s *Service) Complete(ctx context.Context, memoryID, photoID string, now ti
 			invalid = true
 			return tx.QueuePhotoDeletion(ctx, memoryID, photoID, "failed", "INVALID_IMAGE")
 		}
-		err = s.assets.Promote(ctx, p.StageKey, p.ObjectKey, object.Generation, metadata(p))
+		err = s.assets.Promote(ctx, p.StageKey, p.ObjectKey, object.Generation, want)
 		if errors.Is(err, photoasset.ErrAlreadyExists) {
 			final, readErr := s.assets.Read(ctx, p.ObjectKey, photoasset.MaxBytes)
-			if readErr != nil || final.ContentType != p.MIMEType || photoasset.Validate(final.Data, metadata(p)) != nil {
+			if readErr != nil || validate(final) != nil {
 				return ErrStorage
 			}
 		} else if err != nil {

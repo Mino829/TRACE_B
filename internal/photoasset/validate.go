@@ -2,21 +2,29 @@ package photoasset
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"image"
 	"image/jpeg"
 
-	"github.com/Mino829/trace_Backend/internal/photoasset/internal/vp8l"
-	"github.com/Mino829/trace_Backend/internal/photoasset/internal/webp"
 	"golang.org/x/image/vp8"
+	"golang.org/x/image/vp8l"
+	"golang.org/x/image/webp"
 )
+
+// WebP entropy tables have upstream allocation limits, but several simultaneous
+// decodes can still exceed a 512MiB instance. Waiters retain only encoded bytes.
+var webpDecodeSlot = make(chan struct{}, 1)
 
 // Validate accepts only fully decodable, single-frame JPEG/WebP images without
 // user metadata. Marker/chunk parsing, rather than searching pixel bytes, keeps
 // encoded pixel data from being mistaken for EXIF, XMP, or other metadata.
-func Validate(data []byte, meta Metadata) error {
+func Validate(ctx context.Context, data []byte, meta Metadata) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	expected, valid := metadataHash(meta)
 	if !valid || int64(len(data)) != meta.SizeBytes || sha256.Sum256(data) != expected {
 		return ErrInvalidImage
@@ -44,9 +52,19 @@ func Validate(data []byte, meta Metadata) error {
 	}
 	// Both the container and inner WebP bitstream dimensions were checked before
 	// a decoder can allocate the pixel buffer. JPEG DecodeConfig reads the SOF.
-	// The pinned internal WebP/VP8L decoder additionally caps entropy Huffman
-	// groups before allocation, including compressed ALPH planes; dimensions
-	// and compressed size alone cannot bound those tables in upstream v0.43.0.
+	// Official x/image v0.47 includes the VP8L entropy-table allocation fix for
+	// both image and ALPH. Serialize full WebP decoding within this process.
+	if meta.MIMEType == "image/webp" {
+		select {
+		case webpDecodeSlot <- struct{}{}:
+			defer func() { <-webpDecodeSlot }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	if meta.MIMEType == "image/jpeg" {
 		decoded, err = jpeg.Decode(bytes.NewReader(data))
 	} else {
