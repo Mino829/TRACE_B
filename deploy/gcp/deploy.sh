@@ -36,6 +36,8 @@ case "$mode" in
       --set-cloudsql-instances="$GCP_SQL_CONNECTION" --env-vars-file="$env_file" \
       --set-secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET" \
       --tasks=1 --parallelism=1 --max-retries=2 --task-timeout=120s --cpu=1 --memory=512Mi
+    # Process-local position and rate-limit state require one API instance.
+    # Keep max=1 until both move to shared stores; avoid overlapping revisions.
     gcloud run deploy trace-backend "${common[@]}" \
       --image="$GCP_IMAGE" --args=serve --service-account="$GCP_RUNTIME_SA" \
       --execution-environment=gen2 --set-cloudsql-instances="$GCP_SQL_CONNECTION" \
