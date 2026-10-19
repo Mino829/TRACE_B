@@ -153,6 +153,7 @@ func TestPublicIPLimitRejectsAndRecoversWithoutBlockingAnotherIP(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/experiences", nil)
 		req.RemoteAddr = "10.0.0.1:1234"
 		req.Header.Set("X-Trace-Client-IP", ip)
+		req.Header.Set("X-Trace-Edge-Secret", cfg.EdgeSharedSecret)
 		response := httptest.NewRecorder()
 		h(response, req)
 		return response
@@ -198,6 +199,7 @@ func TestCreationIPTrustBoundary(t *testing.T) {
 			r := httptest.NewRequest(http.MethodPost, "/v1/experiences", nil)
 			r.RemoteAddr = tt.remote
 			r.Header.Set("X-Trace-Client-IP", tt.forwarded)
+			r.Header.Set("X-Trace-Edge-Secret", cfg.EdgeSharedSecret)
 			r.Header.Set("X-Forwarded-For", "198.51.100.7")
 			if got := s.clientIP(r); got != tt.want {
 				t.Fatalf("client IP: %q != %q", got, tt.want)
@@ -211,5 +213,34 @@ func TestCreationIPTrustBoundary(t *testing.T) {
 	r.Header.Set("X-Forwarded-For", "198.51.100.7")
 	if got := s.clientIP(r); got != "192.0.2.1" {
 		t.Fatalf("direct request trusted forwarding header: %q", got)
+	}
+}
+
+func TestForwardedIPRequiresSecretAndSingleValue(t *testing.T) {
+	cfg := config.Default()
+	cfg.EdgeSharedSecret = "a-32-byte-secret-for-cloudflare-edge"
+	s := &Server{cfg: cfg}
+	for _, tt := range []struct {
+		name, secret string
+		values       []string
+		want         string
+	}{
+		{"authenticated single IP", cfg.EdgeSharedSecret, []string{"203.0.113.41"}, "203.0.113.41"},
+		{"missing secret", "", []string{"203.0.113.41"}, "10.0.0.1"},
+		{"wrong secret", "wrong", []string{"203.0.113.41"}, "10.0.0.1"},
+		{"multiple headers", cfg.EdgeSharedSecret, []string{"203.0.113.41", "203.0.113.42"}, "10.0.0.1"},
+		{"IPv6 zone", cfg.EdgeSharedSecret, []string{"fe80::1%en0"}, "10.0.0.1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/v1/experiences", nil)
+			r.RemoteAddr = "10.0.0.1:1234"
+			r.Header.Set("X-Trace-Edge-Secret", tt.secret)
+			for _, value := range tt.values {
+				r.Header.Add("X-Trace-Client-IP", value)
+			}
+			if got := s.clientIP(r); got != tt.want {
+				t.Fatalf("client IP = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

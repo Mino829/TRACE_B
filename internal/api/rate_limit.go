@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"net"
 	"net/http"
 	"strconv"
@@ -93,9 +94,12 @@ func (l *rateLimiter) allow(now time.Time, rules ...rateRule) int {
 // secret, checked by middleware before this handler runs. Direct clients and
 // missing/invalid forwarded values use the transport peer, never XFF.
 func (s *Server) clientIP(r *http.Request) string {
-	if s.cfg.EdgeSharedSecret != "" {
-		if ip := net.ParseIP(r.Header.Get("X-Trace-Client-IP")); ip != nil {
-			return ip.String()
+	if s.cfg.EdgeSharedSecret != "" &&
+		subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Trace-Edge-Secret")), []byte(s.cfg.EdgeSharedSecret)) == 1 {
+		if values := r.Header.Values("X-Trace-Client-IP"); len(values) == 1 {
+			if ip := net.ParseIP(values[0]); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -137,10 +141,23 @@ func (s *Server) limitedSession(kind string, next http.HandlerFunc) http.Handler
 		if kind == "position" {
 			rate, burst = 0.2, 5
 		}
-		if wait := s.limiter.allow(s.now(),
-			rateRule{key: kind + "/" + identity, rate: rate, burst: burst},
-			rateRule{key: "authenticated/ip/" + ip, rate: 20, burst: 120},
-			rateRule{key: "api/global", rate: 100, burst: 100}); wait > 0 {
+		budgetKind := kind
+		if kind == "experience-delete" {
+			budgetKind = "session"
+		}
+		rules := [4]rateRule{
+			{key: budgetKind + "/" + identity, rate: rate, burst: burst},
+			{key: "authenticated/ip/" + ip, rate: 20, burst: 120},
+			{key: "api/global", rate: 100, burst: 100},
+		}
+		count := 3
+		if liveToken := r.Header.Get("X-Trace-Live-Token"); kind == "experience-delete" && liveToken != "" {
+			if liveIdentity := hash(liveToken); liveIdentity != identity {
+				rules[count] = rateRule{key: "session/" + liveIdentity, rate: 0.5, burst: 30}
+				count++
+			}
+		}
+		if wait := s.limiter.allow(s.now(), rules[:count]...); wait > 0 {
 			s.rateLimited(w, r, wait)
 			return
 		}
