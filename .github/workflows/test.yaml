@@ -56,6 +56,8 @@ jobs:
       # This revision's schema was manually applied and verified during initial setup.
       STAGING_SCHEMA_BASELINE: ${{ vars.STAGING_SCHEMA_BASELINE || '624ecc1bba4a7c61529b609a1110facf58d38746' }}
       GH_TOKEN: ${{ github.token }}
+      # Probe only; keep this synchronized with the numbered runtime edge Secret.
+      TRACE_STAGING_EDGE_SHARED_SECRET: ${{ secrets.STAGING_EDGE_SHARED_SECRET }}
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
