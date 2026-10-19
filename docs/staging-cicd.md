@@ -30,6 +30,7 @@ Cloud Buildのpushトリガーは作りません。既存Actionsのテストと�
 - 受付はfalse。サービスのIAM認証は有効で、allUsers / allAuthenticatedUsersへのバインディングがないこと。
 - 現在のサービスが正常で、トラフィックが既存の1リビジョンへ100%向いていること。
 - `DATABASE_URL` は設定しないこと（DB_*設定を上書きするため）。
+- APIで`TRACE_EDGE_SHARED_SECRET`を有効にする場合はSecret Managerの数値版を参照し、同じ値をGitHub Actions Secret `STAGING_EDGE_SHARED_SECRET`へ設定すること。無効な場合はGitHub側も未設定にする。
 - 初回DB構造の確認済みコミットは `624ecc1bba4a7c61529b609a1110facf58d38746`。この構造を変更するコードは自動更新を停止する。
 
 以降は管理者がCloud Shellで実行する一度限りのセットアップです。リソース作成・権限付与・課金が発生します。
@@ -178,6 +179,56 @@ GitHub Actionsの設定だけでなく、Google側でも特定リポジトリ・
 GitHub Environmentの有料プラン機能には依存していません。利用できる場合はmainの保護ルールとCIファイルへのレビュー要件を追加してください。
 依存Actionsは検証時のコミットSHAで固定しているため、更新はレビューして行います。
 
+### edge共有secretを有効にしたprobe
+
+| 資格情報 | 役割 | CIでの扱い |
+|---|---|---|
+| WIFで取得する短期IDトークン | Cloud RunのIAM認証 | 候補・通常URLのhealth/configへAuthorizationヘッダーで送信 |
+| `STAGING_EDGE_SHARED_SECRET` | Goの`/v1/*`へのアクセス確認 | `TRACE_STAGING_EDGE_SHARED_SECRET`環境変数から読み、configだけへ`X-Trace-Edge-Secret`で送信 |
+| 参加者Bearer token | 個別セッションの操作 | 受付停止の配備probeでは使用しない |
+
+Cloud Runの`TRACE_EDGE_SHARED_SECRET`は平文環境変数や`latest`ではなく、Secret Managerの数値版を参照させます。管理者は同じ値を **Repository Secret** `STAGING_EDGE_SHARED_SECRET`へ登録してください。Repository Variableへ値を置かず、コマンド引数・チャット・設定ファイルへ貼り付けないでください。CI用の値は32文字以上の空白・改行を含まない可視ASCII文字とします。
+
+CIはSecret Managerから値を読み出さず、デプロイ用アカウントへSecret Accessorを追加しません。その代わり、両保管先の同期が運用上の前提になります。API側のSecret参照があるのにGitHub側が空、API側が無効なのにGitHub側だけ設定済み、数値版以外の参照、不正なヘッダー値はprepare段階でビルド・配備前に拒否します。値そのものの不一致は候補configの403で検出し、通常トラフィックを切り替えません。切替後のconfig確認が失敗した場合も既存のrollback対象です。
+
+Secretの同期変更は自動化を止め、進行中の配備が終了してから行います。APIの数値版とGitHub Secretを同じ値へ更新し、認証付きの疎通を確認してから再開してください。値はstate JSON、GitHub output、Summaryへ保存しません。workflowのdeployジョブ環境には存在するため、mainとworkflowの変更権限・レビューを保護してください。PRのtestジョブには渡しません。
+
+### 最初は非公開Backendだけを確認する
+
+Cloudflare WorkerのIAMトークン取得方式と正式採否は別途未決定です。最初のstaging配備ではCloud Runを一般公開せず、開発者の認証付き経路で確認します。管理者がCloud Shell等で以下を実行します。
+
+```sh
+gcloud run services proxy trace-backend --project=trace-staging-507216 \
+  --region=asia-northeast1 --port=8085
+```
+
+同じ端末の別ターミナルで、secretをコマンド引数へ置かずに確認します。IAM認証は上のプロキシが担当します。edge secretを無効にしている場合は空入力とします。
+
+```sh
+python3 - <<'PY'
+import getpass
+import json
+import urllib.request
+
+secret = getpass.getpass("Staging edge secret (empty if disabled): ")
+for path in ("/health/ready", "/v1/public/config"):
+    headers = {"Accept": "application/json"}
+    if path.startswith("/v1/") and secret:
+        headers["X-Trace-Edge-Secret"] = secret
+    request = urllib.request.Request("http://127.0.0.1:8085" + path, headers=headers)
+    with urllib.request.urlopen(request, timeout=10) as response:
+        data = json.load(response)
+    if path == "/health/ready":
+        assert data.get("status") == "ready"
+    else:
+        assert data.get("registrationOpen") is False
+    print(path, "OK")
+PY
+```
+
+これは配備・DB ready・受付停止の確認であり、参加者E2Eではありません。実際のWIF・IAM、Cloud Build、清掃ジョブ、切替と復旧はクラウド上で別途検証します。Cloudflareからの参加→位置→停止→削除が完了するまでBackend #5全体は閉じません。本番提供者の承認、実参加者データの利用承認や一般公開の代替にもなりません。
+
+
 ## 6. 運用と復旧
 
 - 自動化を止める：Repository variable `STAGING_DEPLOY_ENABLED=false`。実行中のジョブは止まらず、新しい実行から無効になる。
@@ -210,7 +261,7 @@ go test ./...
 go vet ./...
 ```
 
-PythonテストはGoogle CloudとHTTP応答をすべて模擬し、実際のデプロイ・DB削除を行いません。
+PythonテストではGoogle Cloud操作を模擬し、認証付きprobeはループバックHTTPサーバーでも検証します。外部クラウドへの通信・実際のデプロイ・DB削除は行いません。
 GoのAPI/DB統合テストは、専用DBを指定した `make integration` で別途確認します。GitHubのtestジョブではPostgreSQLを起動して実行します。
 実際のWIF・IAM・Cloud Build・Cloud Runの疎通は、セットアップ後の初回Actions実行で検証する必要があります。
 

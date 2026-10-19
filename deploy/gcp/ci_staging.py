@@ -37,15 +37,21 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RefuseRelease("Refusing a redirect during an authenticated request")
 
 
-def request_json(url, token):
+def request_json(url, token, *, edge_secret=None):
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if edge_secret:
+        headers["X-Trace-Edge-Secret"] = edge_secret
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as response:
-        if response.status != 200:
-            raise RefuseRelease(f"Unexpected HTTP status: {response.status}")
-        return json.load(response)
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as response:
+            if response.status != 200:
+                raise RefuseRelease(f"Unexpected HTTP status: {response.status}")
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise
 
 
 def run(*args, timeout=180):
@@ -71,6 +77,7 @@ def require_private(url):
     try:
         request_json(f"{url}/health/ready", None)
     except urllib.error.HTTPError as error:
+        error.close()
         if error.code in (401, 403):
             return
         raise
@@ -109,6 +116,26 @@ def check_runtime(spec, mode):
     secret = env.get("DB_PASSWORD", {}).get("valueFrom", {}).get("secretKeyRef", {})
     if secret.get("name") != "trace-app-db-password" or not re.fullmatch(r"[1-9][0-9]*", secret.get("key", "")):
         raise RefuseRelease("DB_PASSWORD must reference a numbered app-password Secret version")
+    if mode == "serve":
+        edge = env.get("TRACE_EDGE_SHARED_SECRET", {})
+        probe_secret = probe_edge_secret()
+        if not edge or edge.get("value") == "":
+            if probe_secret:
+                raise RefuseRelease("Remove the unused STAGING_EDGE_SHARED_SECRET or configure the runtime edge Secret")
+        else:
+            ref = edge.get("valueFrom", {}).get("secretKeyRef", {})
+            if not ref.get("name") or not re.fullmatch(r"[1-9][0-9]*", ref.get("key", "")):
+                raise RefuseRelease("TRACE_EDGE_SHARED_SECRET must reference a numbered Secret version")
+            if not probe_secret:
+                raise RefuseRelease("Set STAGING_EDGE_SHARED_SECRET to match the runtime edge Secret before deploying")
+
+
+def probe_edge_secret():
+    secret = os.environ.get("TRACE_STAGING_EDGE_SHARED_SECRET", "")
+    if secret and not re.fullmatch(r"[\x21-\x7e]{32,}", secret):
+        # Reject unsafe header values before urllib can include them in an error.
+        raise RefuseRelease("STAGING_EDGE_SHARED_SECRET must contain at least 32 visible ASCII characters")
+    return secret
 
 
 class Release:
@@ -227,10 +254,11 @@ class Release:
         token = os.environ.get("TRACE_ID_TOKEN", "")
         if not token:
             raise RefuseRelease("Missing private health-check ID token")
+        edge_secret = probe_edge_secret()
         for attempt in range(3):
             try:
                 ready = request_json(f"{url}/health/ready", token)
-                config = request_json(f"{url}/v1/public/config", token)
+                config = request_json(f"{url}/v1/public/config", token, edge_secret=edge_secret)
                 if ready.get("status") != "ready" or config.get("registrationOpen") is not False:
                     raise RefuseRelease("Health check failed or registration is not closed")
                 return

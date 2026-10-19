@@ -1,12 +1,15 @@
-"""Offline tests: no Google Cloud/GitHub requests and no production DB access."""
+"""Offline tests: loopback HTTP only, no Google Cloud/GitHub or production DB access."""
 
 import copy
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -29,6 +32,44 @@ def runtime(mode):
     return {"serviceAccountName": ci.RUNTIME_SA, "containers": [{"image": OLD_IMAGE, "args": [mode], "env": env}]}
 
 
+@contextmanager
+def private_probe_server(edge_secret):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.headers.get("Authorization") != "Bearer fake-id-token":
+                self.send_error(403)
+                return
+            if self.path == "/v1/public/config":
+                if self.headers.get("X-Trace-Edge-Secret") != edge_secret:
+                    self.send_error(403)
+                    return
+                payload = {"registrationOpen": False}
+            elif self.path == "/health/ready":
+                payload = {"status": "ready"}
+            else:
+                self.send_error(404)
+                return
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -38,6 +79,7 @@ class ReleaseTests(unittest.TestCase):
                "GH_TOKEN": "fake-gh-token", "GCP_WIF_PROVIDER": "test-provider", "STAGING_SCHEMA_BASELINE": BASELINE,
                "GITHUB_OUTPUT": f"{self.temp.name}/outputs", "GITHUB_STEP_SUMMARY": f"{self.temp.name}/summary",
                "TRACE_ID_TOKEN": "fake-id-token"}
+        env["TRACE_STAGING_EDGE_SHARED_SECRET"] = ""
         self.env_patch = patch.dict(os.environ, env)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
@@ -60,7 +102,7 @@ class ReleaseTests(unittest.TestCase):
         self.addCleanup(self.http_patch.stop)
         self.release = ci.Release()
 
-    def http(self, url, token):
+    def http(self, url, token, *, edge_secret=None):
         if url.startswith("https://api.github.com/"):
             return {"object": {"sha": SHA}}
         if token is None:
@@ -308,6 +350,97 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ci.RefuseRelease, "Manual recovery"):
             self.release.rollback()
         self.assertEqual(ci.active_revision(self.service), "external-revision")
+        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], OLD_IMAGE)
+
+    def enable_edge(self):
+        self.service["spec"]["template"]["spec"]["containers"][0]["env"].append({
+            "name": "TRACE_EDGE_SHARED_SECRET",
+            "valueFrom": {"secretKeyRef": {"name": "trace-staging-edge-secret", "key": "1"}},
+        })
+
+    def test_edge_configuration_must_match_before_candidate_deployment(self):
+        self.enable_edge()
+        with self.assertRaisesRegex(ci.RefuseRelease, "Set STAGING_EDGE_SHARED_SECRET"):
+            self.release.prepare()
+        with patch.dict(os.environ, {"TRACE_STAGING_EDGE_SHARED_SECRET": "test-edge-secret-for-private-staging"}):
+            edge = self.service["spec"]["template"]["spec"]["containers"][0]["env"][-1]
+            edge["valueFrom"]["secretKeyRef"]["key"] = "latest"
+            with self.assertRaisesRegex(ci.RefuseRelease, "numbered Secret"):
+                self.release.prepare()
+        self.assertFalse(any(call[:3] == ("run", "services", "update") for call in self.calls))
+
+    def test_unused_or_unsafe_probe_secret_is_rejected_without_disclosure(self):
+        for secret in ("test-edge-secret-for-private-staging", "unsafe-secret-with-newline\n" + "x" * 32):
+            with self.subTest(secret_kind="newline" if "\n" in secret else "unused"):
+                with patch.dict(os.environ, {"TRACE_STAGING_EDGE_SHARED_SECRET": secret}):
+                    with self.assertRaises(ci.RefuseRelease) as rejected:
+                        self.release.prepare()
+                self.assertNotIn(secret, str(rejected.exception))
+        self.assertFalse(any(call[:3] == ("run", "services", "update") for call in self.calls))
+
+    def test_edge_authenticated_probes_promote_without_persisting_credentials(self):
+        secret = "test-edge-secret-for-private-staging"
+        self.enable_edge()
+        with patch.dict(os.environ, {"TRACE_STAGING_EDGE_SHARED_SECRET": secret}):
+            self.candidate()
+            with private_probe_server(secret) as url, patch.object(self.release, "newest"):
+                self.release.state.update(candidate_url=url, service_url=url)
+                self.http_patch.stop()
+                try:
+                    self.release.verify()
+                    self.release.cleanup_job()
+                    self.release.promote()
+                finally:
+                    self.http_patch.start()
+        self.assertTrue(self.release.state["success"])
+        self.assertEqual(ci.active_revision(self.service), "new-revision")
+        for credential in (secret, "fake-id-token"):
+            self.assertNotIn(credential, self.release.state_path.read_text())
+            self.assertNotIn(credential, Path(os.environ["GITHUB_STEP_SUMMARY"]).read_text())
+
+    def test_edge_auth_failure_restores_api_and_cleanup_after_switch(self):
+        secret = "test-edge-secret-for-private-staging"
+        self.enable_edge()
+        with patch.dict(os.environ, {"TRACE_STAGING_EDGE_SHARED_SECRET": secret}):
+            self.candidate()
+            with (private_probe_server(secret) as candidate,
+                  private_probe_server("different-edge-secret-for-staging") as service,
+                  patch.object(self.release, "newest")):
+                self.release.state.update(candidate_url=candidate, service_url=service)
+                self.http_patch.stop()
+                try:
+                    self.release.verify()
+                    self.release.cleanup_job()
+                    with patch.object(ci.time, "sleep"):
+                        with self.assertRaises(ci.urllib.error.HTTPError) as rejected:
+                            self.release.promote()
+                    self.assertEqual(rejected.exception.code, 403)
+                    self.release.rollback()
+                finally:
+                    self.http_patch.start()
+        self.assertEqual(ci.active_revision(self.service), "old-revision")
+        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], OLD_IMAGE)
+        self.assertFalse(self.release.state.get("success", False))
+        self.assertNotIn(secret, self.release.state_path.read_text())
+
+    def test_wrong_candidate_edge_secret_never_switches_traffic(self):
+        secret = "test-edge-secret-for-private-staging"
+        self.enable_edge()
+        with patch.dict(os.environ, {"TRACE_STAGING_EDGE_SHARED_SECRET": secret}):
+            self.candidate()
+            with private_probe_server("different-edge-secret-for-staging") as url:
+                self.release.state["candidate_url"] = url
+                self.http_patch.stop()
+                try:
+                    with patch.object(ci.time, "sleep"):
+                        with self.assertRaises(ci.urllib.error.HTTPError) as rejected:
+                            self.release.verify()
+                    self.assertEqual(rejected.exception.code, 403)
+                    self.release.rollback()
+                finally:
+                    self.http_patch.start()
+        self.assertFalse(self.release.state.get("candidate_verified", False))
+        self.assertEqual(ci.active_revision(self.service), "old-revision")
         self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], OLD_IMAGE)
 
     def test_url_and_redirect_safety(self):
