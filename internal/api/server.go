@@ -49,7 +49,7 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service) http.Handler
 	mux.HandleFunc("GET /v1/public/config", server.limitedPublic("config", server.publicConfig))
 	mux.HandleFunc("POST /v1/experiences", server.limitedPublic("create", server.createExperience))
 	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.limitedSession("session", server.experienceState))
-	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.limitedSession("session", server.deleteExperience))
+	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.limitedSession("experience-delete", server.deleteExperience))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.limitedSession("position", server.atomic((*Server).updatePosition)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.limitedSession("session", server.atomic((*Server).onSite)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopLive)))
@@ -80,6 +80,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Trace-Live-Token")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 		}
 		if r.Method == http.MethodOptions {
 			if origin := r.Header.Get("Origin"); origin != "" && !s.originAllowed(origin) {
