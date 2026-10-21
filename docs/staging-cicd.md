@@ -31,7 +31,7 @@ Cloud Buildのpushトリガーは作りません。既存Actionsのテストと�
 - 現在のサービスが正常で、トラフィックが既存の1リビジョンへ100%向いていること。
 - `DATABASE_URL` は設定しないこと（DB_*設定を上書きするため）。
 - APIで`TRACE_EDGE_SHARED_SECRET`を有効にする場合はSecret Managerの数値版を参照し、同じ値をGitHub Actions Secret `STAGING_EDGE_SHARED_SECRET`へ設定すること。無効な場合はGitHub側も未設定にする。
-- 初回DB構造の確認済みコミットは `624ecc1bba4a7c61529b609a1110facf58d38746`。この構造を変更するコードは自動更新を停止する。
+- `624ecc1bba4a7c61529b609a1110facf58d38746` は初回schema version 1だけの履歴上の基準であり、現行mainのmigration 002を適用済みという証拠にはならない。管理者が実DBの適用版・権限とAPI/清掃ジョブの互換性を確認するまで自動デプロイを有効にしない。
 
 以降は管理者がCloud Shellで実行する一度限りのセットアップです。リソース作成・権限付与・課金が発生します。
 同名リソースが既にある場合はまず内容を確認し、その作成コマンドだけ省略してください。削除して作り直したり、エラーを無視して次へ進んだりしないでください。
@@ -169,13 +169,14 @@ GitHub Actionsの設定だけでなく、Google側でも特定リポジトリ・
 
 1. `Mino829/TRACE_B` → Settings → Secrets and variables → Actions → Variables を開く。
 2. Repository variable `GCP_WORKLOAD_IDENTITY_PROVIDER` に、上で控えたproviderのフル名を設定する。
-3. 初回は `STAGING_DEPLOY_ENABLED=false` のまま、この変更をレビューしてmainへpushし、`test`ジョブの成功を確認する。
-4. Repository variable `STAGING_DEPLOY_ENABLED` を文字列 `true` にする。
-5. 現在のmainに対するpush実行を再実行するか、次のレビュー済み変更をmainへpushする。PR実行の再実行ではデプロイされない。
-6. Actionsの `Deploy staging after tests` が成功し、Summaryにコミット・digest・リビジョンが表示されることを確認する。
-7. Cloud Runの配信先がそのリビジョンであること、削除ジョブが同じdigestで動くことを確認する。
+3. 初回手動配備の前後を通じて `STAGING_DEPLOY_ENABLED` は未設定または `false` に保つ。実DBのmigration 002と権限を確認し、未適用なら下記の非互換DB変更手順に従って旧API/清掃ジョブを停止してから手動適用する。現行schema対応版の起動・ready・清掃・復旧を確認する。
+4. 実DBへ適用・検証したschemaと権限に対応する **mainのフルコミットSHA** をRepository variable `STAGING_SCHEMA_BASELINE` に設定する。旧version 1のSHAやPRのSHAを、検証済みの代わりに設定しない。未設定・不正値ならCIはクラウド操作前に停止する。
+5. その状態でレビュー済みの変更をmainへpushし、`test`ジョブの成功を確認する。Repository variable `STAGING_DEPLOY_ENABLED` を文字列 `true` にするのは、手動配備の疎通とrollback確認が済んだ後だけにする。
+6. 現在のmainに対するpush実行を再実行するか、次のレビュー済み変更をmainへpushする。PR実行の再実行ではデプロイされない。
+7. Actionsの `Deploy staging after tests` が成功し、Summaryにコミット・digest・リビジョンが表示されることを確認する。
+8. Cloud Runの配信先がそのリビジョンであること、削除ジョブが同じdigestで動くことを確認する。
 
-`STAGING_SCHEMA_BASELINE` は通常は未設定で構いません。migration実装・SQL・権限SQLに変更がある場合は自動デプロイを止め、手動適用・権限・ready・旧版互換性を確認した後に限り、そのDB構造に対応するmainのフルコミットSHAへ更新します。コード変更をマージしただけではbaselineを進めません。
+`STAGING_SCHEMA_BASELINE` は常に明示設定が必要です。migration実装・SQL・権限SQLに変更がある場合は自動デプロイを止め、手動適用・権限・ready・旧版互換性を確認した後に限り、そのDB構造に対応するmainのフルコミットSHAへ更新します。コード変更をマージしただけではbaselineを進めません。写真のPR #18をマージした場合もmigration 003と権限を実DBで検証するまで同じ手順です。
 GitHub Environmentの有料プラン機能には依存していません。利用できる場合はmainの保護ルールとCIファイルへのレビュー要件を追加してください。
 依存Actionsは検証時のコミットSHAで固定しているため、更新はレビューして行います。
 

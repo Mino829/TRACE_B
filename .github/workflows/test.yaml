@@ -53,8 +53,8 @@ jobs:
       GCP_PROJECT_ID: trace-staging-507216
       GCP_DEPLOY_SA: trace-github-deploy@trace-staging-507216.iam.gserviceaccount.com
       GCP_WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      # This revision's schema was manually applied and verified during initial setup.
-      STAGING_SCHEMA_BASELINE: ${{ vars.STAGING_SCHEMA_BASELINE || '624ecc1bba4a7c61529b609a1110facf58d38746' }}
+      # Require the exact main commit whose schema was manually applied and verified.
+      STAGING_SCHEMA_BASELINE: ${{ vars.STAGING_SCHEMA_BASELINE }}
       GH_TOKEN: ${{ github.token }}
       # Probe only; keep this synchronized with the numbered runtime edge Secret.
       TRACE_STAGING_EDGE_SHARED_SECRET: ${{ secrets.STAGING_EDGE_SHARED_SECRET }}
