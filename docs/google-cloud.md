@@ -65,8 +65,8 @@ set -a
 set +a
 ```
 
-`settings.env`はプロジェクトID、SQL接続名、イメージのリリースタグ、サービスアカウント、Secretの数値バージョンです。DBパスワード自体は含めません。
-`runtime.env.yaml`はDB名、CORSの参加画面URL、現地の境界・座標原点、承認済み同意文等です。`DB_HOST`のSQL接続名をsettingsと一致させてください。`TRACE_REGISTRATION_OPEN`は最初はfalseにします。
+`settings.env`はプロジェクトID、SQL接続名、イメージのリリースタグ、サービスアカウント、Secretの数値バージョンです。DBパスワード自体は含めません。Workerとの接続検証でedge secretを使う場合だけ`GCP_EDGE_SHARED_SECRET=trace-edge-shared-secret:1`のように数値版参照を設定し、実行アカウントにそのSecretのSecret Accessorを付与します。値そのものはファイル・コマンド引数・ログに置かず、GitHubの`STAGING_EDGE_SHARED_SECRET`と同期してください。未指定のまま`serve`を再実行するとAPIからedge secret参照が外れます。公開経路で使用する場合は再実行前に必ず設定を確認してください。
+`runtime.env.yaml`はDB名、CORSの参加画面URL、現地の境界・座標原点、承認済み同意文等です。`DB_HOST`のSQL接続名をsettingsと一致させてください。`TRACE_EDGE_SHARED_SECRET`はここに書かず、`settings.env`の数値版参照からSecret Manager経由でAPIにだけ注入します。清掃ジョブには不要です。`TRACE_REGISTRATION_OPEN`は最初はfalseにします。
 
 ローカルで`make integration`と`go vet ./...`を通した後、Cloud BuildでLinux/amd64イメージを作成します。
 
