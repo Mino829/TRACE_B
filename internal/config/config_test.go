@@ -11,6 +11,9 @@ func baseEnv(t *testing.T) {
 	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_SESSION_TTL", "TRACE_MEMORY_SESSION_TTL", "TRACE_LIVE_SESSION_TTL", "TRACE_DATA_RETENTION", "TRACE_EDGE_SHARED_SECRET"} {
 		t.Setenv(k, "")
 	}
+	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL"} {
+		t.Setenv(key, "")
+	}
 	t.Setenv("DATABASE_URL", "postgresql://local:local@localhost/trace?sslmode=disable")
 }
 func TestCloudRunPortAndPool(t *testing.T) {
@@ -81,5 +84,28 @@ func TestDatabaseMissingDoesNotExposeSecrets(t *testing.T) {
 	_, err := FromEnv()
 	if err == nil || strings.Contains(err.Error(), "do-not-log-this") {
 		t.Fatal("unsafe or absent error")
+	}
+}
+
+func TestPhotoStorageCannotBeEnabledWithoutCompletePrivateConfiguration(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("TRACE_PHOTO_ENABLED", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("enabled photos accepted without storage")
+	}
+	t.Setenv("TRACE_PHOTO_BUCKET", "trace-private-photos")
+	t.Setenv("TRACE_PHOTO_SIGNER_EMAIL", "runtime@example.iam.gserviceaccount.com")
+	cfg, err := FromEnv()
+	if err != nil || !cfg.PhotoEnabled {
+		t.Fatalf("configured photos rejected: %v", err)
+	}
+	t.Setenv("TRACE_PHOTO_ENABLED", "false")
+	cfg, err = FromEnv()
+	if err != nil || cfg.PhotoEnabled || cfg.PhotoBucket == "" {
+		t.Fatal("disabling new photos must retain storage for deletion")
+	}
+	t.Setenv("TRACE_PHOTO_SIGNER_EMAIL", "")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("incomplete storage configuration accepted")
 	}
 }

@@ -12,6 +12,8 @@ import (
 
 	"github.com/Mino829/trace_Backend/internal/api"
 	"github.com/Mino829/trace_Backend/internal/config"
+	"github.com/Mino829/trace_Backend/internal/photo"
+	"github.com/Mino829/trace_Backend/internal/photoasset"
 	"github.com/Mino829/trace_Backend/internal/store"
 )
 
@@ -45,18 +47,7 @@ func main() {
 		}
 		slog.Info("database migration complete")
 		return
-	case "cleanup":
-		if err := db.Ping(startupCtx); err != nil {
-			slog.Error("schema not ready; run migrate first")
-			os.Exit(1)
-		}
-		if err := db.Cleanup(startupCtx, time.Now().UTC()); err != nil {
-			slog.Error("cleanup failed", "error", err)
-			os.Exit(1)
-		}
-		slog.Info("database cleanup complete")
-		return
-	case "serve":
+	case "serve", "cleanup":
 	default:
 		slog.Error("usage: trace-backend [serve|migrate|cleanup]")
 		os.Exit(1)
@@ -65,22 +56,42 @@ func main() {
 		slog.Error("schema not ready; run migrate first")
 		os.Exit(1)
 	}
-	if err := db.Cleanup(startupCtx, time.Now().UTC()); err != nil {
-		slog.Error("startup cleanup failed", "error", err)
+	var photos *photo.Service
+	if cfg.PhotoBucket != "" {
+		assets, err := photoasset.NewGCS(startupCtx, cfg.PhotoBucket, cfg.PhotoSignerEmail)
+		if err != nil {
+			slog.Error("photo storage initialization failed; check private bucket policy and runtime permissions")
+			os.Exit(1)
+		}
+		defer assets.Close()
+		photos = photo.New(db, assets)
+	} else {
+		required, err := db.PhotoStorageRequired(startupCtx)
+		if err != nil || required {
+			slog.Error("photo storage configuration is required while retained assets or upload fences exist")
+			os.Exit(1)
+		}
+	}
+	if err := cleanupData(startupCtx, db, photos, time.Now().UTC()); err != nil {
+		slog.Error("startup cleanup failed; persisted deletion intents are retained")
 		os.Exit(1)
+	}
+	if mode == "cleanup" {
+		slog.Info("database and photo cleanup complete")
+		return
 	}
 	cancelStartup()
 
 	server := &http.Server{
 		Addr:              cfg.Address,
-		Handler:           api.New(cfg, db),
+		Handler:           api.New(cfg, db, photos),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	go cleanupExpired(ctx, db)
+	go cleanupExpired(ctx, db, photos)
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -100,7 +111,7 @@ func main() {
 	<-shutdownDone
 }
 
-func cleanupExpired(ctx context.Context, db *store.Store) {
+func cleanupExpired(ctx context.Context, db *store.Store, photos *photo.Service) {
 	ticker := time.NewTicker(30 * time.Second)
 	positionTicker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -118,10 +129,23 @@ func cleanupExpired(ctx context.Context, db *store.Store) {
 				cancel()
 				continue
 			}
-			if err := db.Cleanup(cleanupCtx, now.UTC()); err != nil && ctx.Err() == nil {
-				slog.Error("cleanup expired data", "error", err)
+			if err := cleanupData(cleanupCtx, db, photos, now.UTC()); err != nil && ctx.Err() == nil {
+				slog.Error("cleanup expired data failed; persisted deletion intents are retained")
 			}
 			cancel()
 		}
 	}
+}
+
+func cleanupData(ctx context.Context, db *store.Store, photos *photo.Service, now time.Time) error {
+	if err := db.Cleanup(ctx, now); err != nil {
+		return err
+	}
+	if photos == nil {
+		return nil
+	}
+	if err := photos.Purge(ctx, now); err != nil {
+		return err
+	}
+	return db.Cleanup(ctx, now)
 }

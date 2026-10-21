@@ -17,6 +17,9 @@ type Config struct {
 	AllowedOrigins             []string
 	EdgeSharedSecret           string
 	RegistrationOpen           bool
+	PhotoEnabled               bool
+	PhotoBucket                string
+	PhotoSignerEmail           string
 	MemoryConsentVersion       string
 	LiveConsentVersion         string
 	OnSiteConsentVersion       string
@@ -92,6 +95,22 @@ func FromEnv() (Config, error) {
 	var err error
 	if cfg.RegistrationOpen, err = boolEnv("TRACE_REGISTRATION_OPEN", cfg.RegistrationOpen); err != nil {
 		return Config{}, err
+	}
+	if cfg.PhotoEnabled, err = boolEnv("TRACE_PHOTO_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	cfg.PhotoBucket = os.Getenv("TRACE_PHOTO_BUCKET")
+	cfg.PhotoSignerEmail = os.Getenv("TRACE_PHOTO_SIGNER_EMAIL")
+	if cfg.PhotoEnabled && (cfg.PhotoBucket == "" || cfg.PhotoSignerEmail == "") {
+		return Config{}, fmt.Errorf("enabled photos require TRACE_PHOTO_BUCKET and TRACE_PHOTO_SIGNER_EMAIL")
+	}
+	if (cfg.PhotoBucket == "") != (cfg.PhotoSignerEmail == "") {
+		return Config{}, fmt.Errorf("photo storage requires both TRACE_PHOTO_BUCKET and TRACE_PHOTO_SIGNER_EMAIL")
+	}
+	if strings.ContainsAny(cfg.PhotoBucket, "/\\ \t\r\n") ||
+		(cfg.PhotoSignerEmail != "" && (!strings.Contains(cfg.PhotoSignerEmail, "@") ||
+			!strings.HasSuffix(cfg.PhotoSignerEmail, ".iam.gserviceaccount.com") || strings.ContainsAny(cfg.PhotoSignerEmail, "/\\ \t\r\n"))) {
+		return Config{}, fmt.Errorf("photo bucket or signing service account is invalid")
 	}
 	for name, target := range map[string]*time.Duration{
 		"TRACE_LIVE_POSITION_TTL":  &cfg.LivePositionTTL,

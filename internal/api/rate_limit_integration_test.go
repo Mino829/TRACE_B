@@ -18,7 +18,7 @@ func TestCombinedDeletionHonorsBothControlBudgets(t *testing.T) {
 		t.Run(limited, func(t *testing.T) {
 			f := testdb.Open(t)
 			cfg := config.Default()
-			handler := api.New(cfg, f.Store)
+			handler := api.New(cfg, f.Store, nil)
 			created := createExperience(t, handler, cfg)
 			if _, err := f.SQL.ExecContext(t.Context(), "UPDATE live_presence_sessions SET presence_phase='arrived' WHERE id=$1", created.Live.SessionID); err != nil {
 				t.Fatal(err)
