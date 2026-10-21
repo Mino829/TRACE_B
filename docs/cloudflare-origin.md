@@ -13,7 +13,7 @@
 
 既存のstagingはCloud Run IAMで非公開にしている。共有ヘッダーだけではIAM認証を通過できないため、stagingの公開権限を変更せず、検証用の接続経路を別途設計する。本番用サービスも`--allow-unauthenticated`を設定する前に、以下を完了する。既存の`deploy/gcp/deploy.sh`は非公開設定のまま維持する。
 
-最初のstaging配備は非公開Backendを先行し、[認証付き開発者プロキシとCI probe](staging-cicd.md#最初は非公開backendだけを確認する)で確認する。CIのedge secretはGitHub Actions Secret `STAGING_EDGE_SHARED_SECRET`を使用し、Cloud Runの数値版Secretと同期する。これはCloudflare案の正式採用ではなく、WorkerからのIAM認証・参加者E2Eは未完了のまま残す。共有secretだけでIAMを迂回したり、接続試験のためにstagingを一般公開したりしない。
+最初のstaging配備は非公開Backendを先行し、[認証付き開発者プロキシとCI probe](staging-cicd.md#最初は非公開backendだけを確認する)で確認する。edge secretを有効にする場合は[手動配備設定](google-cloud.md#4-設定とビルド)の`GCP_EDGE_SHARED_SECRET`でSecret Managerの数値版をAPIへ指定し、GitHub Actions Secret `STAGING_EDGE_SHARED_SECRET`と値を同期する。`serve`再実行時も数値版参照を維持する。これはCloudflare案の正式採用ではなく、WorkerからのIAM認証・参加者E2Eは未完了のまま残す。共有secretだけでIAMを迂回したり、接続試験のためにstagingを一般公開したりしない。
 
 ## 公開経路を有効化する前の条件
 

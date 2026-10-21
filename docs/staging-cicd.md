@@ -188,7 +188,7 @@ GitHub Environmentの有料プラン機能には依存していません。利�
 | `STAGING_EDGE_SHARED_SECRET` | Goの`/v1/*`へのアクセス確認 | `TRACE_STAGING_EDGE_SHARED_SECRET`環境変数から読み、configだけへ`X-Trace-Edge-Secret`で送信 |
 | 参加者Bearer token | 個別セッションの操作 | 受付停止の配備probeでは使用しない |
 
-Cloud Runの`TRACE_EDGE_SHARED_SECRET`は平文環境変数や`latest`ではなく、Secret Managerの数値版を参照させます。管理者は同じ値を **Repository Secret** `STAGING_EDGE_SHARED_SECRET`へ登録してください。Repository Variableへ値を置かず、コマンド引数・チャット・設定ファイルへ貼り付けないでください。CI用の値は32文字以上の空白・改行を含まない可視ASCII文字とします。
+Cloud Runの`TRACE_EDGE_SHARED_SECRET`は平文環境変数や`latest`ではなく、Secret Managerの数値版を参照させます。手動配備では`settings.env`の`GCP_EDGE_SHARED_SECRET`に数値版参照だけを設定し、`deploy.sh serve`のAPIへ注入します。無指定で再配備すると参照が外れるため、edge secret有効中は必ず維持してください。管理者は同じ値を **Repository Secret** `STAGING_EDGE_SHARED_SECRET`へ登録してください。Repository Variableへ値を置かず、コマンド引数・チャット・設定ファイルへ貼り付けないでください。CI用の値は32文字以上の空白・改行を含まない可視ASCII文字とします。
 
 CIはSecret Managerから値を読み出さず、デプロイ用アカウントへSecret Accessorを追加しません。その代わり、両保管先の同期が運用上の前提になります。API側のSecret参照があるのにGitHub側が空、API側が無効なのにGitHub側だけ設定済み、数値版以外の参照、不正なヘッダー値はprepare段階でビルド・配備前に拒否します。値そのものの不一致は候補configの403で検出し、通常トラフィックを切り替えません。切替後のconfig確認が失敗した場合も既存のrollback対象です。
 
