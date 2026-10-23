@@ -22,6 +22,7 @@ import (
 
 type createdExperience struct {
 	ExperienceID string `json:"experienceId"`
+	LinkToken    string `json:"experienceLinkToken"`
 	Memory       struct {
 		SessionID        string    `json:"sessionId"`
 		ParticipantToken string    `json:"participantToken"`

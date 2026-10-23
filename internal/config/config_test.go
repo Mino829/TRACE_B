@@ -12,7 +12,8 @@ func baseEnv(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
-		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY"} {
+		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY",
+		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID"} {
 		t.Setenv(key, "")
 	}
 	for _, key := range []string{"TRACE_COORDINATE_VERSION", "TRACE_CAMPUS_GRAPH_VERSION", "TRACE_THREE_D_MAP_VERSION"} {
@@ -143,5 +144,35 @@ func TestSpatialVersionsAreExplicitAndPhotoFlagRemainsOff(t *testing.T) {
 	if err != nil || cfg.PhotoEnabled || cfg.CoordinateVersion != "toyosu-2026-08-28.1" ||
 		cfg.CampusGraphVersion != "toyosu-graph-2026-10-21.1.draft" || cfg.ThreeDMapVersion != "キャンパス全体.blend 2026-10-21" {
 		t.Fatalf("spatial version overrides: %+v, %v", cfg, err)
+	}
+}
+
+func TestArrivalIssuerAndProofKeysStaySeparateAndDisabledByDefault(t *testing.T) {
+	baseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil || cfg.ArrivalEnabled {
+		t.Fatalf("arrival must default off: %v", err)
+	}
+	t.Setenv("TRACE_ARRIVAL_ENABLED", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("enabled arrival without keys accepted")
+	}
+	issuer := "an-issuer-secret-unique-to-operator-1234"
+	proof := "proof-secret-unique-to-projector-4567"
+	t.Setenv("TRACE_ARRIVAL_ISSUER_KEY", issuer)
+	t.Setenv("TRACE_ARRIVAL_PROOF_KEY", issuer)
+	t.Setenv("TRACE_ARRIVAL_VENUE", "booth")
+	t.Setenv("TRACE_ARRIVAL_CHECKPOINT_ID", "entrance")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("shared issuer and QR key accepted")
+	}
+	t.Setenv("TRACE_ARRIVAL_PROOF_KEY", proof)
+	cfg, err = FromEnv()
+	if err != nil || !cfg.ArrivalEnabled {
+		t.Fatalf("valid arrival config rejected: %v", err)
+	}
+	t.Setenv("TRACE_EDGE_SHARED_SECRET", issuer)
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("issuer key reused as participant edge secret")
 	}
 }

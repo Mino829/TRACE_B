@@ -67,6 +67,7 @@ set +a
 
 `settings.env`はプロジェクトID、SQL接続名、イメージのリリースタグ、サービスアカウント、Secretの数値バージョンです。DBパスワード自体は含めません。Workerとの接続検証でedge secretを使う場合だけ`GCP_EDGE_SHARED_SECRET=trace-edge-shared-secret:1`のように数値版参照を設定し、実行アカウントにそのSecretのSecret Accessorを付与します。値そのものはファイル・コマンド引数・ログに置かず、GitHubの`STAGING_EDGE_SHARED_SECRET`と同期してください。未指定のまま`serve`を再実行するとAPIからedge secret参照が外れます。公開経路で使用する場合は再実行前に必ず設定を確認してください。
 `runtime.env.yaml`はDB名、CORSの参加画面URL、現地の境界・座標原点、承認済み同意文等です。`DB_HOST`のSQL接続名をsettingsと一致させてください。`TRACE_EDGE_SHARED_SECRET`はここに書かず、`settings.env`の数値版参照からSecret Manager経由でAPIにだけ注入します。清掃ジョブには不要です。`TRACE_REGISTRATION_OPEN`は最初はfalseにします。
+到着受付を有効化する場合、`runtime.env.yaml`の`TRACE_ARRIVAL_ENABLED`、会場/ブースIDを設定し、`settings.env`に互いに異なる数値版`GCP_ARRIVAL_ISSUER_SECRET`/`GCP_ARRIVAL_PROOF_SECRET`を指定します。`deploy.sh serve`は秘密値をAPIのみに注入し、清掃ジョブや参加者サイトへ渡しません。運営用APIのネットワーク分離・同意と受付停止手順を承認するまで無効のままにしてください。
 
 ローカルで`make integration`と`go vet ./...`を通した後、Cloud BuildでLinux/amd64イメージを作成します。
 
@@ -156,6 +157,7 @@ IAMの一般公開許可と受付開始は別操作です。レート制限は�
 
 - 新しい不変イメージをビルド→互換マイグレーション→権限更新→サービス更新→疎通試験。
 - 写真PR #18より前のmainに含まれるmigrationはschema version 1・2。`002_remove_live_positions.sql` は旧API/清掃ジョブと非互換のため、受付を停止し、旧API/ジョブを停止してから適用し、対応するAPI・ジョブを起動する（[切替手順](staging-cicd.md#6-運用と復旧)）。写真無効の先行配備にはversion 3は不要。PR #18マージ後は写真の有効/無効を問わずmigration 003と権限確認が必須。適用済みSQLを書き換えない。
+- 到着ブランチ統合後は`006_arrivals.sql`を適用し、`runtime-grants.sql`を再適用する。旧revision/清掃ジョブを停止してからmigrationを行い、schema対応版へ切り替える。旧アプリへのイメージロールバックだけでは旧schemaを読めないため、切替前のDBバックアップと復旧手順を確認する。GPS廃止・既存Liveセッションの扱いはIssue #26で決める。
 - アプリのロールバックは以前のイメージへ戻す。DBは自動ダウングレードしない。破壊的スキーマ変更前には個別計画が必要。
 - 本MVPは空のPostgreSQLから開始する。SQLiteのファイル・既存記録は自動削除も転送もしない。
 - DB復元時も古い位置情報を配信しないよう、まず受付停止、清掃、削除済み記録の扱いの確認を行う。
