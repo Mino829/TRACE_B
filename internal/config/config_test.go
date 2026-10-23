@@ -13,7 +13,8 @@ func baseEnv(t *testing.T) {
 	}
 	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
 		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY",
-		"TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID"} {
+		"TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID",
+		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_ISSUER_KEY", "TRACE_DISPLAY_TOKEN_KEY"} {
 		t.Setenv(key, "")
 	}
 	for _, key := range []string{"TRACE_COORDINATE_VERSION", "TRACE_CAMPUS_GRAPH_VERSION", "TRACE_THREE_D_MAP_VERSION"} {
@@ -142,6 +143,39 @@ func TestArrivalIssuerAndProofKeysStaySeparateAndDisabledByDefault(t *testing.T)
 	t.Setenv("TRACE_EDGE_SHARED_SECRET", issuer)
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("issuer key reused as participant edge secret")
+	}
+}
+
+func TestDisplayCredentialsAreOptionalAndSeparated(t *testing.T) {
+	baseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil || cfg.DisplayEnabled {
+		t.Fatalf("display must default disabled: %v", err)
+	}
+	t.Setenv("TRACE_DISPLAY_ENABLED", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("display without secrets accepted")
+	}
+	issuer := "independent-display-issuer-secret-1234"
+	token := "independent-display-token-secret-5678"
+	t.Setenv("TRACE_DISPLAY_ISSUER_KEY", issuer)
+	t.Setenv("TRACE_DISPLAY_TOKEN_KEY", issuer)
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("reused display signing key accepted")
+	}
+	t.Setenv("TRACE_DISPLAY_TOKEN_KEY", token)
+	cfg, err = FromEnv()
+	if err != nil || !cfg.DisplayEnabled {
+		t.Fatalf("independent keys refused: %v", err)
+	}
+	t.Setenv("TRACE_EDGE_SHARED_SECRET", issuer)
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("edge key reused for display issuer")
+	}
+	t.Setenv("TRACE_EDGE_SHARED_SECRET", "")
+	t.Setenv("TRACE_ARRIVAL_ISSUER_KEY", token)
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("arrival issuer key reused for display signing")
 	}
 }
 

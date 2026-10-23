@@ -219,6 +219,21 @@ func (s *Server) operatorSkipArrival(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"replayStatus": "skipped"})
 }
 
+func (s *Server) operatorRetryArrival(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeIssuer(w, r) {
+		return
+	}
+	if !s.cfg.DisplayEnabled {
+		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "display is disabled", Status: http.StatusServiceUnavailable})
+		return
+	}
+	if err := s.store.RetryDisplayArrival(r.Context(), r.PathValue("arrivalId"), s.now().UTC()); err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{"replayStatus": "queued"})
+}
+
 func (s *Server) skipOwnArrival(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.ArrivalEnabled {
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "arrival is unavailable", Status: http.StatusServiceUnavailable})

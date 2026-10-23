@@ -23,6 +23,9 @@ type Config struct {
 	ArrivalProofKey            string
 	ArrivalVenue               string
 	ArrivalCheckpointID        string
+	DisplayEnabled             bool
+	DisplayIssuerKey           string
+	DisplayTokenKey            string
 	PhotoBucket                string
 	PhotoSignerEmail           string
 	MemoryConsentVersion       string
@@ -117,6 +120,18 @@ func FromEnv() (Config, error) {
 		cfg.ArrivalVenue == "" || cfg.ArrivalCheckpointID == "" ||
 		strings.ContainsAny(cfg.ArrivalVenue+cfg.ArrivalCheckpointID, " \t\r\n")) {
 		return Config{}, fmt.Errorf("arrival requires distinct 32-byte issuer/proof keys and venue/checkpoint identifiers")
+	}
+	if cfg.DisplayEnabled, err = boolEnv("TRACE_DISPLAY_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	cfg.DisplayIssuerKey = os.Getenv("TRACE_DISPLAY_ISSUER_KEY")
+	cfg.DisplayTokenKey = os.Getenv("TRACE_DISPLAY_TOKEN_KEY")
+	if cfg.DisplayEnabled && (len(cfg.DisplayIssuerKey) < 32 || len(cfg.DisplayTokenKey) < 32 ||
+		cfg.DisplayIssuerKey == cfg.DisplayTokenKey || cfg.DisplayIssuerKey == cfg.ArrivalIssuerKey ||
+		cfg.DisplayIssuerKey == cfg.ArrivalProofKey || cfg.DisplayTokenKey == cfg.ArrivalIssuerKey ||
+		cfg.DisplayTokenKey == cfg.ArrivalProofKey || cfg.DisplayIssuerKey == cfg.EdgeSharedSecret ||
+		cfg.DisplayTokenKey == cfg.EdgeSharedSecret) {
+		return Config{}, fmt.Errorf("display requires independent 32-byte issuer and token signing keys")
 	}
 	if cfg.PhotoEnabled, err = boolEnv("TRACE_PHOTO_ENABLED", false); err != nil {
 		return Config{}, err
