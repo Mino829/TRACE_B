@@ -254,7 +254,12 @@ func (s *Store) ReadyPhoto(ctx context.Context, memoryID, photoID string, now ti
 			if err := tx.PostponePush(ctx, memoryID, now); err != nil {
 				return err
 			}
-			return tx.reconcileRoutes(ctx, memoryID)
+		}
+		if err := tx.reconcileRoutes(ctx, memoryID); err != nil {
+			return err
+		}
+		if p.Status == "pending" {
+			return tx.readyMarker(ctx, p, now)
 		}
 		return nil
 	})
@@ -278,7 +283,10 @@ func (s *Store) QueuePhotoDeletion(ctx context.Context, memoryID, photoID, targe
 			memoryID, photoID, target, failure); err != nil {
 			return err
 		}
-		return tx.reconcileRoutes(ctx, memoryID)
+		if err := tx.reconcileRoutes(ctx, memoryID); err != nil {
+			return err
+		}
+		return tx.retireMarker(ctx, photoID, time.Now())
 	})
 }
 
@@ -290,11 +298,14 @@ func (s *Store) QueueMemoryPhotoDeletion(ctx context.Context, memoryID string) e
 		if err := tx.StopPushForMemory(ctx, memoryID); err != nil {
 			return err
 		}
-		if err := tx.removeMemoryDisplay(ctx, memoryID, time.Now().UTC()); err != nil {
+		_, err := tx.q.ExecContext(ctx, `UPDATE photos SET status='deleting',delete_target='deleted',failure_code='' WHERE memory_session_id=$1`, memoryID)
+		if err != nil {
 			return err
 		}
-		_, err := tx.q.ExecContext(ctx, `UPDATE photos SET status='deleting',delete_target='deleted',failure_code='' WHERE memory_session_id=$1`, memoryID)
-		return err
+		if err := tx.retireMemoryMarkers(ctx, memoryID, time.Now()); err != nil {
+			return err
+		}
+		return tx.removeMemoryDisplay(ctx, memoryID, time.Now().UTC())
 	})
 }
 
@@ -389,8 +400,8 @@ func (s *Store) PhotoStorageRequired(ctx context.Context) (bool, error) {
 	return required, err
 }
 
-// queueExpiredPhotoMemories runs inside Cleanup's transaction. Acquire the same
-// per-memory advisory lock as uploads before marking any expired session.
+// queueExpiredPhotoMemories starts a separate transaction for each memory,
+// acquiring that memory's advisory lock before its marker/display mutations.
 func (s *Store) queueExpiredPhotoMemories(ctx context.Context, now time.Time) error {
 	rows, err := s.q.QueryContext(ctx, "SELECT id FROM memory_sessions WHERE delete_after<=$1 ORDER BY id", now)
 	if err != nil {

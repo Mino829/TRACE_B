@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func baseEnv(t *testing.T) {
@@ -14,7 +15,8 @@ func baseEnv(t *testing.T) {
 	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
 		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY",
 		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID",
-		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_ISSUER_KEY", "TRACE_DISPLAY_TOKEN_KEY"} {
+		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_ISSUER_KEY", "TRACE_DISPLAY_TOKEN_KEY",
+		"TRACE_PHOTO_MARKERS_APPROVED", "TRACE_PHOTO_MARKER_WIDTH_M", "TRACE_PHOTO_MARKER_TTL", "TRACE_PHOTO_MARKER_MIN_SESSIONS"} {
 		t.Setenv(key, "")
 	}
 	for _, key := range []string{"TRACE_COORDINATE_VERSION", "TRACE_CAMPUS_GRAPH_VERSION", "TRACE_THREE_D_MAP_VERSION"} {
@@ -208,5 +210,58 @@ func TestDisplayCredentialsAreOptionalAndSeparated(t *testing.T) {
 	t.Setenv("TRACE_ARRIVAL_ISSUER_KEY", token)
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("arrival issuer key reused for display signing")
+	}
+}
+
+func TestPhotoMarkersRequireExplicitApprovedSafePolicy(t *testing.T) {
+	baseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil || cfg.PhotoMarkersApproved {
+		t.Fatalf("photo markers must default disabled: %v", err)
+	}
+	t.Setenv("TRACE_PHOTO_MARKERS_APPROVED", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("policy without enabled photos and display accepted")
+	}
+	t.Setenv("TRACE_PHOTO_ENABLED", "true")
+	t.Setenv("TRACE_PHOTO_BUCKET", "private-photos")
+	t.Setenv("TRACE_PHOTO_SIGNER_EMAIL", "signer@local.iam.gserviceaccount.com")
+	t.Setenv("TRACE_DISPLAY_ENABLED", "true")
+	t.Setenv("TRACE_DISPLAY_ISSUER_KEY", "independent-display-issuer-secret-1234")
+	t.Setenv("TRACE_DISPLAY_TOKEN_KEY", "independent-display-token-secret-5678")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("policy without explicit privacy parameters accepted")
+	}
+	t.Setenv("TRACE_PHOTO_MARKER_WIDTH_M", "5")
+	t.Setenv("TRACE_PHOTO_MARKER_TTL", "15m")
+	t.Setenv("TRACE_PHOTO_MARKER_MIN_SESSIONS", "3")
+	cfg, err = FromEnv()
+	if err != nil || !cfg.PhotoMarkersApproved || cfg.PhotoMarkerWidthM != 5 || cfg.PhotoMarkerTTL != 15*time.Minute || cfg.PhotoMarkerMinSessions != 3 {
+		t.Fatalf("valid marker policy: %+v, %v", cfg, err)
+	}
+	for _, tc := range []struct{ key, value string }{
+		{"TRACE_PHOTO_MARKER_WIDTH_M", "4.9"},
+		{"TRACE_PHOTO_MARKER_WIDTH_M", "11"},
+		{"TRACE_PHOTO_MARKER_TTL", "14m59s"},
+		{"TRACE_PHOTO_MARKER_TTL", "31m"},
+		{"TRACE_PHOTO_MARKER_TTL", "15m1ns"},
+		{"TRACE_PHOTO_MARKER_MIN_SESSIONS", "2"},
+		{"TRACE_PHOTO_MARKER_MIN_SESSIONS", "2147483648"},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			if _, err := FromEnv(); err == nil {
+				t.Fatal("unsafe marker policy accepted")
+			}
+		})
+	}
+	t.Setenv("TRACE_DISPLAY_ENABLED", "false")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("approved markers without display accepted")
+	}
+	t.Setenv("TRACE_DISPLAY_ENABLED", "true")
+	t.Setenv("TRACE_PHOTO_ENABLED", "false")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("approved markers without photos accepted")
 	}
 }

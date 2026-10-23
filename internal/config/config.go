@@ -26,6 +26,10 @@ type Config struct {
 	DisplayEnabled             bool
 	DisplayIssuerKey           string
 	DisplayTokenKey            string
+	PhotoMarkersApproved       bool
+	PhotoMarkerWidthM          float64
+	PhotoMarkerTTL             time.Duration
+	PhotoMarkerMinSessions     int
 	PhotoBucket                string
 	PhotoSignerEmail           string
 	PushEnabled                bool
@@ -140,6 +144,29 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.PhotoEnabled, err = boolEnv("TRACE_PHOTO_ENABLED", false); err != nil {
 		return Config{}, err
+	}
+	if cfg.PhotoMarkersApproved, err = boolEnv("TRACE_PHOTO_MARKERS_APPROVED", false); err != nil {
+		return Config{}, err
+	}
+	if err := floatEnv("TRACE_PHOTO_MARKER_WIDTH_M", &cfg.PhotoMarkerWidthM); err != nil {
+		return Config{}, err
+	}
+	if err := durationEnv("TRACE_PHOTO_MARKER_TTL", &cfg.PhotoMarkerTTL); err != nil {
+		return Config{}, err
+	}
+	if raw := os.Getenv("TRACE_PHOTO_MARKER_MIN_SESSIONS"); raw != "" {
+		cfg.PhotoMarkerMinSessions, err = strconv.Atoi(raw)
+		if err != nil || cfg.PhotoMarkerMinSessions < 3 || cfg.PhotoMarkerMinSessions > 1<<31-1 {
+			return Config{}, fmt.Errorf("TRACE_PHOTO_MARKER_MIN_SESSIONS must be between 3 and 2147483647")
+		}
+	}
+	if cfg.PhotoMarkersApproved && (!cfg.PhotoEnabled || !cfg.DisplayEnabled ||
+		os.Getenv("TRACE_PHOTO_MARKER_WIDTH_M") == "" || os.Getenv("TRACE_PHOTO_MARKER_TTL") == "" ||
+		os.Getenv("TRACE_PHOTO_MARKER_MIN_SESSIONS") == "" ||
+		cfg.PhotoMarkerWidthM < 5 || cfg.PhotoMarkerWidthM > 10 ||
+		cfg.PhotoMarkerTTL < 15*time.Minute || cfg.PhotoMarkerTTL > 30*time.Minute ||
+		cfg.PhotoMarkerTTL%time.Second != 0 || cfg.PhotoMarkerMinSessions < 3) {
+		return Config{}, fmt.Errorf("approved photo markers require photos and display enabled and explicit width (5-10m), TTL (15-30m) and at least 3 sessions")
 	}
 	if cfg.PushEnabled, err = boolEnv("TRACE_PUSH_ENABLED", false); err != nil {
 		return Config{}, err

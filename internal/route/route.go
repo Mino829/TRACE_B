@@ -197,6 +197,17 @@ func (g *Graph) project(lat, lon float64) (float64, float64) {
 		g.originNorth + earthRadius*(lat-g.originLat)*math.Pi/180
 }
 
+// ProjectMarker only accepts anchors near an eligible campus edge. The local
+// point remains unquantized; callers MUST quantize before public serialization.
+func (g *Graph) ProjectMarker(lat, lon, accuracy float64, at time.Time) (float64, float64, bool) {
+	if !finite(lat) || !finite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180 ||
+		len(g.candidates(Anchor{Latitude: lat, Longitude: lon, AccuracyM: accuracy}, at)) == 0 {
+		return 0, 0, false
+	}
+	x, z := g.project(lat, lon)
+	return x, z, true
+}
+
 func (e *edge) available(at time.Time) bool {
 	if !e.Passable || e.Restricted || e.Closed {
 		return false

@@ -7,7 +7,7 @@
 - MemorySession / LivePresenceSession / ExperienceLinkの分離発行、別Bearer token認証
 - 同意版検証、公開設定、キャンパス範囲・精度・時刻・ジャンプの検証
 - 生の通常GPSや履歴は保存しない。描画無効（既定）では量子化済み最新位置をGoプロセス内だけで30～60秒保持し、停止・期限切れ・削除時に消去する
-- 描画有効時は再起動・複数Backendのsnapshot再同期用に量子化済み最新位置1件だけをPostgreSQLへ保存し、TTL・停止・削除時にDBから消去する。過去位置を蓄積せず、投影用の不透明IDと安全な表示aliasだけを配信する
+- 描画有効時も量子化済み最新位置は単一Goプロセス内だけに保持し、位置履歴をPostgreSQLへ保存しない。過去の到着・再生イベントだけをDBに永続化する
 - MemorySession / LivePresenceSessionごとの有効期限と削除期限。期限後も各`deleteAfter`までは本人の状態取得・削除が可能
 - 個別削除と両トークンによる体験単位削除。後者はLive側から順に個別に確定し、部分成功を24時間の記録と同じキーで再試行
 - DBロックとトランザクションで各削除・冪等性記録を一括確定
@@ -18,6 +18,7 @@
 - 任意同意後のWeb Push撮影リマインダー（既定で無効）：購読情報の暗号化、15/30分、停止・期限消去
 - 既定無効の投影QR到着受付、運営専用署名発行、永続演出キュー、本人向け再生状態
 - 既定無効の描画WSS：短期専用資格、snapshot→PostgreSQL連番差分、単一主描画機lease、再生開始・完了・失敗と期限切れ・切断skip
+- 既定無効の写真ピン・フォトスポット：承認済み空間ポリシーと運営スイッチでのみ表示WSに匿名・量子化済み差分を送信し、少人数・削除・期限切れ・停止時は非表示にする
 
 | メソッド | エンドポイント |
 |---|---|
@@ -46,8 +47,14 @@
 | POST | /v1/operator/display-tokens |
 | POST | /v1/operator/arrivals/{arrivalId}/retry |
 | GET (WSS) | /v1/display/ws |
+| GET | /v1/operator/photo-markers/status |
+| POST | /v1/operator/photo-markers/start |
+| POST | /v1/operator/photo-markers/stop |
+| POST | /v1/operator/photo-hotspots/start |
+| POST | /v1/operator/photo-hotspots/stop |
+| POST | /v1/operator/photo-markers/sparse |
 
-到着QRと描画WebSocketは機能フラグで個別に有効化します。写真ストーリーは写真撮影時GPSとCampusGraphから経路を推定し、通常GPS履歴を使いません。写真ピン・フォトスポット描画イベントと画像/経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
+到着QR、描画WebSocket、写真マーカーはそれぞれ明示的な有効化が必要です。写真ストーリーは写真撮影時GPSとCampusGraphから経路を推定し、通常GPS履歴を使いません。画像/経路を伴う到着演出素材はまだ統合されていません。GPS廃止後の公開ピンの扱いは設計Issue #23の判断待ちで、現時点のGPS由来マーカーを新展示の承認済み仕様とは扱いません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -101,7 +108,7 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 運営の専用発行器から空bodyの`POST /v1/operator/display-tokens`へ、`X-Trace-Display-Issuer-Timestamp: <Unix秒>`と`X-Trace-Display-Issuer-Signature: base64url(HMAC-SHA256(TRACE_DISPLAY_ISSUER_KEY, \"POST\\n/v1/operator/display-tokens\\n\" + timestamp))`を送ります（時差最大15秒）。レスポンス`displayToken`は2分有効で、参加者Bearer/到着運営署名と互換性がありません。`GET /v1/display/ws`へ`Authorization: Bearer <displayToken>`、`X-Trace-Schema-Version: 1`、`X-Trace-Coordinate-Version`、`X-Trace-Campus-Graph-Version`、`X-Trace-Three-D-Map-Version`（現行設定と完全一致）を付け、Origin・query stringは付けません。不一致はHTTP 409、資格エラーは401、機能無効は503です。
 
-WS接続直後の`display.snapshot`は`data.cursor`、量子化済み最新位置の`participants`、再生待ち/再生中の`arrivals`を含みます。写真marker配列は#10統合前なので**含まれません**。到着・再生イベントの`eventId`はDB連番で、欠番や再接続時はsnapshotで全置換します。`position.updated`、`position.expired`、`tracking.stopped`は各接続で最新のGoメモリ状態から生成する一時的な差分であり、`eventId`は不透明な重複排除キーです。位置差分はDBに保存・再送せず、位置のTTLは最大60秒、接続断後は次のsnapshotで復元します。写真/trajectory未提供の`participant.arrived`、`participant.phase.changed`、`participant.on_site`、`arrival.replay.requested/started/completed/failed/skipped`は永続差分です。画像、写真URL、元のGPS、参加者資格、内部セッションIDは含みません。映像へ正確な時刻やIDを表示しないでください。
+WS接続直後の`display.snapshot`は`data.cursor`、量子化済み最新位置の`participants`、再生待ち/再生中の`arrivals`、写真マーカーの`pins`/`hotspots`を含みます。承認前・未有効化・少人数時の写真配列は空です。到着・再生・マーカーイベントの`eventId`はDB連番で、欠番や再接続時はsnapshotで全置換します。`position.updated`、`position.expired`、`tracking.stopped`は各接続で最新のGoメモリ状態から生成する一時的な差分であり、`eventId`は不透明な重複排除キーです。位置差分はDBに保存・再送せず、位置のTTLは最大60秒、接続断後は次のsnapshotで復元します。`photo.marker.created/deleted`、`photo.hotspot.updated/hidden`、写真/trajectory未提供の`participant.arrived`、`participant.phase.changed`、`participant.on_site`、`arrival.replay.requested/started/completed/failed/skipped`は永続差分です。画像、写真URL、元のGPS、参加者資格、内部セッションIDは含みません。映像へ正確な時刻やIDを表示しないでください。
 
 送信JSONはすべて`schemaVersion:1`、3種のversion、`type`を含めます。`renderer.primary.acquire`で主リースを要求し、`renderer.primary.granted`の`data.leaseId`を保存します。他接続には`renderer.primary.conflict`を返します。`arrival.replay.started`、`arrival.replay.completed`、`arrival.replay.failed`にはクライアント生成の一意な`eventId`（8～128文字）、`arrivalId`、`leaseId`を指定します。成功は`renderer.ack`、競合・失効は`renderer.rejected`です。同じeventId・同じ操作の再送は24時間同じ結果となり、異なる内容は拒否します。切断/30秒heartbeat欠落/リース期限切れは再生中を`skipped`に確定し、別端末による自動再生はしません。運営の署名済み明示retryのみが再投入できます。10秒間隔のping/pong（または`renderer.heartbeat`）と30秒応答期限を設け、50分でWSを終了します。Cloud Run設定は3600秒で、クライアント側は切断時に指数バックオフで**新しい資格を取得し**snapshotから再接続します。
 
@@ -134,9 +141,20 @@ CampusGraphは`internal/route/campus_graph.json`へ固定同梱します（TRACE
 
 削除はまず永続的な`deleting`を確定し、画像の消去が成功するまで参照・認証材料を捨てません。写真DELETE成功は204、写真・Memoryの消去失敗は503となり、同じ冪等性キーで再試行します。体験単位削除は従来どおりLive削除後にMemoryを処理し、写真消去失敗時は`memory: pending`です。期限切れはAPI常駐清掃と清掃ジョブで同じ処理を再開します。
 
-署名付きPUTは削除後も期限まで生きるため、アップロード先はゼロバイトで占有し、期限後だけoutboxから消去します。これにより削除後の再送で画像が復活しません。画像バイト・GPS・PhotoMoment参照とそれに紐づくRouteSegmentは削除対象となり、この短期outboxにはランダムなobject keyと期限だけを保持します。ピン・派生特徴・別サムネイルはまだ生成しません。
+署名付きPUTは削除後も期限まで生きるため、アップロード先はゼロバイトで占有し、期限後だけoutboxから消去します。これにより削除後の再送で画像が復活しません。画像バイト・GPS・PhotoMoment参照とそれに紐づくRouteSegmentは削除対象となり、この短期outboxにはランダムなobject keyと期限だけを保持します。別サムネイルは生成しません。
 
 DBに`004_route_segments.sql`を追加します。適用後に`runtime-grants.sql`を実行し、APIと清掃ジョブを同じschema対応版へ更新してください。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
+
+## 写真マーカー（既定無効）
+
+`008_photo_markers.sql`を`007_display.sql`の後に適用します。写真が初めて`ready`になった際、承認済みポリシーと運営スイッチが有効なら、写真撮影時のGPSをCampusGraphへ投影して5～10mの格子中心へ丸めたピンの寄与を記録します。位置のない写真は対象外です。写真画像・URL・生GPS・正確な時刻・MemorySession IDは描画へ渡しません。TTLは15～30分の承認値で、写真・MemorySessionの期限、写真削除要求、運営停止でも非表示にします。同じ格子に異なる有効MemorySessionから3件以上の寄与があるときだけフォトスポットを表示します。全体の異なる有効MemorySession数が承認済み下限未満、または運営の少人数強制非表示が有効ならピンもスポットも表示しません。
+運営スイッチOFF中に`ready`になった過去写真は後から公開へ遡及登録しません。量子化寄与が既に保持されている写真もTTL・削除・少人数保護を継続し、再開で期限切れの寄与を復活させません。
+
+マーカーは描画WSの`display.snapshot`と同じDBカーソルの差分で配信し、停止・削除・期限切れ・しきい値割れでは公開投影を取り下げます。公開IDは乱数で、写真IDや個人セッションIDと共用しません。正確な撮影時刻は配信しません。#23でGPS由来ピンの扱い、大学による量子化幅・TTL・少人数しきい値の承認、表示側の版整合、専用運営経路の整備が完了するまでフラグを有効化しないでください。大学の承認なしに値を推測して有効化する運用は認めません。
+
+承認された場合のみ`TRACE_PHOTO_MARKERS_APPROVED=true`、`TRACE_PHOTO_MARKER_WIDTH_M`（5～10）、`TRACE_PHOTO_MARKER_TTL`（15m～30m）、`TRACE_PHOTO_MARKER_MIN_SESSIONS`（3以上）を指定し、写真・描画機能も個別に有効化します。起動設定だけでは描画は始まらず、DBのpin/spotスイッチは初期OFF、少人数強制非表示は初期ONです。署名済み運営専用APIの`POST /v1/operator/photo-markers/sparse`へ`{\"sparse\":false}`を送って強制非表示を解除した後、`photo-markers/start`と`photo-hotspots/start`を独立に実行します。停止は各`stop`、予期しない少人数時は`{\"sparse\":true}`で即時に非表示へ切り替えます。起動し直しても停止状態・強制非表示を勝手に解除しません。
+
+運営APIは`TRACE_DISPLAY_ISSUER_KEY`を持つ専用クライアントから、各リクエストの正確なメソッド・パスで`X-Trace-Display-Issuer-Timestamp: <Unix秒>`、`X-Trace-Display-Issuer-Signature: base64url(HMAC-SHA256(key, method + \"\\n\" + path + \"\\n\" + timestamp))`を付けて送信します。署名の許容時差は15秒で、参加者サイト・RendererのWSS tokenからは操作できません。`status`は件数・座標・参加者IDを含まないスイッチ・表示有無のみを返し、承認設定が取り下げられても保有する発行鍵による停止・強制非表示は可能です。運営経路は別途ネットワークで制限してください。
 
 ## 最短のローカル起動
 
