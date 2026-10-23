@@ -20,6 +20,7 @@ import (
 
 	"github.com/Mino829/trace_Backend/internal/config"
 	"github.com/Mino829/trace_Backend/internal/photo"
+	"github.com/Mino829/trace_Backend/internal/push"
 	"github.com/Mino829/trace_Backend/internal/store"
 )
 
@@ -31,6 +32,7 @@ type Server struct {
 	limiter *rateLimiter
 	now     func() time.Time
 	photos  *photo.Service
+	push    *push.Service
 }
 
 type apiError struct {
@@ -41,8 +43,11 @@ type apiError struct {
 
 func (e *apiError) Error() string { return e.Code }
 
-func New(cfg config.Config, db *store.Store, photos *photo.Service) http.Handler {
+func New(cfg config.Config, db *store.Store, photos *photo.Service, sender ...*push.Service) http.Handler {
 	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter(), photos: photos}
+	if len(sender) != 0 {
+		server.push = sender[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.live)
 	mux.HandleFunc("GET /health/ready", server.ready)
@@ -61,6 +66,9 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service) http.Handler
 	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete", server.limitedSession("session", server.completePhoto))
 	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}", server.limitedSession("session", server.deletePhoto))
 	mux.HandleFunc("GET /v1/memory-sessions/{memorySessionId}/memory", server.limitedSession("session", server.photoMemory))
+	mux.HandleFunc("PUT /v1/memory-sessions/{memorySessionId}/push-subscription", server.limitedSession("push", server.putPush))
+	mux.HandleFunc("PATCH /v1/memory-sessions/{memorySessionId}/push-subscription", server.limitedSession("push", server.patchPush))
+	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}/push-subscription", server.limitedSession("push", server.deletePush))
 	return server.middleware(mux)
 }
 
@@ -79,7 +87,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Trace-Live-Token")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 		}
 		if r.Method == http.MethodOptions {
@@ -132,6 +140,10 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
+	vapidPublicKey := ""
+	if s.cfg.PushEnabled && s.push != nil {
+		vapidPublicKey = s.cfg.PushVAPIDPublicKey
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"registrationOpen": s.cfg.RegistrationOpen,
 		"consent": map[string]any{
@@ -155,6 +167,13 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 			"maxUploadBytes":    5 * 1024 * 1024,
 			"maxLongEdgePixels": 1920,
 			"publicDisplay":     false,
+		},
+		"notification": map[string]any{
+			"enabled":                 s.cfg.PushEnabled && s.push != nil,
+			"defaultIntervalMinutes":  30,
+			"allowedIntervalsMinutes": []int{15, 30},
+			"exactDeliveryGuaranteed": false,
+			"vapidPublicKey":          vapidPublicKey,
 		},
 		"contact": s.cfg.Contact,
 	})

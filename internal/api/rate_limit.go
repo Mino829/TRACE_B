@@ -142,6 +142,8 @@ func (s *Server) limitedSession(kind string, next http.HandlerFunc) http.Handler
 			rate, burst = 0.2, 5
 		} else if kind == "photo-metadata" {
 			rate, burst = 0.1, 6
+		} else if kind == "push" {
+			rate, burst = 1.0/6, 10
 		}
 		budgetKind := kind
 		if kind == "experience-delete" {

@@ -329,6 +329,9 @@ func (s *Store) StopLive(ctx context.Context, id, reason string, now time.Time) 
 				return err
 			}
 		}
+		if err := tx.stopPushForLive(ctx, id); err != nil {
+			return err
+		}
 		tx.pending = positionChange{id: id, operation: removePosition}
 		return nil
 	})
@@ -369,11 +372,17 @@ func (s *Store) DeleteMemory(ctx context.Context, id string) error {
 		if pending {
 			return ErrPhotoPending
 		}
+		if err := tx.StopPushForMemory(ctx, id); err != nil {
+			return err
+		}
 		return tx.deleteSession(ctx, "DELETE FROM memory_sessions WHERE id=$1", id)
 	})
 }
 func (s *Store) DeleteLive(ctx context.Context, id string) error {
 	return s.Transaction(ctx, id, func(tx *Store) error {
+		if err := tx.stopPushForLive(ctx, id); err != nil {
+			return err
+		}
 		if err := tx.deleteSession(ctx, "DELETE FROM live_presence_sessions WHERE id=$1", id); err != nil {
 			return err
 		}
@@ -488,6 +497,7 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 			return err
 		}
 		for _, query := range []string{
+			"DELETE FROM push_subscriptions WHERE expires_at<=$1 OR memory_session_id IN (SELECT e.memory_session_id FROM experiences e JOIN live_presence_sessions l ON l.id=e.live_session_id WHERE l.expires_at<=$1 OR l.tracking_status<>'tracking' OR l.presence_phase IN ('arrived','on_site'))",
 			"UPDATE live_presence_sessions SET tracking_status='expired',presence_phase='ended' WHERE expires_at<=$1 AND tracking_status='tracking'",
 			"DELETE FROM experience_links WHERE expires_at<=$1",
 			"DELETE FROM experiences WHERE delete_after<=$1",

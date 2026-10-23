@@ -247,10 +247,16 @@ func (s *Store) ReadyPhoto(ctx context.Context, memoryID, photoID string, now ti
 		if err := tx.enqueuePhotoFence(ctx, p.StageKey, p.UploadExpiresAt); err != nil {
 			return err
 		}
-		if _, err = tx.q.ExecContext(ctx, "UPDATE photos SET status='ready' WHERE memory_session_id=$1 AND id=$2", memoryID, photoID); err != nil {
+		if _, err := tx.q.ExecContext(ctx, "UPDATE photos SET status='ready' WHERE memory_session_id=$1 AND id=$2", memoryID, photoID); err != nil {
 			return err
 		}
-		return tx.reconcileRoutes(ctx, memoryID)
+		if p.Status == "pending" {
+			if err := tx.PostponePush(ctx, memoryID, now); err != nil {
+				return err
+			}
+			return tx.reconcileRoutes(ctx, memoryID)
+		}
+		return nil
 	})
 }
 
@@ -279,6 +285,9 @@ func (s *Store) QueuePhotoDeletion(ctx context.Context, memoryID, photoID, targe
 func (s *Store) QueueMemoryPhotoDeletion(ctx context.Context, memoryID string) error {
 	return s.Transaction(ctx, memoryID, func(tx *Store) error {
 		if err := tx.deleteSession(ctx, "UPDATE memory_sessions SET deleting=TRUE WHERE id=$1", memoryID); err != nil {
+			return err
+		}
+		if err := tx.StopPushForMemory(ctx, memoryID); err != nil {
 			return err
 		}
 		_, err := tx.q.ExecContext(ctx, `UPDATE photos SET status='deleting',delete_target='deleted',failure_code='' WHERE memory_session_id=$1`, memoryID)

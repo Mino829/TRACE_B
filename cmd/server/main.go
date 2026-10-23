@@ -14,6 +14,7 @@ import (
 	"github.com/Mino829/trace_Backend/internal/config"
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/photoasset"
+	"github.com/Mino829/trace_Backend/internal/push"
 	"github.com/Mino829/trace_Backend/internal/route"
 	"github.com/Mino829/trace_Backend/internal/store"
 )
@@ -73,6 +74,17 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	var reminders *push.Service
+	if cfg.PushEnabled {
+		reminders, err = push.New(cfg)
+		if err != nil {
+			slog.Error("invalid push configuration")
+			os.Exit(1)
+		}
+	} else if err := db.ClearPush(startupCtx); err != nil {
+		slog.Error("failed to erase subscriptions while push is disabled")
+		os.Exit(1)
+	}
 	if photos != nil {
 		graph, err := route.Embedded()
 		if err != nil {
@@ -96,7 +108,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              cfg.Address,
-		Handler:           api.New(cfg, db, photos),
+		Handler:           api.New(cfg, db, photos, reminders),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -104,6 +116,9 @@ func main() {
 	}
 
 	go cleanupExpired(ctx, db, photos)
+	if reminders != nil {
+		go dispatchReminders(ctx, db, reminders)
+	}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -160,4 +175,21 @@ func cleanupData(ctx context.Context, db *store.Store, photos *photo.Service, no
 		return err
 	}
 	return db.Cleanup(ctx, now)
+}
+
+func dispatchReminders(ctx context.Context, db *store.Store, reminders *push.Service) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			workCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := reminders.Dispatch(workCtx, db, now.UTC()); err != nil && ctx.Err() == nil {
+				slog.Error("push dispatch failed")
+			}
+			cancel()
+		}
+	}
 }

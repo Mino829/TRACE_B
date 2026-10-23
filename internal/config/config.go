@@ -20,6 +20,11 @@ type Config struct {
 	PhotoEnabled               bool
 	PhotoBucket                string
 	PhotoSignerEmail           string
+	PushEnabled                bool
+	PushVAPIDPublicKey         string
+	PushVAPIDPrivateKey        string
+	PushVAPIDSubject           string
+	PushEncryptionKey          string
 	MemoryConsentVersion       string
 	LiveConsentVersion         string
 	OnSiteConsentVersion       string
@@ -101,6 +106,17 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.PhotoEnabled, err = boolEnv("TRACE_PHOTO_ENABLED", false); err != nil {
 		return Config{}, err
+	}
+	if cfg.PushEnabled, err = boolEnv("TRACE_PUSH_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	cfg.PushVAPIDPublicKey = os.Getenv("TRACE_PUSH_VAPID_PUBLIC_KEY")
+	cfg.PushVAPIDPrivateKey = os.Getenv("TRACE_PUSH_VAPID_PRIVATE_KEY")
+	cfg.PushVAPIDSubject = os.Getenv("TRACE_PUSH_VAPID_SUBJECT")
+	cfg.PushEncryptionKey = os.Getenv("TRACE_PUSH_ENCRYPTION_KEY")
+	if cfg.PushEnabled && (cfg.PushVAPIDPublicKey == "" || cfg.PushVAPIDPrivateKey == "" ||
+		cfg.PushVAPIDSubject == "" || cfg.PushEncryptionKey == "") {
+		return Config{}, fmt.Errorf("enabled push requires VAPID public/private keys, subject and separate encryption key")
 	}
 	cfg.PhotoBucket = os.Getenv("TRACE_PHOTO_BUCKET")
 	cfg.PhotoSignerEmail = os.Getenv("TRACE_PHOTO_SIGNER_EMAIL")

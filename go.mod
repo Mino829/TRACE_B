@@ -5,6 +5,7 @@ go 1.26.9
 require (
 	cloud.google.com/go/storage v1.65.0
 	github.com/jackc/pgx/v5 v5.10.0
+	golang.org/x/crypto v0.57.0
 	golang.org/x/image v0.47.0
 	google.golang.org/api v0.290.0
 )
@@ -46,7 +47,6 @@ require (
 	go.opentelemetry.io/otel/sdk v1.45.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.45.0 // indirect
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
