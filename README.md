@@ -15,6 +15,7 @@
 - CloudflareサイトWorker向けの共有シークレット検証（設定時、`/v1/*`のみ）
 - 明示的なDBマイグレーションと期限削除コマンド
 - 任意有効化する非公開写真API：メタデータ登録、署名付きPUT、検証完了、本人ストーリー、写真・セッション・期限削除
+- 任意同意後のWeb Push撮影リマインダー（既定で無効）：購読情報の暗号化、15/30分、停止・期限消去
 
 | メソッド | エンドポイント |
 |---|---|
@@ -34,6 +35,7 @@
 | POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete |
 | DELETE | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
 | GET | /v1/memory-sessions/{memorySessionId}/memory |
+| PUT / PATCH / DELETE | /v1/memory-sessions/{memorySessionId}/push-subscription |
 
 経路再構成、到着QR、描画WebSocket、写真ピン・フォトスポット、運営APIは未実装です。写真ストーリーの`segments`は経路実装まで空配列とし、仮の経路を生成しません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
@@ -47,13 +49,25 @@
 | 位置送信 | Live参加トークンごとに12回/分・burst 5 |
 | 本人状態取得、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
 | 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
+| Web Push購読・変更・解除 | Memory参加トークンごとに10回/分・burst 10 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
-超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有します。Push・描画・運営の制限は該当APIの実装時に追加します。
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。描画・運営の制限は該当APIの実装時に追加します。
 許可Originには`Retry-After`をCORSで公開します。一括削除はMemoryのBearer tokenと`X-Trace-Live-Token`の両方の操作枠を同時に確認・消費し、片側が超過していれば削除を開始せず、もう片側の枠も消費しません。位置送信と操作のトークン別枠は分離されていますが、IP別・全体の追加上限は共通です。
 IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
 転送IPは単一のIPv4/IPv6だけを受け付けます。複数の同名ヘッダー、カンマ区切り、IPv6 zone付きなどは接続元IPへフォールバックします。
 カウンターは最大10,000件を1プロセスのメモリに保持し、2分以上使われていないものを消去します。容量超過は`429`（`Retry-After: 60`）で安全側に拒否します。再起動でリセットされ、複数インスタンス間では共有されません。`deploy/gcp/deploy.sh`の最大1インスタンスを維持し、新旧revisionの並存も避けてください。増設する場合は共有レート制限ストアまたは信頼できる共通edgeの制限へ移行します。
+
+## 任意の撮影リマインダー
+
+`TRACE_PUSH_ENABLED=false`が既定です。承認済みの通知文面・別途のブラウザ通知許可・stagingでの実Push確認後だけ有効化してください。MemorySession作成・写真撮影・位置共有には通知が不要です。通知を無効化した場合、新規PUT/PATCHは`503 PUSH_UNAVAILABLE`、DELETEは本人認証後に購読を消去します。無効化して起動すると残存購読を全消去し、外部送信は開始しません。公開設定`notification`は`enabled`、`defaultIntervalMinutes:30`、`allowedIntervalsMinutes:[15,30]`、`exactDeliveryGuaranteed:false`と、有効化時のみ`vapidPublicKey`を返します。
+
+`TRACE_PUSH_VAPID_PUBLIC_KEY`は非圧縮P-256公開鍵（65 byteのbase64url）、`TRACE_PUSH_VAPID_PRIVATE_KEY`は対応する32 byteの秘密scalar、`TRACE_PUSH_VAPID_SUBJECT`は有効な運営先の`mailto:`、`TRACE_PUSH_ENCRYPTION_KEY`は**VAPIDとは別の**ランダムな32 byte AES-GCM鍵（base64url）です。鍵はSecret ManagerからAPIとworkerへ同一の値を渡し、ソース・通常ログ・運営画面・描画へ出さないでください。古い暗号化鍵を失うと既存購読は復号できません。鍵を変更する場合は購読を一旦消去し、端末に再同意・再購読を求めてください。`004_push_subscriptions.sql`の適用後、`deploy/gcp/runtime-grants.sql`を再適用してからAPIを入れ替えます。デプロイ時のmigration番号は他ブランチと統合して連番にしてください。
+Cloud Runの`deploy/gcp/runtime.env.yaml`には公開鍵と`mailto:`だけを記載し、秘密鍵と暗号化鍵は置かないでください。`deploy/gcp/deploy.sh serve`には別々のSecret Manager参照`GCP_PUSH_VAPID_PRIVATE_SECRET`と`GCP_PUSH_ENCRYPTION_SECRET`を渡すと、APIと清掃ジョブの両方へ秘密環境変数として配布します。実行サービスアカウントのSecret Accessor権限を両secretに限定してください。常駐ディスパッチャはCloud Runの`--min=1 --no-cpu-throttling`に依存します。スケール・revision並存時の重複と配信時刻、外部プロバイダへの実到達性はstagingで確認してください。
+
+Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscription`へ`{"consent":true,"subscription":{"endpoint":"https://...","keys":{"p256dh":"base64url","auth":"base64url"}},"intervalMinutes":30}`を送ります。許可・説明後の参加者操作だけで`consent:true`を送信してください。endpointはHTTPSのFirefox/Chrome/Windows/Apple push serviceのみを受け付け、外部URLを無条件にフェッチしません。`PATCH`は`{"intervalMinutes":15}`または`{"status":"paused"}` / `{"status":"active"}`を受け付け、`DELETE`（空body）は204で未送信予定と鍵を消去します。PUT/PATCHは`status`、`intervalMinutes`、`nextSendAt`、`expiresAt`だけを返し、endpointや鍵は返しません。paused中の`nextSendAt`はnull、再開・間隔変更で時刻を再計算します。
+
+10秒ごとに最大50件を抽出し、DB内のMemoryロックと状態再確認のもと、5秒以内にプロバイダへ送信します。送信時刻は厳密には保証しません。payloadは固定の一般文面と相対URL`/photo`だけで、位置・写真・セッションID・参加記号を含みません。正常2xxでは次回を間隔後へ、404/410では鍵を削除、その他の失敗は1分後に再試行します。Web Pushに配信のexactly-once保証はなく、プロバイダ受理後DB commit失敗時には重複し得ます。写真の初回`ready`時は同じトランザクションで次回を延期します。Memory削除準備・Memory/Live削除・Live停止・期限清掃は購読も削除します。#8を統合するとき、`store.AcceptArrival`の初回ArrivalEvent作成分岐で、到着確定と同じMemory Storeトランザクション内から`tx.EndPushForMemory(ctx, memoryID)`を呼んでください。このhookはMemoryに`push_stopped=true`を立て、購読を消去してMemory単独参加やLive削除後も再購読を禁止します。単純解除は`StopPushForMemory`（再購読可能）を使用します。到着時に確実に停止するにはこのhookの統合が必須です。
 
 ## 非公開写真の設定とライフサイクル
 

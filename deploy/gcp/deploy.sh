@@ -31,17 +31,23 @@ case "$mode" in
     if [[ ! -f "$env_file" ]] || grep -q REPLACE "$env_file"; then
       echo "Prepare $env_file with real deployment settings" >&2; exit 2
     fi
+    runtime_secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET"
+    if [[ -n "${GCP_PUSH_VAPID_PRIVATE_SECRET:-}" || -n "${GCP_PUSH_ENCRYPTION_SECRET:-}" ]]; then
+      : "${GCP_PUSH_VAPID_PRIVATE_SECRET:?set GCP_PUSH_VAPID_PRIVATE_SECRET}"
+      : "${GCP_PUSH_ENCRYPTION_SECRET:?set GCP_PUSH_ENCRYPTION_SECRET}"
+      runtime_secrets+=",TRACE_PUSH_VAPID_PRIVATE_KEY=$GCP_PUSH_VAPID_PRIVATE_SECRET,TRACE_PUSH_ENCRYPTION_KEY=$GCP_PUSH_ENCRYPTION_SECRET"
+    fi
     gcloud run jobs deploy trace-cleanup "${common[@]}" \
       --image="$GCP_IMAGE" --args=cleanup --service-account="$GCP_RUNTIME_SA" \
       --set-cloudsql-instances="$GCP_SQL_CONNECTION" --env-vars-file="$env_file" \
-      --set-secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET" \
+      --set-secrets="$runtime_secrets" \
       --tasks=1 --parallelism=1 --max-retries=2 --task-timeout=120s --cpu=1 --memory=512Mi
     # Process-local position and rate-limit state require one API instance.
     # Keep max=1 until both move to shared stores; avoid overlapping revisions.
     gcloud run deploy trace-backend "${common[@]}" \
       --image="$GCP_IMAGE" --args=serve --service-account="$GCP_RUNTIME_SA" \
       --execution-environment=gen2 --set-cloudsql-instances="$GCP_SQL_CONNECTION" \
-      --env-vars-file="$env_file" --set-secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET" \
+      --env-vars-file="$env_file" --set-secrets="$runtime_secrets" \
       --port=8080 --cpu=1 --memory=512Mi --concurrency=40 --timeout=30s \
       --min=1 --max=1 --no-cpu-throttling --no-allow-unauthenticated --invoker-iam-check \
       --startup-probe="httpGet.path=/health/ready,httpGet.port=8080,initialDelaySeconds=0,periodSeconds=5,timeoutSeconds=2,failureThreshold=12" \

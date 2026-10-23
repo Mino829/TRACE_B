@@ -11,7 +11,8 @@ func baseEnv(t *testing.T) {
 	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_SESSION_TTL", "TRACE_MEMORY_SESSION_TTL", "TRACE_LIVE_SESSION_TTL", "TRACE_DATA_RETENTION", "TRACE_EDGE_SHARED_SECRET"} {
 		t.Setenv(k, "")
 	}
-	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL"} {
+	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
+		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("DATABASE_URL", "postgresql://local:local@localhost/trace?sslmode=disable")
@@ -107,5 +108,25 @@ func TestPhotoStorageCannotBeEnabledWithoutCompletePrivateConfiguration(t *testi
 	t.Setenv("TRACE_PHOTO_SIGNER_EMAIL", "")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("incomplete storage configuration accepted")
+	}
+}
+
+func TestPushRequiresExplicitEnableAndAllSecrets(t *testing.T) {
+	baseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil || cfg.PushEnabled {
+		t.Fatal("push enabled without opt-in", err)
+	}
+	t.Setenv("TRACE_PUSH_ENABLED", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("missing keys accepted")
+	}
+	t.Setenv("TRACE_PUSH_VAPID_PUBLIC_KEY", "public")
+	t.Setenv("TRACE_PUSH_VAPID_PRIVATE_KEY", "private")
+	t.Setenv("TRACE_PUSH_VAPID_SUBJECT", "mailto:contact@example.org")
+	t.Setenv("TRACE_PUSH_ENCRYPTION_KEY", "separate")
+	cfg, err = FromEnv()
+	if err != nil || !cfg.PushEnabled {
+		t.Fatal("complete push config rejected", err)
 	}
 }
