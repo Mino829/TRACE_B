@@ -251,13 +251,12 @@ func (s *Store) ReadyPhoto(ctx context.Context, memoryID, photoID string, now ti
 			return err
 		}
 		if p.Status == "pending" {
-			return tx.PostponePush(ctx, memoryID, now)
+			if err := tx.PostponePush(ctx, memoryID, now); err != nil {
+				return err
+			}
+			return tx.reconcileRoutes(ctx, memoryID)
 		}
 		return nil
-		if _, err = tx.q.ExecContext(ctx, "UPDATE photos SET status='ready' WHERE memory_session_id=$1 AND id=$2", memoryID, photoID); err != nil {
-			return err
-		}
-		return tx.reconcileRoutes(ctx, memoryID)
 	})
 }
 
