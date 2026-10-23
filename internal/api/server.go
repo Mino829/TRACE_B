@@ -48,11 +48,16 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service) http.Handler
 	mux.HandleFunc("GET /health/ready", server.ready)
 	mux.HandleFunc("GET /v1/public/config", server.limitedPublic("config", server.publicConfig))
 	mux.HandleFunc("POST /v1/experiences", server.limitedPublic("create", server.createExperience))
+	mux.HandleFunc("POST /v1/operator/arrival-proofs", server.issueArrivalProof)
+	mux.HandleFunc("GET /v1/operator/arrivals", server.operatorArrivals)
+	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/skip", server.operatorSkipArrival)
 	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.limitedSession("session", server.experienceState))
 	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.limitedSession("experience-delete", server.deleteExperience))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.limitedSession("position", server.atomic((*Server).updatePosition)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.limitedSession("session", server.atomic((*Server).onSite)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopLive)))
+	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/arrival", server.limitedSession("session", server.arrive))
+	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/arrival/skip", server.limitedSession("session", server.skipOwnArrival))
 	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.limitedSession("session", server.prepareMemoryPhotoDeletion(server.atomic((*Server).deleteMemory))))
 	mux.HandleFunc("DELETE /v1/live-presence-sessions/{liveSessionId}", server.limitedSession("session", server.atomic((*Server).deleteLive)))
 	mux.HandleFunc("GET /v1/memory-sessions/{memorySessionId}/photos", server.limitedSession("session", server.listPhotos))
@@ -256,6 +261,7 @@ func (s *Server) experienceState(w http.ResponseWriter, r *http.Request) {
 		},
 		"displayAlias": map[string]string{"color": state.DisplayColor, "symbol": state.DisplaySymbol},
 		"photoSummary": map[string]int{"ready": summary.Ready, "pending": summary.Pending, "failed": summary.Failed, "maxCount": 12},
+		"replayStatus": state.ReplayStatus,
 	}
 	if state.LiveSessionID != "" {
 		response["livePresenceSession"] = map[string]any{

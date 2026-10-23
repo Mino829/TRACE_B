@@ -18,6 +18,11 @@ type Config struct {
 	EdgeSharedSecret           string
 	RegistrationOpen           bool
 	PhotoEnabled               bool
+	ArrivalEnabled             bool
+	ArrivalIssuerKey           string
+	ArrivalProofKey            string
+	ArrivalVenue               string
+	ArrivalCheckpointID        string
 	PhotoBucket                string
 	PhotoSignerEmail           string
 	MemoryConsentVersion       string
@@ -98,6 +103,20 @@ func FromEnv() (Config, error) {
 	var err error
 	if cfg.RegistrationOpen, err = boolEnv("TRACE_REGISTRATION_OPEN", cfg.RegistrationOpen); err != nil {
 		return Config{}, err
+	}
+	if cfg.ArrivalEnabled, err = boolEnv("TRACE_ARRIVAL_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	cfg.ArrivalIssuerKey = os.Getenv("TRACE_ARRIVAL_ISSUER_KEY")
+	cfg.ArrivalProofKey = os.Getenv("TRACE_ARRIVAL_PROOF_KEY")
+	cfg.ArrivalVenue = os.Getenv("TRACE_ARRIVAL_VENUE")
+	cfg.ArrivalCheckpointID = os.Getenv("TRACE_ARRIVAL_CHECKPOINT_ID")
+	if cfg.ArrivalEnabled && (len(cfg.ArrivalIssuerKey) < 32 || len(cfg.ArrivalProofKey) < 32 ||
+		cfg.ArrivalIssuerKey == cfg.ArrivalProofKey ||
+		(cfg.EdgeSharedSecret != "" && (cfg.EdgeSharedSecret == cfg.ArrivalIssuerKey || cfg.EdgeSharedSecret == cfg.ArrivalProofKey)) ||
+		cfg.ArrivalVenue == "" || cfg.ArrivalCheckpointID == "" ||
+		strings.ContainsAny(cfg.ArrivalVenue+cfg.ArrivalCheckpointID, " \t\r\n")) {
+		return Config{}, fmt.Errorf("arrival requires distinct 32-byte issuer/proof keys and venue/checkpoint identifiers")
 	}
 	if cfg.PhotoEnabled, err = boolEnv("TRACE_PHOTO_ENABLED", false); err != nil {
 		return Config{}, err

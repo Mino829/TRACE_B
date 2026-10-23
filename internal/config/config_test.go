@@ -11,7 +11,9 @@ func baseEnv(t *testing.T) {
 	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_SESSION_TTL", "TRACE_MEMORY_SESSION_TTL", "TRACE_LIVE_SESSION_TTL", "TRACE_DATA_RETENTION", "TRACE_EDGE_SHARED_SECRET"} {
 		t.Setenv(k, "")
 	}
-	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL"} {
+	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
+		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY",
+		"TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID"} {
 		t.Setenv(key, "")
 	}
 	for _, key := range []string{"TRACE_COORDINATE_VERSION", "TRACE_CAMPUS_GRAPH_VERSION", "TRACE_THREE_D_MAP_VERSION"} {
@@ -110,6 +112,36 @@ func TestPhotoStorageCannotBeEnabledWithoutCompletePrivateConfiguration(t *testi
 	t.Setenv("TRACE_PHOTO_SIGNER_EMAIL", "")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("incomplete storage configuration accepted")
+	}
+}
+
+func TestArrivalIssuerAndProofKeysStaySeparateAndDisabledByDefault(t *testing.T) {
+	baseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil || cfg.ArrivalEnabled {
+		t.Fatalf("arrival must default off: %v", err)
+	}
+	t.Setenv("TRACE_ARRIVAL_ENABLED", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("enabled arrival without keys accepted")
+	}
+	issuer := "an-issuer-secret-unique-to-operator-1234"
+	proof := "proof-secret-unique-to-projector-4567"
+	t.Setenv("TRACE_ARRIVAL_ISSUER_KEY", issuer)
+	t.Setenv("TRACE_ARRIVAL_PROOF_KEY", issuer)
+	t.Setenv("TRACE_ARRIVAL_VENUE", "booth")
+	t.Setenv("TRACE_ARRIVAL_CHECKPOINT_ID", "entrance")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("shared issuer and QR key accepted")
+	}
+	t.Setenv("TRACE_ARRIVAL_PROOF_KEY", proof)
+	cfg, err = FromEnv()
+	if err != nil || !cfg.ArrivalEnabled {
+		t.Fatalf("valid arrival config rejected: %v", err)
+	}
+	t.Setenv("TRACE_EDGE_SHARED_SECRET", issuer)
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("issuer key reused as participant edge secret")
 	}
 }
 

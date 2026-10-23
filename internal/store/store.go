@@ -65,6 +65,7 @@ type ExperienceState struct {
 	TrackingStatus, PresencePhase, DisplayColor, DisplaySymbol string
 	MemoryExpiresAt, MemoryDeleteAfter                         time.Time
 	LiveExpiresAt, LiveDeleteAfter                             time.Time
+	ReplayStatus                                               string
 }
 type LiveSession struct {
 	ID, TrackingStatus, PresencePhase, DisplayColor, DisplaySymbol string
@@ -234,6 +235,15 @@ func (s *Store) ExperienceByMemoryToken(ctx context.Context, id, token string, n
 			v.TrackingStatus = "expired"
 			v.PresencePhase = "ended"
 		}
+	}
+	arrival, err := s.arrivalForMemory(ctx, v.MemorySessionID)
+	if err == nil {
+		v.ReplayStatus = arrival.Status
+		if arrival.Status == "queued" && !now.Before(arrival.ReplayDeadline) {
+			v.ReplayStatus = "skipped"
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return ExperienceState{}, err
 	}
 	return v, nil
 }
@@ -484,6 +494,9 @@ func (s *Store) SaveIdempotency(ctx context.Context, scope, key, requestHash str
 func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	s.PurgePositions(now)
 	return s.Transaction(ctx, "trace:cleanup", func(tx *Store) error {
+		if err := tx.ExpireArrivals(ctx, now); err != nil {
+			return err
+		}
 		if err := tx.queueExpiredPhotoMemories(ctx, now); err != nil {
 			return err
 		}
@@ -494,6 +507,8 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 			"DELETE FROM memory_sessions WHERE delete_after<=$1 AND NOT EXISTS (SELECT 1 FROM photos WHERE memory_session_id=memory_sessions.id)",
 			"DELETE FROM live_presence_sessions WHERE delete_after<=$1",
 			"DELETE FROM idempotency_records WHERE expires_at<=$1",
+			"DELETE FROM arrival_receipts WHERE expires_at<=$1",
+			"DELETE FROM arrival_operator_audit WHERE created_at + INTERVAL '24 hours' <= $1",
 		} {
 			if _, err := tx.q.ExecContext(ctx, query, now); err != nil {
 				return err
