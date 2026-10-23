@@ -15,6 +15,7 @@
 - CloudflareサイトWorker向けの共有シークレット検証（設定時、`/v1/*`のみ）
 - 明示的なDBマイグレーションと期限削除コマンド
 - 任意有効化する非公開写真API：メタデータ登録、署名付きPUT、検証完了、本人ストーリー、写真・セッション・期限削除
+- 既定無効の投影QR到着受付、運営専用署名発行、永続演出キュー、本人向け再生状態
 
 | メソッド | エンドポイント |
 |---|---|
@@ -27,6 +28,8 @@
 | POST | /v1/live-presence-sessions/{liveSessionId}/position |
 | POST | /v1/live-presence-sessions/{liveSessionId}/on-site |
 | POST | /v1/live-presence-sessions/{liveSessionId}/stop |
+| POST | /v1/memory-sessions/{memorySessionId}/arrival |
+| POST | /v1/memory-sessions/{memorySessionId}/arrival/skip |
 | DELETE | /v1/memory-sessions/{memorySessionId} |
 | DELETE | /v1/live-presence-sessions/{liveSessionId} |
 | GET / POST | /v1/memory-sessions/{memorySessionId}/photos |
@@ -34,8 +37,11 @@
 | POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete |
 | DELETE | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
 | GET | /v1/memory-sessions/{memorySessionId}/memory |
+| POST | /v1/operator/arrival-proofs |
+| GET | /v1/operator/arrivals |
+| POST | /v1/operator/arrivals/{arrivalId}/skip |
 
-経路再構成、到着QR、描画WebSocket、写真ピン・フォトスポット、運営APIは未実装です。写真ストーリーの`segments`は経路実装まで空配列とし、仮の経路を生成しません。
+経路再構成、描画WebSocket・再生開始/完了、写真ピン・フォトスポット、および到着以外の運営APIは未実装です。写真ストーリーの`segments`は経路実装まで空配列とし、仮の経路を生成しません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -45,15 +51,29 @@
 | 参加作成 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
 | 公開設定取得 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
 | 位置送信 | Live参加トークンごとに12回/分・burst 5 |
-| 本人状態取得、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
+| 本人状態取得、到着、演出skip、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
 | 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
+| 到着proof発行・候補照会・運営skip | 有効な運営署名の要求を全体で1回/秒・burst 10 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
-超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有します。Push・描画・運営の制限は該当APIの実装時に追加します。
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有します。Push・描画と到着以外の運営APIは該当機能実装時に追加します。
 許可Originには`Retry-After`をCORSで公開します。一括削除はMemoryのBearer tokenと`X-Trace-Live-Token`の両方の操作枠を同時に確認・消費し、片側が超過していれば削除を開始せず、もう片側の枠も消費しません。位置送信と操作のトークン別枠は分離されていますが、IP別・全体の追加上限は共通です。
 IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
 転送IPは単一のIPv4/IPv6だけを受け付けます。複数の同名ヘッダー、カンマ区切り、IPv6 zone付きなどは接続元IPへフォールバックします。
 カウンターは最大10,000件を1プロセスのメモリに保持し、2分以上使われていないものを消去します。容量超過は`429`（`Retry-After: 60`）で安全側に拒否します。再起動でリセットされ、複数インスタンス間では共有されません。`deploy/gcp/deploy.sh`の最大1インスタンスを維持し、新旧revisionの並存も避けてください。増設する場合は共有レート制限ストアまたは信頼できる共通edgeの制限へ移行します。
+
+## 投影QRによる到着（既定無効）
+
+`TRACE_ARRIVAL_ENABLED=false`が既定です。有効化には`TRACE_ARRIVAL_VENUE`（会場ID）、`TRACE_ARRIVAL_CHECKPOINT_ID`（ブースID）、異なる32バイト以上の秘密値`TRACE_ARRIVAL_PROOF_KEY`（QR署名専用）、`TRACE_ARRIVAL_ISSUER_KEY`（運営発行API認証専用）が必須です。鍵を参加者サイト/QR/ログへ渡さず、Secret Manager等で配置してください。鍵の切替・失効は設定の更新と稼働revision切替で行い、旧proofと旧運営署名を即時失効させます。複数revisionを同時公開すると鍵・キューの一貫性が失われるため、切替前に受付停止し単一APIインスタンスを維持してください。設計Issue #11で未確定の秒数・容量は以下の暫定実装契約です。大学の審査と運営導線が整うまでフラグは有効化しないでください。
+
+運営専用の`POST /v1/operator/arrival-proofs`へ空bodyでHTTPSアクセスします。認証ヘッダー`X-Trace-Issuer-Timestamp`には現在のUnix秒を十進表記、`X-Trace-Issuer-Signature`には`base64url(HMAC-SHA256(TRACE_ARRIVAL_ISSUER_KEY, \"POST\\n/v1/operator/arrival-proofs\\n\" + timestamp))`（paddingなし）を設定します。有効期間は前後15秒、リクエスト署名はメソッドとパスに限定されます。固定鍵自体をネットワーク送信せず、署名を短命の運営資格として使います。投影機/運営サーバーがこの方法で取得したレスポンスの`checkpointToken`という**文字列だけ**をWeb URLではなくQRにエンコードし、例えば15秒ごとに交換します。`expiresAt`（UTC）到達後は掲示しません。端末はWeb App内のカメラで読み、既存Memoryセッションのまま送信します。会場用機器からのみ運営経路に到達できるよう、リバースプロキシ/Workerにも運営APIのアクセス制御を設定してください。ブラウザのOriginを伴う運営API要求は拒否します。参加用Bearer tokenやEdge共有シークレットだけでは発行できません。
+配置先が`TRACE_EDGE_SHARED_SECRET`を要求する場合、運営用プライベート経路も`X-Trace-Edge-Secret`を同時に送ります。サイトWorkerは参加者用`/api/backend/*`から`/v1/operator/*`への転送を拒否し、運営用の認可済みプライベート入口を別に用意してください（署名認証だけをネットワーク分離の代替にしない）。現行運営監査は個人操作者ではなく資格情報を保有する`arrival_issuer`サービス名、操作時刻、到着IDのハッシュ短縮値、結果を24時間保持します。個人別の監査・運営権限分離は運営UIを構築する際に別途必要です。
+
+発行されるproofは`base64url(JSON).base64url(HMAC-SHA256(TRACE_ARRIVAL_PROOF_KEY, base64url(JSON)))`です。JSONには`checkpointId`、`venue`、`issuedAt`/`expiresAt`（Unix秒）、ランダム`nonce`を含み、有効期間は25秒です。参加端末は`POST /v1/memory-sessions/{memorySessionId}/arrival`へMemory Bearer、`Idempotency-Key`（ランダム値）、JSON `{\"checkpointToken\":\"...\",\"experienceLinkToken\":\"...\",\"clientTime\":\"...\"}`を送ります。`clientTime`は判定に使わずサーバー時刻を正とします。改変・他会場・期限切れ・未来発行は403、別トークンによる別セッションへの操作は認証で拒否します。投影QRは複数来場者が読むため同一proofを**別Memory間では共有可能**です。同一Memoryへの二重到着は1件のArrivalEventとなり、24時間の同一キー/同一内容の再送は期限切れQRでも元の結果を返します。同一キー/別内容は409、Memory削除と同時に到着・再送記録も消えます。
+
+有効なExperienceLinkを持つ場合は当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。GPSは`tracking`のまま、`on_site`は従来どおり本人の追加同意版が必要です。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。到着は写真機能無効でも有効、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOは最大32件、満杯でも到着自体を記録して`skipped`（`queue_full`）とし、開始されず2分経った候補も`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`は未再生の演出をスキップします。
+
+運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\\n/v1/operator/arrivals\\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。本人GETにキュー順は出しません。描画機のリース、再生開始・完了・停止イベントと写真/経路素材の組立はIssue #9の統合まで提供しません。運営候補APIを呼んでも再生状態は`playing`へ移りません。適用DBは`004_arrivals.sql`で、展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。
 
 ## 非公開写真の設定とライフサイクル
 
@@ -133,7 +153,7 @@ APIと清掃ジョブは起動時、APIは`/health/ready`と各`/v1/`リクエ�
 
 APIは起動時と稼働中30秒ごとにDBの期限データを清掃し、表示位置は稼働中毎秒プロセスメモリから消去します。期限切れ位置は清掃前でも読み出せません。別途5分ごとのDB清掃ジョブはAPIプロセスの位置メモリを消去できません。Cloud RunのAPIは最大1インスタンス・CPU常時割当とし、スケールアウト・再起動・新旧revision並存で直近の表示位置が失われたり分岐したりするため、追跡中の切替を避けます。
 
-`002_remove_live_positions.sql`で旧表示位置テーブルは破棄し、移行前の位置点は持ち越しません。既存のExperienceLinkは認証トークンの旧期限を`token_expires_at`へ移し、関連付けの保持期限を両セッションの早い`delete_after`へ更新します。再配備時はDBのschema版が非互換となるため、旧revisionを停止してからmigrationを実施します。切替中の位置表示欠落は仕様です。データ保護承認（設計Issue #9）、到着判定の経路（設計Issue #11/Backend Issue #8）は別途未確定です。
+`002_remove_live_positions.sql`で旧表示位置テーブルは破棄し、移行前の位置点は持ち越しません。既存のExperienceLinkは認証トークンの旧期限を`token_expires_at`へ移し、関連付けの保持期限を両セッションの早い`delete_after`へ更新します。再配備時はDBのschema版が非互換となるため、旧revisionを停止してからmigrationを実施します。切替中の位置表示欠落は仕様です。データ保護承認（設計Issue #9）と到着proofの暫定期限・運営導線の最終仕様（設計Issue #11）は未確定です。
 
 ## テスト
 
@@ -154,7 +174,7 @@ make integration
 テストごとにランダムな専用スキーマを作り、終了時にそのスキーマだけを削除します。URL内のパスワードに特殊文字がある場合はURLエンコードが必要です。
 GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合テストを必ず実行します。
 
-検証対象：既存API導線、時刻型の往復、資格情報分離、複数接続からの同時削除、停止と位置保存の競合、再送記録失敗時のロールバック、保存期限・関連データ削除、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、Cloud Runポート・Cloud SQL接続設定。
+検証対象：既存API導線、時刻型の往復、資格情報分離、複数接続からの同時削除、停止と位置保存の競合、再送記録失敗時のロールバック、保存期限・関連データ削除、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、Cloud Runポート・Cloud SQL接続設定。到着の統合テストには運営/参加者資格分離、改変・期限境界・会場、重複・別端末・同時削除、キュー上限・タイムアウト、写真0/1枚・pending15秒、skip・監査を追加しています。
 
 ## Google Cloudへ配置
 
