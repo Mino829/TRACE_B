@@ -247,8 +247,10 @@ func (s *Store) ReadyPhoto(ctx context.Context, memoryID, photoID string, now ti
 		if err := tx.enqueuePhotoFence(ctx, p.StageKey, p.UploadExpiresAt); err != nil {
 			return err
 		}
-		_, err = tx.q.ExecContext(ctx, "UPDATE photos SET status='ready' WHERE memory_session_id=$1 AND id=$2", memoryID, photoID)
-		return err
+		if _, err = tx.q.ExecContext(ctx, "UPDATE photos SET status='ready' WHERE memory_session_id=$1 AND id=$2", memoryID, photoID); err != nil {
+			return err
+		}
+		return tx.reconcileRoutes(ctx, memoryID)
 	})
 }
 
@@ -266,9 +268,11 @@ func (s *Store) QueuePhotoDeletion(ctx context.Context, memoryID, photoID, targe
 		if p.Status == "deleting" && p.DeleteTarget == "deleted" {
 			return nil
 		}
-		_, err = tx.q.ExecContext(ctx, `UPDATE photos SET status='deleting',delete_target=$3,failure_code=$4 WHERE memory_session_id=$1 AND id=$2`,
-			memoryID, photoID, target, failure)
-		return err
+		if _, err = tx.q.ExecContext(ctx, `UPDATE photos SET status='deleting',delete_target=$3,failure_code=$4 WHERE memory_session_id=$1 AND id=$2`,
+			memoryID, photoID, target, failure); err != nil {
+			return err
+		}
+		return tx.reconcileRoutes(ctx, memoryID)
 	})
 }
 
@@ -315,12 +319,17 @@ func (s *Store) FinishPhotoDeletion(ctx context.Context, memoryID, photoID strin
 			return err
 		}
 		if p.DeleteTarget == "deleted" {
-			return tx.deleteSession(ctx, "DELETE FROM photos WHERE memory_session_id=$1 AND id=$2", memoryID, photoID)
-		}
-		_, err = tx.q.ExecContext(ctx, `UPDATE photos SET status='failed',delete_target='',
+			if err := tx.deleteSession(ctx, "DELETE FROM photos WHERE memory_session_id=$1 AND id=$2", memoryID, photoID); err != nil {
+				return err
+			}
+		} else {
+			if _, err = tx.q.ExecContext(ctx, `UPDATE photos SET status='failed',delete_target='',
  latitude=NULL,longitude=NULL,accuracy_m=NULL,location_recorded_at=NULL,stage_key=NULL,object_key=NULL
- WHERE memory_session_id=$1 AND id=$2`, memoryID, photoID)
-		return err
+ WHERE memory_session_id=$1 AND id=$2`, memoryID, photoID); err != nil {
+				return err
+			}
+		}
+		return tx.reconcileRoutes(ctx, memoryID)
 	})
 }
 

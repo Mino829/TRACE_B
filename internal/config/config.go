@@ -87,6 +87,9 @@ func FromEnv() (Config, error) {
 	cfg.OnSiteConsentVersion = env("TRACE_ON_SITE_CONSENT_VERSION", cfg.OnSiteConsentVersion)
 	cfg.ConsentLanguage = env("TRACE_CONSENT_LANGUAGE", cfg.ConsentLanguage)
 	cfg.ConsentBody = env("TRACE_CONSENT_BODY", cfg.ConsentBody)
+	cfg.CoordinateVersion = env("TRACE_COORDINATE_VERSION", cfg.CoordinateVersion)
+	cfg.CampusGraphVersion = env("TRACE_CAMPUS_GRAPH_VERSION", cfg.CampusGraphVersion)
+	cfg.ThreeDMapVersion = env("TRACE_THREE_D_MAP_VERSION", cfg.ThreeDMapVersion)
 	cfg.Contact = env("TRACE_CONTACT", cfg.Contact)
 	if raw := os.Getenv("TRACE_ALLOWED_ORIGINS"); raw != "" {
 		cfg.AllowedOrigins = splitNonEmpty(raw)

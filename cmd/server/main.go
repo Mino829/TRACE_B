@@ -14,6 +14,7 @@ import (
 	"github.com/Mino829/trace_Backend/internal/config"
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/photoasset"
+	"github.com/Mino829/trace_Backend/internal/route"
 	"github.com/Mino829/trace_Backend/internal/store"
 )
 
@@ -69,6 +70,17 @@ func main() {
 		required, err := db.PhotoStorageRequired(startupCtx)
 		if err != nil || required {
 			slog.Error("photo storage configuration is required while retained assets or upload fences exist")
+			os.Exit(1)
+		}
+	}
+	if photos != nil {
+		graph, err := route.Embedded()
+		if err != nil {
+			slog.Error("invalid embedded CampusGraph", "error", err)
+			os.Exit(1)
+		}
+		if err := db.ConfigureRoutes(graph, cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion); err != nil {
+			slog.Error("photo routing requires compatible graph, coordinate and 3D map versions", "error", err)
 			os.Exit(1)
 		}
 	}
