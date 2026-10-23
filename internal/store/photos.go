@@ -290,6 +290,9 @@ func (s *Store) QueueMemoryPhotoDeletion(ctx context.Context, memoryID string) e
 		if err := tx.StopPushForMemory(ctx, memoryID); err != nil {
 			return err
 		}
+		if err := tx.removeMemoryDisplay(ctx, memoryID, time.Now().UTC()); err != nil {
+			return err
+		}
 		_, err := tx.q.ExecContext(ctx, `UPDATE photos SET status='deleting',delete_target='deleted',failure_code='' WHERE memory_session_id=$1`, memoryID)
 		return err
 	})

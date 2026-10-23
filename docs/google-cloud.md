@@ -11,7 +11,7 @@ Cloud RunのファイルシステムへDBを置きません。TLS証明書はClo
 
 - リージョン：API、DB、Artifact Registryを原則`asia-northeast1`へ揃える。
 - Cloud SQL：PostgreSQL 17、DB名`trace`。検証用の最小構成と展示本番のHA構成は別に判断する。
-- Cloud Run：1 vCPU、512MiB、同時リクエスト40、最小1・最大1、CPU常時割当を初期値とする。表示位置とレート制限はプロセス内保持のため、新旧revisionの並存も避ける。性能保証値ではなく、60セッション・8時間の負荷試験で調整する。
+- Cloud Run：1 vCPU、512MiB、同時リクエスト40、最小1・最大1、CPU常時割当を初期値とする。描画WS有効時も量子化済み最新位置とレート制限は単一APIプロセスのメモリだけに保持し、PostgreSQLには到着・再生イベントと主描画機leaseだけを保存する。API/WSを同じインスタンスへ接続し、新旧revisionを並存させない。60セッション・8時間の負荷試験で調整する。
 - 接続プール：API1台あたり5接続。通常は最大5接続＋ジョブ分。リビジョン更新中の余裕、管理接続も含めてDB接続上限を確認する。
 - 最小1＋CPU常時割当、Cloud SQL、バックアップ等には待機中も費用が発生する。無料運用前提ではない。予算アラートは支出の強制停止機能ではない。
 
@@ -111,6 +111,10 @@ bash deploy/gcp/deploy.sh serve
 
 `/health/ready`を起動確認、`/health/live`を死活確認に使用します。DB障害だけでAPIを再起動し続けないよう、livenessはDBへ問い合わせません。
 
+任意の描画WSは`TRACE_DISPLAY_ENABLED=false`のまま配備し、承認後に`007_display.sql`のmigration、`runtime-grants.sql`、安全なrenderer用の外向き専用HTTPS/WSS入口を用意します。鍵は参加者・到着運営・Edgeと独立した32バイト以上のSecret Manager版で、`settings.env`の`GCP_DISPLAY_ISSUER_SECRET`/`GCP_DISPLAY_TOKEN_SECRET`に**版名だけ**を指定し、APIにだけ注入します。実行サービスアカウントのAccessor権限を対象Secretに限定してください。`runtime.env.yaml`の`TRACE_DISPLAY_ENABLED=true`で有効化します。参加者Workerからの描画/運営経路転送は拒否し、署名付き資格の発行は運営の別入口から行います。
+
+`deploy.sh serve`は描画有効/無効にかかわらずCloud Runリクエスト上限を3600秒へ設定します。WS本体は50分で終了、10秒ping/pong、30秒無応答切断。HTTP 10秒middleware期限はWS upgradeへ適用しません。Cloud Run timeout/instance replacement後はrendererが短期資格を再取得し、指数バックオフで新snapshotへ再接続します。上限の長い接続は請求とconcurrency枠を消費するため、現場60人規模の実負荷で検証してください。WebSocket経路をCloudflare Workerの参加者用proxyへ流さず、HTTPS upgrade透過・権限・秘密ヘッダー非記録を運営経路で確認してください。変更しても既存stagingへのデプロイを意味しません。
+
 ## 6. 期限削除の補助ジョブ
 
 まずScheduler用サービスアカウントへ、清掃ジョブだけの実行権限を付与します。
@@ -158,6 +162,7 @@ IAMの一般公開許可と受付開始は別操作です。レート制限は�
 - 新しい不変イメージをビルド→互換マイグレーション→権限更新→サービス更新→疎通試験。
 - 写真PR #18より前のmainに含まれるmigrationはschema version 1・2。`002_remove_live_positions.sql` は旧API/清掃ジョブと非互換のため、受付を停止し、旧API/ジョブを停止してから適用し、対応するAPI・ジョブを起動する（[切替手順](staging-cicd.md#6-運用と復旧)）。写真無効の先行配備にはversion 3は不要。PR #18マージ後は写真の有効/無効を問わずmigration 003と権限確認が必須。適用済みSQLを書き換えない。
 - 到着ブランチ統合後は`006_arrivals.sql`を適用し、`runtime-grants.sql`を再適用する。旧revision/清掃ジョブを停止してからmigrationを行い、schema対応版へ切り替える。旧アプリへのイメージロールバックだけでは旧schemaを読めないため、切替前のDBバックアップと復旧手順を確認する。GPS廃止・既存Liveセッションの扱いはIssue #26で決める。
+- 描画ブランチ統合後は`007_display.sql`を適用し、`runtime-grants.sql`を再適用する。位置のメモリ保持と描画イベントのDBカーソルは単一Backendインスタンスを前提とするため、旧revisionとの並存を避け、受付停止・バックアップ/復旧準備の後に切り替える。
 - アプリのロールバックは以前のイメージへ戻す。DBは自動ダウングレードしない。破壊的スキーマ変更前には個別計画が必要。
 - 本MVPは空のPostgreSQLから開始する。SQLiteのファイル・既存記録は自動削除も転送もしない。
 - DB復元時も古い位置情報を配信しないよう、まず受付停止、清掃、削除済み記録の扱いの確認を行う。

@@ -27,20 +27,24 @@ type executor interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 type Store struct {
-	db        *sql.DB
-	q         executor
-	inTx      bool
-	positions *positionCache
-	pending   positionChange
-	routes    *route.Graph
+	db             *sql.DB
+	q              executor
+	inTx           bool
+	positions      *positionCache
+	pending        positionChange
+	routes         *route.Graph
+	displayEnabled bool
 }
 type positionCache struct {
-	mu     sync.RWMutex
-	latest map[string]Position
+	mu        sync.RWMutex
+	latest    map[string]Position
+	projected map[string]DisplayParticipant
 }
 type positionChange struct {
 	id        string
 	point     Position
+	display   DisplayParticipant
+	phase     string
 	operation positionOperation
 }
 type positionOperation byte
@@ -49,6 +53,7 @@ const (
 	noPositionChange positionOperation = iota
 	setPosition
 	removePosition
+	updatePositionPhase
 )
 
 type NewExperience struct {
@@ -105,7 +110,7 @@ func Open(ctx context.Context, dsn string, maxConnections int) (*Store, error) {
 		db.Close()
 		return nil, errors.New("PostgreSQL connection failed; check network and credentials")
 	}
-	return &Store{db: db, q: db, positions: &positionCache{latest: make(map[string]Position)}}, nil
+	return &Store{db: db, q: db, positions: &positionCache{latest: make(map[string]Position), projected: make(map[string]DisplayParticipant)}}, nil
 }
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Ping(ctx context.Context) error {
@@ -140,7 +145,7 @@ func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) err
 		return err
 	}
 	defer tx.Rollback()
-	work := &Store{db: s.db, q: tx, inTx: true, positions: s.positions, routes: s.routes}
+	work := &Store{db: s.db, q: tx, inTx: true, positions: s.positions, routes: s.routes, displayEnabled: s.displayEnabled}
 	if err := work.lockTransaction(ctx, key); err != nil {
 		return err
 	}
@@ -157,8 +162,17 @@ func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) err
 	switch work.pending.operation {
 	case setPosition:
 		s.positions.latest[work.pending.id] = work.pending.point
+		if s.displayEnabled {
+			s.positions.projected[work.pending.id] = work.pending.display
+		}
 	case removePosition:
 		delete(s.positions.latest, work.pending.id)
+		delete(s.positions.projected, work.pending.id)
+	case updatePositionPhase:
+		if display, ok := s.positions.projected[work.pending.id]; ok {
+			display.PresencePhase = work.pending.phase
+			s.positions.projected[work.pending.id] = display
+		}
 	}
 	return nil
 }
@@ -267,6 +281,11 @@ func (s *Store) authenticate(ctx context.Context, query, id, token string, now t
 	}
 	return nil
 }
+
+// EnableDisplay exposes the same short-lived in-memory positions to native renderers.
+// Arrivals and replay receipts remain durable; deployment must use one Backend instance.
+func (s *Store) EnableDisplay() { s.displayEnabled = true }
+
 func (s *Store) LiveSession(ctx context.Context, id string) (LiveSession, *Position, error) {
 	var v LiveSession
 	err := s.q.QueryRowContext(ctx, "SELECT id,tracking_status,presence_phase,display_color,display_symbol,expires_at FROM live_presence_sessions WHERE id=$1", id).
@@ -312,10 +331,19 @@ func (s *Store) SavePosition(ctx context.Context, id string, p Position) error {
 		if found && !p.RecordedAt.After(previous.RecordedAt) {
 			return ErrConflict
 		}
+		if tx.displayEnabled {
+			var displayID, color, symbol, phase string
+			if err := tx.q.QueryRowContext(ctx, `SELECT display_id::text,display_color,display_symbol,presence_phase FROM live_presence_sessions WHERE id=$1`, id).Scan(&displayID, &color, &symbol, &phase); err != nil {
+				return err
+			}
+			tx.pending.display = DisplayParticipant{LivePresenceID: displayID, X: p.X, Z: p.Z, AccuracyM: p.AccuracyM, DisplayAlias: DisplayAlias{Color: color, Symbol: symbol}, PresencePhase: phase, LastUpdatedAt: p.ReceivedAt, ExpiresAt: p.ExpiresAt}
+		}
 		if _, err := tx.q.ExecContext(ctx, "UPDATE live_presence_sessions SET last_seen_at=$1 WHERE id=$2", p.ReceivedAt, id); err != nil {
 			return err
 		}
-		tx.pending = positionChange{id: id, point: p, operation: setPosition}
+		tx.pending.id = id
+		tx.pending.point = p
+		tx.pending.operation = setPosition
 		return nil
 	})
 }
@@ -365,7 +393,10 @@ func (s *Store) SetOnSite(ctx context.Context, id, consent string, continuing bo
 			return tx.StopLive(ctx, id, "on_site_declined", now)
 		}
 		_, err = tx.q.ExecContext(ctx, `UPDATE live_presence_sessions SET presence_phase='on_site',on_site_consent_version=$1 WHERE id=$2`, consent, id)
-		return err
+		if err != nil {
+			return err
+		}
+		return tx.displayPhase(ctx, id, "participant.on_site", now)
 	})
 }
 func (s *Store) DeleteMemory(ctx context.Context, id string) error {
@@ -385,6 +416,9 @@ func (s *Store) DeleteMemory(ctx context.Context, id string) error {
 		if err := tx.StopPushForMemory(ctx, id); err != nil {
 			return err
 		}
+		if err := tx.removeMemoryDisplay(ctx, id, time.Now().UTC()); err != nil {
+			return err
+		}
 		return tx.deleteSession(ctx, "DELETE FROM memory_sessions WHERE id=$1", id)
 	})
 }
@@ -393,10 +427,10 @@ func (s *Store) DeleteLive(ctx context.Context, id string) error {
 		if err := tx.stopPushForLive(ctx, id); err != nil {
 			return err
 		}
+		tx.pending = positionChange{id: id, operation: removePosition}
 		if err := tx.deleteSession(ctx, "DELETE FROM live_presence_sessions WHERE id=$1", id); err != nil {
 			return err
 		}
-		tx.pending = positionChange{id: id, operation: removePosition}
 		return nil
 	})
 }
@@ -481,6 +515,7 @@ func (s *Store) PurgePositions(now time.Time) {
 	for id, p := range s.positions.latest {
 		if !now.Before(p.ExpiresAt) {
 			delete(s.positions.latest, id)
+			delete(s.positions.projected, id)
 		}
 	}
 }
@@ -502,10 +537,15 @@ func (s *Store) SaveIdempotency(ctx context.Context, scope, key, requestHash str
 }
 func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	s.PurgePositions(now)
+	if err := s.RefreshDisplay(ctx, now); err != nil {
+		return err
+	}
+	if err := s.Transaction(ctx, "display:expired-memories", func(tx *Store) error {
+		return tx.removeExpiredMemoryDisplay(ctx, now)
+	}); err != nil {
+		return err
+	}
 	return s.Transaction(ctx, "trace:cleanup", func(tx *Store) error {
-		if err := tx.ExpireArrivals(ctx, now); err != nil {
-			return err
-		}
 		if err := tx.queueExpiredPhotoMemories(ctx, now); err != nil {
 			return err
 		}
@@ -523,6 +563,14 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 			if _, err := tx.q.ExecContext(ctx, query, now); err != nil {
 				return err
 			}
+		}
+		_, err := tx.q.ExecContext(ctx, `DELETE FROM display_events WHERE occurred_at<$1`, now.Add(-24*time.Hour))
+		if err != nil {
+			return err
+		}
+		_, err = tx.q.ExecContext(ctx, `DELETE FROM display_renderer_receipts WHERE created_at<$1`, now.Add(-24*time.Hour))
+		if err != nil {
+			return err
 		}
 		return nil
 	})

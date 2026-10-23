@@ -90,6 +90,9 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 					}
 					if n, _ := result.RowsAffected(); n == 1 {
 						a.LivePresencePhase = "arrived"
+						if err := tx.linkedDisplayPhase(ctx, memoryID, "participant.phase.changed", now); err != nil {
+							return err
+						}
 					}
 				}
 				if err := tx.EndPushForMemory(ctx, memoryID); err != nil {
@@ -114,6 +117,23 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 					a.PhotoWaitUntil, a.ReplayDeadline, finished)
 				if err != nil {
 					return err
+				}
+				alias, err := tx.arrivalDisplayAlias(ctx, memoryID)
+				if err != nil {
+					return err
+				}
+				_, err = tx.AppendDisplayEvent(ctx, "participant.arrived", map[string]any{
+					"arrivalId": a.ID, "replayStatus": a.Status,
+					"displayAlias": alias, "replayDurationSeconds": 15,
+				}, now)
+				if err != nil {
+					return err
+				}
+				if a.Status == "queued" {
+					_, err = tx.AppendDisplayEvent(ctx, "arrival.replay.requested", map[string]string{"arrivalId": a.ID}, now)
+					if err != nil {
+						return err
+					}
 				}
 			} else if err != nil {
 				return err
@@ -172,9 +192,35 @@ func (s *Store) SaveArrivalReceipt(ctx context.Context, memoryID, key, requestHa
 }
 
 func (s *Store) ExpireArrivals(ctx context.Context, now time.Time) error {
-	_, err := s.q.ExecContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason='timeout',replay_finished_at=$1
- WHERE replay_status='queued' AND replay_deadline<=$1`, now)
-	return err
+	if !s.inTx {
+		return s.Transaction(ctx, "arrival:expire", func(tx *Store) error { return tx.ExpireArrivals(ctx, now) })
+	}
+	rows, err := s.q.QueryContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason='timeout',replay_finished_at=$1
+ WHERE replay_status='queued' AND replay_deadline<=$1 RETURNING id`, now)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			break
+		}
+		ids = append(ids, id)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err = s.AppendDisplayEvent(ctx, "arrival.replay.skipped", map[string]string{"arrivalId": id, "reason": "timeout"}, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReplayCandidates is a durable, bounded FIFO view for the future renderer
@@ -212,6 +258,12 @@ func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error
 		if err != nil {
 			return err
 		}
+		if n, _ := result.RowsAffected(); n != 0 {
+			_, err = tx.AppendDisplayEvent(ctx, "arrival.replay.skipped", map[string]string{"arrivalId": id, "reason": "operator"}, now)
+			if err != nil {
+				return err
+			}
+		}
 		outcome := "skipped"
 		if n, _ := result.RowsAffected(); n == 0 {
 			var status string
@@ -235,21 +287,25 @@ func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error
 }
 
 func (s *Store) SkipOwnArrival(ctx context.Context, memoryID string, now time.Time) error {
-	result, err := s.q.ExecContext(ctx, `UPDATE arrival_events SET replay_status='skipped',
+	return s.Transaction(ctx, memoryID, func(tx *Store) error {
+		var id string
+		err := tx.q.QueryRowContext(ctx, `UPDATE arrival_events SET replay_status='skipped',
  skip_reason='participant_request',replay_finished_at=$2
- WHERE memory_session_id=$1 AND replay_status='queued'`, memoryID, now)
-	if err != nil {
-		return err
-	}
-	if n, _ := result.RowsAffected(); n > 0 {
-		return nil
-	}
-	a, err := s.arrivalForMemory(ctx, memoryID)
-	if err != nil {
-		return err
-	}
-	if a.Status == "skipped" {
-		return nil
-	}
-	return ErrConflict
+ WHERE memory_session_id=$1 AND replay_status='queued' RETURNING id`, memoryID, now).Scan(&id)
+		if err == nil {
+			_, err = tx.AppendDisplayEvent(ctx, "arrival.replay.skipped", map[string]string{"arrivalId": id, "reason": "participant_request"}, now)
+			return err
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		a, err := tx.arrivalForMemory(ctx, memoryID)
+		if err != nil {
+			return err
+		}
+		if a.Status == "skipped" {
+			return nil
+		}
+		return ErrConflict
+	})
 }
