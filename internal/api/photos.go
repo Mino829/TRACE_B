@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/photoasset"
+	"github.com/Mino829/trace_Backend/internal/route"
 	"github.com/Mino829/trace_Backend/internal/store"
 )
 
@@ -295,9 +296,35 @@ func (s *Server) photoMemory(w http.ResponseWriter, r *http.Request) {
 		}
 		moments = append(moments, map[string]any{"photoMomentId": p.ID, "capturedAt": p.CapturedAt, "imageUrl": url, "locationConfidence": confidence})
 	}
-	// RouteSegment generation is implemented separately by Backend Issue #7.
-	// No route is fabricated for uploaded photos.
-	s.writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "moments": moments, "segments": []any{}, "deleteAfter": memory.DeleteAfter})
+	segments, err := s.store.RouteSegments(r.Context(), memoryID)
+	if err != nil {
+		s.photoError(w, r, err)
+		return
+	}
+	// A previous schema may have ready photos but no persisted segments.
+	// Rebuild once, under the same memory lock used by complete and delete.
+	if len(segments) != max(0, len(moments)-1) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
+		if err := s.store.RefreshRoutes(r.Context(), memoryID, s.now().UTC()); err != nil {
+			s.photoError(w, r, err)
+			return
+		}
+		segments, err = s.store.RouteSegments(r.Context(), memoryID)
+		if err != nil || len(segments) != max(0, len(moments)-1) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
+			s.photoError(w, r, store.ErrConflict)
+			return
+		}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "moments": moments, "segments": segments, "deleteAfter": memory.DeleteAfter})
+}
+
+func staleSegments(segments []store.RouteSegment, coordinate, graph, threeD string) bool {
+	for _, segment := range segments {
+		if segment.CoordinateVersion != coordinate || segment.CampusGraphVersion != graph ||
+			segment.ThreeDMapVersion != threeD || segment.AlgorithmVersion != route.AlgorithmVersion {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) deletePhoto(w http.ResponseWriter, r *http.Request) {

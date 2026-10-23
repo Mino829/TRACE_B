@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mino829/trace_Backend/internal/route"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 )
@@ -31,6 +32,7 @@ type Store struct {
 	inTx      bool
 	positions *positionCache
 	pending   positionChange
+	routes    *route.Graph
 }
 type positionCache struct {
 	mu     sync.RWMutex
@@ -138,7 +140,7 @@ func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) err
 		return err
 	}
 	defer tx.Rollback()
-	work := &Store{db: s.db, q: tx, inTx: true, positions: s.positions}
+	work := &Store{db: s.db, q: tx, inTx: true, positions: s.positions, routes: s.routes}
 	if err := work.lockTransaction(ctx, key); err != nil {
 		return err
 	}
