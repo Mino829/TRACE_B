@@ -27,6 +27,15 @@ case "$mode" in
   serve)
     : "${GCP_RUNTIME_SA:?set GCP_RUNTIME_SA}"
     : "${GCP_APP_PASSWORD_SECRET:?set GCP_APP_PASSWORD_SECRET}"
+    # The edge credential is optional for private staging, but a configured
+    # credential must come from a pinned Secret Manager version.
+    secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET"
+    if [[ -n "${GCP_EDGE_SHARED_SECRET:-}" ]]; then
+      if [[ ! "$GCP_EDGE_SHARED_SECRET" =~ ^[a-zA-Z][a-zA-Z0-9_-]*:[1-9][0-9]*$ ]]; then
+        echo "GCP_EDGE_SHARED_SECRET must be a Secret Manager name and numeric version" >&2; exit 2
+      fi
+      secrets+=",TRACE_EDGE_SHARED_SECRET=$GCP_EDGE_SHARED_SECRET"
+    fi
     env_file=deploy/gcp/runtime.env.yaml
     if [[ ! -f "$env_file" ]] || grep -q REPLACE "$env_file"; then
       echo "Prepare $env_file with real deployment settings" >&2; exit 2
@@ -36,6 +45,9 @@ case "$mode" in
       : "${GCP_PUSH_VAPID_PRIVATE_SECRET:?set GCP_PUSH_VAPID_PRIVATE_SECRET}"
       : "${GCP_PUSH_ENCRYPTION_SECRET:?set GCP_PUSH_ENCRYPTION_SECRET}"
       runtime_secrets+=",TRACE_PUSH_VAPID_PRIVATE_KEY=$GCP_PUSH_VAPID_PRIVATE_SECRET,TRACE_PUSH_ENCRYPTION_KEY=$GCP_PUSH_ENCRYPTION_SECRET"
+    fi
+    if grep -Eq '^[[:space:]]*TRACE_EDGE_SHARED_SECRET[[:space:]]*:' "$env_file"; then
+      echo "Remove TRACE_EDGE_SHARED_SECRET from $env_file; use GCP_EDGE_SHARED_SECRET instead" >&2; exit 2
     fi
     gcloud run jobs deploy trace-cleanup "${common[@]}" \
       --image="$GCP_IMAGE" --args=cleanup --service-account="$GCP_RUNTIME_SA" \

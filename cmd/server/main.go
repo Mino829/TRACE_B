@@ -15,6 +15,7 @@ import (
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/photoasset"
 	"github.com/Mino829/trace_Backend/internal/push"
+	"github.com/Mino829/trace_Backend/internal/route"
 	"github.com/Mino829/trace_Backend/internal/store"
 )
 
@@ -83,6 +84,17 @@ func main() {
 	} else if err := db.ClearPush(startupCtx); err != nil {
 		slog.Error("failed to erase subscriptions while push is disabled")
 		os.Exit(1)
+	}
+	if photos != nil {
+		graph, err := route.Embedded()
+		if err != nil {
+			slog.Error("invalid embedded CampusGraph", "error", err)
+			os.Exit(1)
+		}
+		if err := db.ConfigureRoutes(graph, cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion); err != nil {
+			slog.Error("photo routing requires compatible graph, coordinate and 3D map versions", "error", err)
+			os.Exit(1)
+		}
 	}
 	if err := cleanupData(startupCtx, db, photos, time.Now().UTC()); err != nil {
 		slog.Error("startup cleanup failed; persisted deletion intents are retained")
