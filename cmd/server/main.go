@@ -57,6 +57,9 @@ func main() {
 		slog.Error("schema not ready; run migrate first")
 		os.Exit(1)
 	}
+	if cfg.DisplayEnabled {
+		db.EnableDisplay()
+	}
 	var photos *photo.Service
 	if cfg.PhotoBucket != "" {
 		assets, err := photoasset.NewGCS(startupCtx, cfg.PhotoBucket, cfg.PhotoSignerEmail)
@@ -73,14 +76,14 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if photos != nil {
+	if photos != nil || cfg.DisplayEnabled {
 		graph, err := route.Embedded()
 		if err != nil {
 			slog.Error("invalid embedded CampusGraph", "error", err)
 			os.Exit(1)
 		}
 		if err := db.ConfigureRoutes(graph, cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion); err != nil {
-			slog.Error("photo routing requires compatible graph, coordinate and 3D map versions", "error", err)
+			slog.Error("display/photo routing requires compatible graph, coordinate and 3D map versions", "error", err)
 			os.Exit(1)
 		}
 	}
@@ -98,12 +101,14 @@ func main() {
 		Addr:              cfg.Address,
 		Handler:           api.New(cfg, db, photos),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// The WebSocket route supplies its own 30s heartbeat/read deadline and
+		// 50m lifetime. HTTP requests remain bounded by API middleware contexts.
+		ReadTimeout:  0,
+		WriteTimeout: 0,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	go cleanupExpired(ctx, db, photos)
+	go cleanupExpired(ctx, db, photos, cfg.DisplayEnabled)
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -123,7 +128,7 @@ func main() {
 	<-shutdownDone
 }
 
-func cleanupExpired(ctx context.Context, db *store.Store, photos *photo.Service) {
+func cleanupExpired(ctx context.Context, db *store.Store, photos *photo.Service, displayEnabled bool) {
 	ticker := time.NewTicker(30 * time.Second)
 	positionTicker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -134,6 +139,13 @@ func cleanupExpired(ctx context.Context, db *store.Store, photos *photo.Service)
 			return
 		case now := <-positionTicker.C:
 			db.PurgePositions(now.UTC())
+			if displayEnabled {
+				displayCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if err := db.RefreshDisplay(displayCtx, now.UTC()); err != nil && ctx.Err() == nil {
+					slog.Error("display expiry cleanup failed")
+				}
+				cancel()
+			}
 		case now := <-ticker.C:
 			cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			if err := db.Ping(cleanupCtx); err != nil {

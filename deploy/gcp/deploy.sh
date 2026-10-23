@@ -31,18 +31,24 @@ case "$mode" in
     if [[ ! -f "$env_file" ]] || grep -q REPLACE "$env_file"; then
       echo "Prepare $env_file with real deployment settings" >&2; exit 2
     fi
+    runtime_secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET"
+    if [[ -n "${GCP_DISPLAY_ISSUER_SECRET:-}" || -n "${GCP_DISPLAY_TOKEN_SECRET:-}" ]]; then
+      : "${GCP_DISPLAY_ISSUER_SECRET:?set both display Secret Manager version references}"
+      : "${GCP_DISPLAY_TOKEN_SECRET:?set both display Secret Manager version references}"
+      runtime_secrets+=",TRACE_DISPLAY_ISSUER_KEY=$GCP_DISPLAY_ISSUER_SECRET,TRACE_DISPLAY_TOKEN_KEY=$GCP_DISPLAY_TOKEN_SECRET"
+    fi
     gcloud run jobs deploy trace-cleanup "${common[@]}" \
       --image="$GCP_IMAGE" --args=cleanup --service-account="$GCP_RUNTIME_SA" \
       --set-cloudsql-instances="$GCP_SQL_CONNECTION" --env-vars-file="$env_file" \
-      --set-secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET" \
+      --set-secrets="$runtime_secrets" \
       --tasks=1 --parallelism=1 --max-retries=2 --task-timeout=120s --cpu=1 --memory=512Mi
-    # Process-local position and rate-limit state require one API instance.
-    # Keep max=1 until both move to shared stores; avoid overlapping revisions.
+    # Position projection and rate limits remain process-local. Never run
+    # overlapping revisions or more than one active Backend instance.
     gcloud run deploy trace-backend "${common[@]}" \
       --image="$GCP_IMAGE" --args=serve --service-account="$GCP_RUNTIME_SA" \
       --execution-environment=gen2 --set-cloudsql-instances="$GCP_SQL_CONNECTION" \
-      --env-vars-file="$env_file" --set-secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET" \
-      --port=8080 --cpu=1 --memory=512Mi --concurrency=40 --timeout=30s \
+      --env-vars-file="$env_file" --set-secrets="$runtime_secrets" \
+      --port=8080 --cpu=1 --memory=512Mi --concurrency=40 --timeout=3600s \
       --min=1 --max=1 --no-cpu-throttling --no-allow-unauthenticated --invoker-iam-check \
       --startup-probe="httpGet.path=/health/ready,httpGet.port=8080,initialDelaySeconds=0,periodSeconds=5,timeoutSeconds=2,failureThreshold=12" \
       --liveness-probe="httpGet.path=/health/live,httpGet.port=8080,periodSeconds=30,timeoutSeconds=2,failureThreshold=3"

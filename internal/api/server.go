@@ -43,6 +43,9 @@ func (e *apiError) Error() string { return e.Code }
 
 func New(cfg config.Config, db *store.Store, photos *photo.Service) http.Handler {
 	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter(), photos: photos}
+	if cfg.DisplayEnabled && db != nil {
+		db.EnableDisplay()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.live)
 	mux.HandleFunc("GET /health/ready", server.ready)
@@ -51,6 +54,9 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service) http.Handler
 	mux.HandleFunc("POST /v1/operator/arrival-proofs", server.issueArrivalProof)
 	mux.HandleFunc("GET /v1/operator/arrivals", server.operatorArrivals)
 	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/skip", server.operatorSkipArrival)
+	mux.HandleFunc("POST /v1/operator/display-tokens", server.issueDisplayToken)
+	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/retry", server.operatorRetryArrival)
+	mux.HandleFunc("GET /v1/display/ws", server.displayWS)
 	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.limitedSession("session", server.experienceState))
 	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.limitedSession("experience-delete", server.deleteExperience))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.limitedSession("position", server.atomic((*Server).updatePosition)))
@@ -101,7 +107,16 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 				s.writeError(w, requestID, &apiError{Code: "INTERNAL_ERROR", Message: "internal server error", Status: http.StatusInternalServerError})
 			}
 		}()
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		if r.URL.Path != "/v1/display/ws" {
+			controller := http.NewResponseController(w)
+			_ = controller.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_ = controller.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		}
+		ctx := r.Context()
+		cancel := func() {}
+		if r.URL.Path != "/v1/display/ws" {
+			ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		}
 		defer cancel()
 		if strings.HasPrefix(r.URL.Path, "/v1/") && s.store.Ping(ctx) != nil {
 			s.writeError(w, requestID, &apiError{Code: "NOT_READY", Message: "required services are unavailable", Status: http.StatusServiceUnavailable})
