@@ -35,7 +35,7 @@
 | DELETE | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
 | GET | /v1/memory-sessions/{memorySessionId}/memory |
 
-経路再構成、到着QR、描画WebSocket、写真ピン・フォトスポット、運営APIは未実装です。写真ストーリーの`segments`は経路実装まで空配列とし、仮の経路を生成しません。
+到着QR、描画WebSocket、写真ピン・フォトスポット、運営APIは未実装です。本人用写真ストーリーの経路は写真撮影時GPSとCampusGraphから推定し、通常GPS履歴は使いません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -71,12 +71,20 @@ WebPはVP8Lの過大割り当てを修正した公式`x/image v0.47.0`を使い�
 アップロードURLは最大5分（Memoryの`expiresAt`以下）の新規作成専用PUTです。返却する`uploadHeaders`の`Content-Type`、`x-goog-if-generation-match: 0`、`Cache-Control`を送信し、`Content-Length`はブラウザがBlobサイズから自動設定します。上書き・読み取り・一覧には使えません。`complete`はbodyなしで何度送っても同じ写真の状態へ収束します。未アップロードは409、不正画像は消去後`failed`となり、消去に失敗した間は`deleting`で新しいURLを発行しません。
 
 本人memoryは検証済み`ready`だけを撮影時刻順に返し、画像URLは5分と`deleteAfter`の早い方までです。`locationConfidence`はGPSなし/精度100m超をlow、30m超〜100mをmedium、30m以下をhighとする暫定値で、経路の信頼度ではありません。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
+写真が`ready`になると、撮影時刻順の隣り合う写真ごとに`RouteSegment`を同一DBトランザクションで作成します。個別削除要求では`deleting`になった写真をただちに除外して残る前後の写真間を再計算し、画像消去完了・失敗時にも整合させます。写真0枚・1枚なら区間は空のままで到着/終了を妨げません。既存写真を保持するDBへ移行したときは本人memory取得時に欠損区間を再計算します。
+到着QRの確定情報は現時点ではブースcheckpointIdのみです。承認済みの会場checkpoint→CampusGraph座標の対応がないため、最後の写真から到着地点への区間は捏造しません。この依存が解決するまでは写真間の経路のみを提供します。
+
+CampusGraphは`internal/route/campus_graph.json`へ固定同梱します（TRACE_F main、2026-10-23取得、JSON記載版`toyosu-graph-2026-10-21.1.draft`）。Graph付属READMEの記述版`toyosu-graph-2026-10-18.2.draft`とは異なるため、JSON自身の版を正として使います。Graphの`coordinateVersion`=`toyosu-2026-08-28.1`、`threeDMapVersion`=`キャンパス全体.blend 2026-10-21`と公開設定の三つが一致しないと写真ストレージを用いるAPI/清掃ジョブの起動を拒否します。既定の`campus-2026-01`等を黙って上書きしません。承認済みの地図・表示機側にも同じ版を事前配布・ヘルス確認してから`TRACE_COORDINATE_VERSION`、`TRACE_CAMPUS_GRAPH_VERSION`、`TRACE_THREE_D_MAP_VERSION`と豊洲のジオフェンスを設定し、受け付け切替・ロールバックを行ってください。Graphの更新では固定JSON、互換版、試験点の測定を併せて更新します。
+
+アンカーはGraphのローカルENU（東=x、北=z）へ変換し、GPS精度円内の通行可能な`gpsSnap=true`両端を持つ辺だけへ投影します。`passable=false`、`restricted=true`、`closed=true`、時刻付き`closures`内、および`openingHours`（曜日0=日曜〜6=土曜、`open`/`close`は`HH:MM`・日本時間）の時間外辺は候補・探索の両方から除外します。現行Graphは`passable`のみを収録し、現場の一時通行止め・利用時間の運用入力は未提供です。運用データが正式に渡されるまでは実際の臨時閉鎖や時間外利用を防げないため公開運用に使用しないでください。階や屋内はGPSで確定できないため`gpsSnap=false`の辺へ吸着しません。
+
+本人専用memoryレスポンスの`segments`は`routeSegmentId`、両端の写真ID、`coordinateVersion`、`campusGraphVersion`、`threeDMapVersion`、`algorithmVersion`=`photo-edges-dijkstra-1`、`confidence`、`lengthM`、`path`を返します。`path`はGraph沿いの表示用ローカル点列`{t,x,z}`で、GPS履歴や生緯度経度は含みません。同程度の複数辺・撮影GPS欠損/精度不足・撮影地点から60秒超過去/10秒超未来の位置情報・経路不在・極端な移動速度は`confidence=low,path=[]`です。推定経路は実歩行の完全再現ではありません。公開イベント/スクリーンへ本人の写真・正確な撮影時刻・経路を流しません。
 
 削除はまず永続的な`deleting`を確定し、画像の消去が成功するまで参照・認証材料を捨てません。写真DELETE成功は204、写真・Memoryの消去失敗は503となり、同じ冪等性キーで再試行します。体験単位削除は従来どおりLive削除後にMemoryを処理し、写真消去失敗時は`memory: pending`です。期限切れはAPI常駐清掃と清掃ジョブで同じ処理を再開します。
 
-署名付きPUTは削除後も期限まで生きるため、アップロード先はゼロバイトで占有し、期限後だけoutboxから消去します。これにより削除後の再送で画像が復活しません。画像バイト・GPS・PhotoMoment参照は削除対象となり、この短期outboxにはランダムなobject keyと期限だけを保持します。写真の派生特徴・別サムネイル・経路・ピンはまだ生成しないため、その隠れた複製はありません。
+署名付きPUTは削除後も期限まで生きるため、アップロード先はゼロバイトで占有し、期限後だけoutboxから消去します。これにより削除後の再送で画像が復活しません。画像バイト・GPS・PhotoMoment参照とそれに紐づくRouteSegmentは削除対象となり、この短期outboxにはランダムなobject keyと期限だけを保持します。ピン・派生特徴・別サムネイルはまだ生成しません。
 
-DBは`003_photos.sql`を追加します。適用後に`runtime-grants.sql`を実行し、APIと清掃ジョブを同じschema対応版へ更新してください。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
+DBに`004_route_segments.sql`を追加します。適用後に`runtime-grants.sql`を実行し、APIと清掃ジョブを同じschema対応版へ更新してください。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
 
 ## 最短のローカル起動
 
@@ -153,8 +161,9 @@ make integration
 
 テストごとにランダムな専用スキーマを作り、終了時にそのスキーマだけを削除します。URL内のパスワードに特殊文字がある場合はURLエンコードが必要です。
 GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合テストを必ず実行します。
+`go test ./internal/route -run TestGenerationP95 -count=1 -v`は同梱された実Graph上で100回の生成時間を採取し、昇順95番目（p95）をログへ出します。デプロイ環境で計測し、承認した目標値と照合してください。試験コードを追加しただけでは実測・合格を意味しません。
 
-検証対象：既存API導線、時刻型の往復、資格情報分離、複数接続からの同時削除、停止と位置保存の競合、再送記録失敗時のロールバック、保存期限・関連データ削除、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、Cloud Runポート・Cloud SQL接続設定。
+検証対象：既存API導線、時刻型の往復、資格情報分離、複数接続からの同時削除、停止と位置保存の競合、再送記録失敗時のロールバック、保存期限・関連データ削除、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、CampusGraph上の既知経路/通行禁止/時間外/複数候補/欠損、Readyと写真削除時の区間再生成、Cloud Runポート・Cloud SQL接続設定。
 
 ## Google Cloudへ配置
 
