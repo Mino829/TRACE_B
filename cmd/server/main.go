@@ -99,8 +99,30 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if cfg.PhotoMarkersApproved {
+		if err := db.ConfigureMarkers(store.MarkerConfig{
+			Approved:          true,
+			WidthM:            cfg.PhotoMarkerWidthM,
+			TTL:               cfg.PhotoMarkerTTL,
+			SparseMinSessions: cfg.PhotoMarkerMinSessions,
+			CoordinateVersion: cfg.CoordinateVersion,
+			GraphVersion:      cfg.CampusGraphVersion,
+			ThreeDVersion:     cfg.ThreeDMapVersion,
+		}); err != nil {
+			slog.Error("approved photo marker policy is incompatible with configured spatial versions", "error", err)
+			os.Exit(1)
+		}
+	}
 	if err := cleanupData(startupCtx, db, photos, time.Now().UTC()); err != nil {
 		slog.Error("startup cleanup failed; persisted deletion intents are retained")
+		os.Exit(1)
+	}
+	// Reconcile retained visibility even when approval was withdrawn and no
+	// marker policy is installed in this process. A mismatch is already erased
+	// by the status transaction and remains unavailable to operators.
+	if _, err := db.MarkerStatus(startupCtx); err != nil &&
+		!errors.Is(err, store.ErrMarkersDisabled) && !errors.Is(err, store.ErrConflict) {
+		slog.Error("startup marker visibility reconciliation failed")
 		os.Exit(1)
 	}
 	if mode == "cleanup" {

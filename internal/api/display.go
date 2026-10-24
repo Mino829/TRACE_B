@@ -27,8 +27,12 @@ type displayCredential struct {
 }
 
 func (s *Server) displayAvailable() bool {
+	return s.cfg.DisplayEnabled && s.displayIssuerConfigured()
+}
+
+func (s *Server) displayIssuerConfigured() bool {
 	cfg := s.cfg
-	return cfg.DisplayEnabled && len(cfg.DisplayIssuerKey) >= 32 && len(cfg.DisplayTokenKey) >= 32 &&
+	return len(cfg.DisplayIssuerKey) >= 32 && len(cfg.DisplayTokenKey) >= 32 &&
 		cfg.DisplayIssuerKey != cfg.DisplayTokenKey && cfg.DisplayIssuerKey != cfg.EdgeSharedSecret &&
 		cfg.DisplayTokenKey != cfg.EdgeSharedSecret && cfg.DisplayIssuerKey != cfg.ArrivalIssuerKey &&
 		cfg.DisplayIssuerKey != cfg.ArrivalProofKey && cfg.DisplayTokenKey != cfg.ArrivalIssuerKey &&
@@ -42,25 +46,8 @@ func (s *Server) issueDisplayToken(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "display is disabled", Status: 503})
 		return
 	}
-	if r.Header.Get("Origin") != "" || r.Header.Get("Authorization") != "" || len(r.Header.Values("X-Trace-Display-Issuer-Timestamp")) != 1 || len(r.Header.Values("X-Trace-Display-Issuer-Signature")) != 1 {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
-		return
-	}
-	timestamp := r.Header.Get("X-Trace-Display-Issuer-Timestamp")
-	seconds, err := strconv.ParseInt(timestamp, 10, 64)
-	now := s.now().UTC()
-	if err != nil || seconds < now.Add(-15*time.Second).Unix() || seconds > now.Add(15*time.Second).Unix() {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
-		return
-	}
-	sig, err := base64.RawURLEncoding.DecodeString(r.Header.Get("X-Trace-Display-Issuer-Signature"))
-	if err != nil || subtle.ConstantTimeCompare(sig, mac(s.cfg.DisplayIssuerKey, "POST\n/v1/operator/display-tokens\n"+timestamp)) != 1 {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
-		return
-	}
-	if wait := s.limiter.allow(now, rateRule{key: "display-issuer/global", rate: 1, burst: 10},
-		rateRule{key: "api/global", rate: 100, burst: 100}); wait > 0 {
-		s.rateLimited(w, r, wait)
+	now, ok := s.authorizeDisplayIssuer(w, r)
+	if !ok {
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1))
@@ -76,6 +63,35 @@ func (s *Server) issueDisplayToken(w http.ResponseWriter, r *http.Request) {
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	s.writeJSON(w, 200, map[string]any{"displayToken": encoded + "." + base64.RawURLEncoding.EncodeToString(mac(s.cfg.DisplayTokenKey, encoded)), "expiresAt": time.Unix(claim.ExpiresAt, 0).UTC()})
+}
+
+// Display issuer signatures bind the method and exact route, not a renderer
+// credential. The same independent key authorizes private marker controls.
+func (s *Server) authorizeDisplayIssuer(w http.ResponseWriter, r *http.Request) (time.Time, bool) {
+	if r.Header.Get("Origin") != "" || len(r.Header.Values("Authorization")) != 0 ||
+		len(r.Header.Values("X-Trace-Display-Issuer-Timestamp")) != 1 ||
+		len(r.Header.Values("X-Trace-Display-Issuer-Signature")) != 1 {
+		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
+		return time.Time{}, false
+	}
+	timestamp := r.Header.Get("X-Trace-Display-Issuer-Timestamp")
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	now := s.now().UTC()
+	if err != nil || seconds < now.Add(-15*time.Second).Unix() || seconds > now.Add(15*time.Second).Unix() {
+		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
+		return time.Time{}, false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(r.Header.Get("X-Trace-Display-Issuer-Signature"))
+	if err != nil || subtle.ConstantTimeCompare(sig, mac(s.cfg.DisplayIssuerKey, r.Method+"\n"+r.URL.Path+"\n"+timestamp)) != 1 {
+		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
+		return time.Time{}, false
+	}
+	if wait := s.limiter.allow(now, rateRule{key: "display-issuer/global", rate: 1, burst: 10},
+		rateRule{key: "api/global", rate: 100, burst: 100}); wait > 0 {
+		s.rateLimited(w, r, wait)
+		return time.Time{}, false
+	}
+	return now, true
 }
 func (s *Server) verifyDisplayToken(token string, now time.Time) bool {
 	if len(token) > 1024 {
@@ -153,6 +169,13 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 		r.Header.Get("X-Trace-Schema-Version") != "1" || r.Header.Get("X-Trace-Coordinate-Version") != s.cfg.CoordinateVersion || r.Header.Get("X-Trace-Campus-Graph-Version") != s.cfg.CampusGraphVersion || r.Header.Get("X-Trace-Three-D-Map-Version") != s.cfg.ThreeDMapVersion {
 		s.writeError(w, requestID(r), &apiError{Code: "VERSION_MISMATCH", Message: "renderer bundle version mismatch", Status: 409})
 		return
+	}
+	if s.cfg.PhotoMarkersApproved {
+		if err := s.store.ValidateMarkerVersions(r.Header.Get("X-Trace-Coordinate-Version"),
+			r.Header.Get("X-Trace-Campus-Graph-Version"), r.Header.Get("X-Trace-Three-D-Map-Version")); err != nil {
+			s.writeError(w, requestID(r), &apiError{Code: "VERSION_MISMATCH", Message: "renderer bundle version mismatch", Status: http.StatusConflict})
+			return
+		}
 	}
 	conn, err := (&websocket.Upgrader{HandshakeTimeout: 5 * time.Second, CheckOrigin: func(r *http.Request) bool { return r.Header.Get("Origin") == "" }}).Upgrade(w, r, nil)
 	if err != nil {

@@ -34,6 +34,7 @@ type Store struct {
 	pending        positionChange
 	routes         *route.Graph
 	displayEnabled bool
+	markers        *MarkerConfig
 }
 type positionCache struct {
 	mu        sync.RWMutex
@@ -145,7 +146,7 @@ func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) err
 		return err
 	}
 	defer tx.Rollback()
-	work := &Store{db: s.db, q: tx, inTx: true, positions: s.positions, routes: s.routes, displayEnabled: s.displayEnabled}
+	work := &Store{db: s.db, q: tx, inTx: true, positions: s.positions, routes: s.routes, displayEnabled: s.displayEnabled, markers: s.markers}
 	if err := work.lockTransaction(ctx, key); err != nil {
 		return err
 	}
@@ -545,10 +546,15 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.queueExpiredPhotoMemories(ctx, now); err != nil {
+		return err
+	}
+	if err := s.Transaction(ctx, "trace:markers", func(tx *Store) error {
+		return tx.reconcileMarkers(ctx, now)
+	}); err != nil {
+		return err
+	}
 	return s.Transaction(ctx, "trace:cleanup", func(tx *Store) error {
-		if err := tx.queueExpiredPhotoMemories(ctx, now); err != nil {
-			return err
-		}
 		for _, query := range []string{
 			"DELETE FROM push_subscriptions WHERE expires_at<=$1 OR memory_session_id IN (SELECT e.memory_session_id FROM experiences e JOIN live_presence_sessions l ON l.id=e.live_session_id WHERE l.expires_at<=$1 OR l.tracking_status<>'tracking' OR l.presence_phase IN ('arrived','on_site'))",
 			"UPDATE live_presence_sessions SET tracking_status='expired',presence_phase='ended' WHERE expires_at<=$1 AND tracking_status='tracking'",

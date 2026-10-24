@@ -35,6 +35,8 @@ type DisplayState struct {
 	Cursor       int64                `json:"cursor"`
 	Participants []DisplayParticipant `json:"participants"`
 	Arrivals     []DisplayArrival     `json:"arrivals"`
+	Pins         []MarkerPoint        `json:"pins"`
+	Hotspots     []MarkerPoint        `json:"hotspots"`
 }
 type DisplayArrival struct {
 	ArrivalID    string       `json:"arrivalId"`
@@ -66,11 +68,22 @@ func (s *Store) AppendDisplayEvent(ctx context.Context, kind string, data any, n
 	return id, err
 }
 
-// Durable arrival state and its cursor share a transaction cut. Positions are
-// volatile and are copied separately; a following poll catches any concurrent change.
+// Durable arrival and marker state share a cursor cut. Positions are volatile
+// and copied separately; a following poll catches any concurrent change.
 func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayState, error) {
-	state := DisplayState{Participants: []DisplayParticipant{}, Arrivals: []DisplayArrival{}}
-	err := s.Transaction(ctx, "display:snapshot", func(tx *Store) error {
+	state := DisplayState{Participants: []DisplayParticipant{}, Arrivals: []DisplayArrival{}, Pins: []MarkerPoint{}, Hotspots: []MarkerPoint{}}
+	policyMismatch := false
+	err := s.Transaction(ctx, "trace:markers", func(tx *Store) error {
+		// Reconcile before locking display_cursor: marker -> cursor everywhere.
+		if err := tx.reconcileMarkers(ctx, now); err != nil {
+			return err
+		}
+		control, err := tx.markerControl(ctx)
+		if err != nil {
+			return err
+		}
+		_, policyErr := tx.validateMarkerControl(control)
+		policyMismatch = errors.Is(policyErr, ErrConflict)
 		if err := tx.q.QueryRowContext(ctx, `SELECT last_id FROM display_cursor WHERE singleton=TRUE FOR UPDATE`).Scan(&state.Cursor); err != nil {
 			return err
 		}
@@ -92,8 +105,33 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 			err = rows.Err()
 		}
 		rows.Close()
+		if err != nil || !tx.displayEnabled {
+			return err
+		}
+		rows, err = tx.q.QueryContext(ctx, `SELECT kind,public_id,x,z FROM marker_visible ORDER BY kind,public_id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var p MarkerPoint
+			if err = rows.Scan(&p.Kind, &p.ID, &p.X, &p.Z); err != nil {
+				break
+			}
+			if p.Kind == "pin" {
+				state.Pins = append(state.Pins, p)
+			} else {
+				state.Hotspots = append(state.Hotspots, p)
+			}
+		}
+		if err == nil {
+			err = rows.Err()
+		}
+		rows.Close()
 		return err
 	})
+	if err == nil && policyMismatch {
+		return DisplayState{}, ErrConflict
+	}
 	if err == nil {
 		for _, p := range s.DisplayPositions(now) {
 			state.Participants = append(state.Participants, p)
@@ -108,12 +146,15 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 var ErrDisplayResync = errors.New("display event cursor expired; resync required")
 
 func (s *Store) DisplayEvents(ctx context.Context, cursor int64, limit int) ([]DisplayEvent, error) {
-	if limit < 1 || limit > 256 {
+	if cursor < 0 || limit < 1 || limit > 256 {
 		return nil, ErrConflict
 	}
 	var last int64
 	if err := s.q.QueryRowContext(ctx, `SELECT last_id FROM display_cursor WHERE singleton=TRUE`).Scan(&last); err != nil {
 		return nil, err
+	}
+	if cursor > last {
+		return nil, ErrDisplayResync
 	}
 	rows, err := s.q.QueryContext(ctx, `SELECT id,kind,data,occurred_at FROM display_events WHERE id>$1 ORDER BY id LIMIT $2`, cursor, limit)
 	if err != nil {
@@ -162,7 +203,10 @@ func (s *Store) RefreshDisplay(ctx context.Context, now time.Time) error {
 	if err := s.Transaction(ctx, "display:lease", func(tx *Store) error { return tx.expireDisplayLease(ctx, now) }); err != nil {
 		return err
 	}
-	return s.ExpireArrivals(ctx, now)
+	if err := s.ExpireArrivals(ctx, now); err != nil {
+		return err
+	}
+	return s.Transaction(ctx, "trace:markers", func(tx *Store) error { return tx.reconcileMarkers(ctx, now) })
 }
 
 // Lease is fenced by an unpredictable ID and holder connection ID, in SQL.
