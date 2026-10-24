@@ -59,8 +59,21 @@ case "$mode" in
       fi
       api_secrets+=",TRACE_ARRIVAL_ISSUER_KEY=$GCP_ARRIVAL_ISSUER_SECRET,TRACE_ARRIVAL_PROOF_KEY=$GCP_ARRIVAL_PROOF_SECRET"
     fi
+    if [[ -n "${GCP_DISPLAY_ISSUER_SECRET:-}" || -n "${GCP_DISPLAY_TOKEN_SECRET:-}" ]]; then
+      : "${GCP_DISPLAY_ISSUER_SECRET:?set GCP_DISPLAY_ISSUER_SECRET}"
+      : "${GCP_DISPLAY_TOKEN_SECRET:?set GCP_DISPLAY_TOKEN_SECRET}"
+      for ref in "$GCP_DISPLAY_ISSUER_SECRET" "$GCP_DISPLAY_TOKEN_SECRET"; do
+        if [[ ! "$ref" =~ ^[a-zA-Z][a-zA-Z0-9_-]*:[1-9][0-9]*$ ]]; then
+          echo "Display secrets must be pinned Secret Manager name:version references" >&2; exit 2
+        fi
+      done
+      if [[ "$GCP_DISPLAY_ISSUER_SECRET" == "$GCP_DISPLAY_TOKEN_SECRET" ]]; then
+        echo "Display issuer and token secrets must differ" >&2; exit 2
+      fi
+      api_secrets+=",TRACE_DISPLAY_ISSUER_KEY=$GCP_DISPLAY_ISSUER_SECRET,TRACE_DISPLAY_TOKEN_KEY=$GCP_DISPLAY_TOKEN_SECRET"
+    fi
     api_secrets+="${runtime_secrets#DB_PASSWORD=$GCP_APP_PASSWORD_SECRET}"
-    if grep -Eq '^[[:space:]]*(TRACE_EDGE_SHARED_SECRET|TRACE_ARRIVAL_(ISSUER|PROOF)_KEY)[[:space:]]*:' "$env_file"; then
+    if grep -Eq '^[[:space:]]*(TRACE_EDGE_SHARED_SECRET|TRACE_(ARRIVAL|DISPLAY)_(ISSUER|PROOF|TOKEN)_KEY)[[:space:]]*:' "$env_file"; then
       echo "Remove private credentials from $env_file; use pinned Secret Manager references instead" >&2; exit 2
     fi
     gcloud run jobs deploy trace-cleanup "${common[@]}" \
@@ -68,13 +81,13 @@ case "$mode" in
       --set-cloudsql-instances="$GCP_SQL_CONNECTION" --env-vars-file="$env_file" \
       --set-secrets="$runtime_secrets" \
       --tasks=1 --parallelism=1 --max-retries=2 --task-timeout=120s --cpu=1 --memory=512Mi
-    # Process-local position and rate-limit state require one API instance.
-    # Keep max=1 until both move to shared stores; avoid overlapping revisions.
+    # Position projection and rate limits remain process-local. Never run
+    # overlapping revisions or more than one active Backend instance.
     gcloud run deploy trace-backend "${common[@]}" \
       --image="$GCP_IMAGE" --args=serve --service-account="$GCP_RUNTIME_SA" \
       --execution-environment=gen2 --set-cloudsql-instances="$GCP_SQL_CONNECTION" \
       --env-vars-file="$env_file" --set-secrets="$api_secrets" \
-      --port=8080 --cpu=1 --memory=512Mi --concurrency=40 --timeout=30s \
+      --port=8080 --cpu=1 --memory=512Mi --concurrency=40 --timeout=3600s \
       --min=1 --max=1 --no-cpu-throttling --no-allow-unauthenticated --invoker-iam-check \
       --startup-probe="httpGet.path=/health/ready,httpGet.port=8080,initialDelaySeconds=0,periodSeconds=5,timeoutSeconds=2,failureThreshold=12" \
       --liveness-probe="httpGet.path=/health/live,httpGet.port=8080,periodSeconds=30,timeoutSeconds=2,failureThreshold=3"

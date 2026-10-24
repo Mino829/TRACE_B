@@ -6,8 +6,8 @@
 
 - MemorySession / LivePresenceSession / ExperienceLinkの分離発行、別Bearer token認証
 - 同意版検証、公開設定、キャンパス範囲・精度・時刻・ジャンプの検証
-- 通常GPSの生緯度経度・履歴を保存せず、量子化済み最新表示位置だけを単一Goプロセスのメモリに保持（30～60秒TTL）
-- 期限切れ位置の読み出し抑止と毎秒の物理削除、停止・削除時消去。再起動時は表示位置を破棄
+- 生の通常GPSや履歴は保存しない。描画無効（既定）では量子化済み最新位置をGoプロセス内だけで30～60秒保持し、停止・期限切れ・削除時に消去する
+- 描画有効時は再起動・複数Backendのsnapshot再同期用に量子化済み最新位置1件だけをPostgreSQLへ保存し、TTL・停止・削除時にDBから消去する。過去位置を蓄積せず、投影用の不透明IDと安全な表示aliasだけを配信する
 - MemorySession / LivePresenceSessionごとの有効期限と削除期限。期限後も各`deleteAfter`までは本人の状態取得・削除が可能
 - 個別削除と両トークンによる体験単位削除。後者はLive側から順に個別に確定し、部分成功を24時間の記録と同じキーで再試行
 - DBロックとトランザクションで各削除・冪等性記録を一括確定
@@ -17,6 +17,7 @@
 - 任意有効化する非公開写真API：メタデータ登録、署名付きPUT、検証完了、本人ストーリー、写真・セッション・期限削除
 - 任意同意後のWeb Push撮影リマインダー（既定で無効）：購読情報の暗号化、15/30分、停止・期限消去
 - 既定無効の投影QR到着受付、運営専用署名発行、永続演出キュー、本人向け再生状態
+- 既定無効の描画WSS：短期専用資格、snapshot→PostgreSQL連番差分、単一主描画機lease、再生開始・完了・失敗と期限切れ・切断skip
 
 | メソッド | エンドポイント |
 |---|---|
@@ -42,8 +43,11 @@
 | POST | /v1/operator/arrival-proofs |
 | GET | /v1/operator/arrivals |
 | POST | /v1/operator/arrivals/{arrivalId}/skip |
+| POST | /v1/operator/display-tokens |
+| POST | /v1/operator/arrivals/{arrivalId}/retry |
+| GET (WSS) | /v1/display/ws |
 
-描画WebSocket・再生開始/完了、写真ピン・フォトスポット、および到着以外の運営APIは未実装です。本人用写真ストーリーの経路は写真撮影時GPSとCampusGraphから推定し、通常GPS履歴は使いません。
+到着QRと描画WebSocketは機能フラグで個別に有効化します。写真ストーリーは写真撮影時GPSとCampusGraphから経路を推定し、通常GPS履歴を使いません。写真ピン・フォトスポット描画イベントと画像/経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -57,9 +61,10 @@
 | 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
 | Web Push購読・変更・解除 | Memory参加トークンごとに10回/分・burst 10 |
 | 到着proof発行・候補照会・運営skip | 有効な運営署名の要求を全体で1回/秒・burst 10 |
+| 描画token発行 | 有効な発行署名の要求を全体で1回/秒・burst 10 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
-超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。運営用到着APIは有効な署名の要求を全体で1回/秒・burst 10に制限します。描画・その他の運営APIの制限は該当APIの実装時に追加します。
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。運営用到着APIと描画token発行はそれぞれ有効な署名の要求を全体で1回/秒・burst 10に制限します。描画WSは1接続あたり10メッセージ/秒、各256KiBで制限します。
 許可Originには`Retry-After`をCORSで公開します。一括削除はMemoryのBearer tokenと`X-Trace-Live-Token`の両方の操作枠を同時に確認・消費し、片側が超過していれば削除を開始せず、もう片側の枠も消費しません。位置送信と操作のトークン別枠は分離されていますが、IP別・全体の追加上限は共通です。
 IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
 転送IPは単一のIPv4/IPv6だけを受け付けます。複数の同名ヘッダー、カンマ区切り、IPv6 zone付きなどは接続元IPへフォールバックします。
@@ -88,7 +93,19 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 有効なExperienceLinkを持つ場合は当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。GPSは`tracking`のまま、`on_site`は従来どおり本人の追加同意版が必要です。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。到着は写真機能無効でも有効、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOは最大32件、満杯でも到着自体を記録して`skipped`（`queue_full`）とし、開始されず2分経った候補も`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`は未再生の演出をスキップします。
 
-運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。本人GETにキュー順は出しません。描画機のリース、再生開始・完了・停止イベントと写真/経路素材の組立はIssue #9の統合まで提供しません。運営候補APIを呼んでも再生状態は`playing`へ移りません。DBは`006_arrivals.sql`です。展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。既存Live/位置APIのGPS廃止後の扱いはIssue #26の判断待ちです。
+運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。`POST /v1/operator/arrivals/{arrivalId}/retry`は描画機障害によるskipに限り、同じ運営署名で明示的に再キュー投入します。本人GETにキュー順は出しません。演出の状態変更は主描画機leaseを確認したWSSだけが行い、運営候補照会では`playing`へ移りません。適用DBは`004_route_segments.sql`、`005_push_subscriptions.sql`、`006_arrivals.sql`、`007_display.sql`の順です。展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。既存Live/位置APIのGPS廃止後の扱いはIssue #26の判断待ちです。
+
+## 描画WebSocket（既定無効）
+
+`TRACE_DISPLAY_ENABLED=false`が既定です。有効化するには参加者・到着運営・Edgeとは異なる32バイト以上の`TRACE_DISPLAY_ISSUER_KEY`と`TRACE_DISPLAY_TOKEN_KEY`が必須です。写真の有無を問わず起動時に座標/CampusGraph/3D Map版を埋め込みCampusGraphと照合し、既定の未審査bundleとは不一致なら起動を拒否します。秘密値はSecret Managerで個別管理し、署名鍵をローテーションすると既発行資格を即時失効します。描画PCが外向きHTTPS/WSSでアクセスする**承認済み専用経路**を用意してください。参加者サイトWorkerは`/v1/display/*`と`/v1/operator/*`を転送しないでください。Edge共有シークレットが有効なら承認済み経路から`X-Trace-Edge-Secret`も送ります。WSSトークンをURL、ブラウザ、ログ、写真やQRへ載せないでください。
+
+運営の専用発行器から空bodyの`POST /v1/operator/display-tokens`へ、`X-Trace-Display-Issuer-Timestamp: <Unix秒>`と`X-Trace-Display-Issuer-Signature: base64url(HMAC-SHA256(TRACE_DISPLAY_ISSUER_KEY, \"POST\\n/v1/operator/display-tokens\\n\" + timestamp))`を送ります（時差最大15秒）。レスポンス`displayToken`は2分有効で、参加者Bearer/到着運営署名と互換性がありません。`GET /v1/display/ws`へ`Authorization: Bearer <displayToken>`、`X-Trace-Schema-Version: 1`、`X-Trace-Coordinate-Version`、`X-Trace-Campus-Graph-Version`、`X-Trace-Three-D-Map-Version`（現行設定と完全一致）を付け、Origin・query stringは付けません。不一致はHTTP 409、資格エラーは401、機能無効は503です。
+
+WS接続直後の`display.snapshot`は`data.cursor`、量子化済み最新位置の`participants`、再生待ち/再生中の`arrivals`を含みます。写真marker配列は#10統合前なので**含まれません**。到着・再生イベントの`eventId`はDB連番で、欠番や再接続時はsnapshotで全置換します。`position.updated`、`position.expired`、`tracking.stopped`は各接続で最新のGoメモリ状態から生成する一時的な差分であり、`eventId`は不透明な重複排除キーです。位置差分はDBに保存・再送せず、位置のTTLは最大60秒、接続断後は次のsnapshotで復元します。写真/trajectory未提供の`participant.arrived`、`participant.phase.changed`、`participant.on_site`、`arrival.replay.requested/started/completed/failed/skipped`は永続差分です。画像、写真URL、元のGPS、参加者資格、内部セッションIDは含みません。映像へ正確な時刻やIDを表示しないでください。
+
+送信JSONはすべて`schemaVersion:1`、3種のversion、`type`を含めます。`renderer.primary.acquire`で主リースを要求し、`renderer.primary.granted`の`data.leaseId`を保存します。他接続には`renderer.primary.conflict`を返します。`arrival.replay.started`、`arrival.replay.completed`、`arrival.replay.failed`にはクライアント生成の一意な`eventId`（8～128文字）、`arrivalId`、`leaseId`を指定します。成功は`renderer.ack`、競合・失効は`renderer.rejected`です。同じeventId・同じ操作の再送は24時間同じ結果となり、異なる内容は拒否します。切断/30秒heartbeat欠落/リース期限切れは再生中を`skipped`に確定し、別端末による自動再生はしません。運営の署名済み明示retryのみが再投入できます。10秒間隔のping/pong（または`renderer.heartbeat`）と30秒応答期限を設け、50分でWSを終了します。Cloud Run設定は3600秒で、クライアント側は切断時に指数バックオフで**新しい資格を取得し**snapshotから再接続します。
+
+最新の量子化済み位置は単一BackendのGoメモリにのみ保持し、PostgreSQLには保存しません。到着・再生イベントと主描画機leaseだけをDBに保存します。複数Backend間で位置は共有されないため、**APIとWebSocketは同じ1インスタンス**へ接続し、Cloud Runの最大インスタンス数を1としてください。旧revisionと並存させると表示が欠落し得るため、受付停止・旧revision停止後に切り替えます。複数インスタンス化には仕様で定めるRedis互換TTLストア/メッセージ基盤への移行と容量・プライバシー承認が必要です。DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。新規写真・位置受付を廃止する判断は設計Issue #23・Backend #25/#26待ちであり、旧位置イベントを新展示契約として確定しません。
 
 ## 非公開写真の設定とライフサイクル
 
