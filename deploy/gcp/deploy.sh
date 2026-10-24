@@ -29,12 +29,12 @@ case "$mode" in
     : "${GCP_APP_PASSWORD_SECRET:?set GCP_APP_PASSWORD_SECRET}"
     # The edge credential is optional for private staging, but a configured
     # credential must come from a pinned Secret Manager version.
-    secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET"
+    api_secrets="DB_PASSWORD=$GCP_APP_PASSWORD_SECRET"
     if [[ -n "${GCP_EDGE_SHARED_SECRET:-}" ]]; then
       if [[ ! "$GCP_EDGE_SHARED_SECRET" =~ ^[a-zA-Z][a-zA-Z0-9_-]*:[1-9][0-9]*$ ]]; then
         echo "GCP_EDGE_SHARED_SECRET must be a Secret Manager name and numeric version" >&2; exit 2
       fi
-      secrets+=",TRACE_EDGE_SHARED_SECRET=$GCP_EDGE_SHARED_SECRET"
+      api_secrets+=",TRACE_EDGE_SHARED_SECRET=$GCP_EDGE_SHARED_SECRET"
     fi
     env_file=deploy/gcp/runtime.env.yaml
     if [[ ! -f "$env_file" ]] || grep -q REPLACE "$env_file"; then
@@ -46,8 +46,22 @@ case "$mode" in
       : "${GCP_PUSH_ENCRYPTION_SECRET:?set GCP_PUSH_ENCRYPTION_SECRET}"
       runtime_secrets+=",TRACE_PUSH_VAPID_PRIVATE_KEY=$GCP_PUSH_VAPID_PRIVATE_SECRET,TRACE_PUSH_ENCRYPTION_KEY=$GCP_PUSH_ENCRYPTION_SECRET"
     fi
-    if grep -Eq '^[[:space:]]*TRACE_EDGE_SHARED_SECRET[[:space:]]*:' "$env_file"; then
-      echo "Remove TRACE_EDGE_SHARED_SECRET from $env_file; use GCP_EDGE_SHARED_SECRET instead" >&2; exit 2
+    if [[ -n "${GCP_ARRIVAL_ISSUER_SECRET:-}" || -n "${GCP_ARRIVAL_PROOF_SECRET:-}" ]]; then
+      : "${GCP_ARRIVAL_ISSUER_SECRET:?set GCP_ARRIVAL_ISSUER_SECRET}"
+      : "${GCP_ARRIVAL_PROOF_SECRET:?set GCP_ARRIVAL_PROOF_SECRET}"
+      for ref in "$GCP_ARRIVAL_ISSUER_SECRET" "$GCP_ARRIVAL_PROOF_SECRET"; do
+        if [[ ! "$ref" =~ ^[a-zA-Z][a-zA-Z0-9_-]*:[1-9][0-9]*$ ]]; then
+          echo "Arrival secrets must be pinned Secret Manager name:version references" >&2; exit 2
+        fi
+      done
+      if [[ "$GCP_ARRIVAL_ISSUER_SECRET" == "$GCP_ARRIVAL_PROOF_SECRET" ]]; then
+        echo "Arrival issuer and proof secrets must differ" >&2; exit 2
+      fi
+      api_secrets+=",TRACE_ARRIVAL_ISSUER_KEY=$GCP_ARRIVAL_ISSUER_SECRET,TRACE_ARRIVAL_PROOF_KEY=$GCP_ARRIVAL_PROOF_SECRET"
+    fi
+    api_secrets+="${runtime_secrets#DB_PASSWORD=$GCP_APP_PASSWORD_SECRET}"
+    if grep -Eq '^[[:space:]]*(TRACE_EDGE_SHARED_SECRET|TRACE_ARRIVAL_(ISSUER|PROOF)_KEY)[[:space:]]*:' "$env_file"; then
+      echo "Remove private credentials from $env_file; use pinned Secret Manager references instead" >&2; exit 2
     fi
     gcloud run jobs deploy trace-cleanup "${common[@]}" \
       --image="$GCP_IMAGE" --args=cleanup --service-account="$GCP_RUNTIME_SA" \
@@ -59,7 +73,7 @@ case "$mode" in
     gcloud run deploy trace-backend "${common[@]}" \
       --image="$GCP_IMAGE" --args=serve --service-account="$GCP_RUNTIME_SA" \
       --execution-environment=gen2 --set-cloudsql-instances="$GCP_SQL_CONNECTION" \
-      --env-vars-file="$env_file" --set-secrets="$runtime_secrets" \
+      --env-vars-file="$env_file" --set-secrets="$api_secrets" \
       --port=8080 --cpu=1 --memory=512Mi --concurrency=40 --timeout=30s \
       --min=1 --max=1 --no-cpu-throttling --no-allow-unauthenticated --invoker-iam-check \
       --startup-probe="httpGet.path=/health/ready,httpGet.port=8080,initialDelaySeconds=0,periodSeconds=5,timeoutSeconds=2,failureThreshold=12" \

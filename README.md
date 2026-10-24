@@ -16,6 +16,7 @@
 - 明示的なDBマイグレーションと期限削除コマンド
 - 任意有効化する非公開写真API：メタデータ登録、署名付きPUT、検証完了、本人ストーリー、写真・セッション・期限削除
 - 任意同意後のWeb Push撮影リマインダー（既定で無効）：購読情報の暗号化、15/30分、停止・期限消去
+- 既定無効の投影QR到着受付、運営専用署名発行、永続演出キュー、本人向け再生状態
 
 | メソッド | エンドポイント |
 |---|---|
@@ -28,6 +29,8 @@
 | POST | /v1/live-presence-sessions/{liveSessionId}/position |
 | POST | /v1/live-presence-sessions/{liveSessionId}/on-site |
 | POST | /v1/live-presence-sessions/{liveSessionId}/stop |
+| POST | /v1/memory-sessions/{memorySessionId}/arrival |
+| POST | /v1/memory-sessions/{memorySessionId}/arrival/skip |
 | DELETE | /v1/memory-sessions/{memorySessionId} |
 | DELETE | /v1/live-presence-sessions/{liveSessionId} |
 | GET / POST | /v1/memory-sessions/{memorySessionId}/photos |
@@ -36,8 +39,11 @@
 | DELETE | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
 | GET | /v1/memory-sessions/{memorySessionId}/memory |
 | PUT / PATCH / DELETE | /v1/memory-sessions/{memorySessionId}/push-subscription |
+| POST | /v1/operator/arrival-proofs |
+| GET | /v1/operator/arrivals |
+| POST | /v1/operator/arrivals/{arrivalId}/skip |
 
-到着QR、描画WebSocket、写真ピン・フォトスポット、運営APIは未実装です。本人用写真ストーリーの経路は写真撮影時GPSとCampusGraphから推定し、通常GPS履歴は使いません。
+描画WebSocket・再生開始/完了、写真ピン・フォトスポット、および到着以外の運営APIは未実装です。本人用写真ストーリーの経路は写真撮影時GPSとCampusGraphから推定し、通常GPS履歴は使いません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -47,12 +53,13 @@
 | 参加作成 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
 | 公開設定取得 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
 | 位置送信 | Live参加トークンごとに12回/分・burst 5 |
-| 本人状態取得、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
+| 本人状態取得、到着、演出skip、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
 | 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
 | Web Push購読・変更・解除 | Memory参加トークンごとに10回/分・burst 10 |
+| 到着proof発行・候補照会・運営skip | 有効な運営署名の要求を全体で1回/秒・burst 10 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
-超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。描画・運営の制限は該当APIの実装時に追加します。
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。運営用到着APIは有効な署名の要求を全体で1回/秒・burst 10に制限します。描画・その他の運営APIの制限は該当APIの実装時に追加します。
 許可Originには`Retry-After`をCORSで公開します。一括削除はMemoryのBearer tokenと`X-Trace-Live-Token`の両方の操作枠を同時に確認・消費し、片側が超過していれば削除を開始せず、もう片側の枠も消費しません。位置送信と操作のトークン別枠は分離されていますが、IP別・全体の追加上限は共通です。
 IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
 転送IPは単一のIPv4/IPv6だけを受け付けます。複数の同名ヘッダー、カンマ区切り、IPv6 zone付きなどは接続元IPへフォールバックします。
@@ -62,12 +69,26 @@ IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`�
 
 `TRACE_PUSH_ENABLED=false`が既定です。承認済みの通知文面・別途のブラウザ通知許可・stagingでの実Push確認後だけ有効化してください。MemorySession作成・写真撮影・位置共有には通知が不要です。通知を無効化した場合、新規PUT/PATCHは`503 PUSH_UNAVAILABLE`、DELETEは本人認証後に購読を消去します。無効化して起動すると残存購読を全消去し、外部送信は開始しません。公開設定`notification`は`enabled`、`defaultIntervalMinutes:30`、`allowedIntervalsMinutes:[15,30]`、`exactDeliveryGuaranteed:false`と、有効化時のみ`vapidPublicKey`を返します。
 
-`TRACE_PUSH_VAPID_PUBLIC_KEY`は非圧縮P-256公開鍵（65 byteのbase64url）、`TRACE_PUSH_VAPID_PRIVATE_KEY`は対応する32 byteの秘密scalar、`TRACE_PUSH_VAPID_SUBJECT`は有効な運営先の`mailto:`、`TRACE_PUSH_ENCRYPTION_KEY`は**VAPIDとは別の**ランダムな32 byte AES-GCM鍵（base64url）です。鍵はSecret ManagerからAPIとworkerへ同一の値を渡し、ソース・通常ログ・運営画面・描画へ出さないでください。古い暗号化鍵を失うと既存購読は復号できません。鍵を変更する場合は購読を一旦消去し、端末に再同意・再購読を求めてください。`004_push_subscriptions.sql`の適用後、`deploy/gcp/runtime-grants.sql`を再適用してからAPIを入れ替えます。デプロイ時のmigration番号は他ブランチと統合して連番にしてください。
+`TRACE_PUSH_VAPID_PUBLIC_KEY`は非圧縮P-256公開鍵（65 byteのbase64url）、`TRACE_PUSH_VAPID_PRIVATE_KEY`は対応する32 byteの秘密scalar、`TRACE_PUSH_VAPID_SUBJECT`は有効な運営先の`mailto:`、`TRACE_PUSH_ENCRYPTION_KEY`は**VAPIDとは別の**ランダムな32 byte AES-GCM鍵（base64url）です。鍵はSecret ManagerからAPIとworkerへ同一の値を渡し、ソース・通常ログ・運営画面・描画へ出さないでください。古い暗号化鍵を失うと既存購読は復号できません。鍵を変更する場合は購読を一旦消去し、端末に再同意・再購読を求めてください。`005_push_subscriptions.sql`の適用後、`deploy/gcp/runtime-grants.sql`を再適用してからAPIを入れ替えます。
 Cloud Runの`deploy/gcp/runtime.env.yaml`には公開鍵と`mailto:`だけを記載し、秘密鍵と暗号化鍵は置かないでください。`deploy/gcp/deploy.sh serve`には別々のSecret Manager参照`GCP_PUSH_VAPID_PRIVATE_SECRET`と`GCP_PUSH_ENCRYPTION_SECRET`を渡すと、APIと清掃ジョブの両方へ秘密環境変数として配布します。実行サービスアカウントのSecret Accessor権限を両secretに限定してください。常駐ディスパッチャはCloud Runの`--min=1 --no-cpu-throttling`に依存します。スケール・revision並存時の重複と配信時刻、外部プロバイダへの実到達性はstagingで確認してください。
 
 Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscription`へ`{"consent":true,"subscription":{"endpoint":"https://...","keys":{"p256dh":"base64url","auth":"base64url"}},"intervalMinutes":30}`を送ります。許可・説明後の参加者操作だけで`consent:true`を送信してください。endpointはHTTPSのFirefox/Chrome/Windows/Apple push serviceのみを受け付け、外部URLを無条件にフェッチしません。`PATCH`は`{"intervalMinutes":15}`または`{"status":"paused"}` / `{"status":"active"}`を受け付け、`DELETE`（空body）は204で未送信予定と鍵を消去します。PUT/PATCHは`status`、`intervalMinutes`、`nextSendAt`、`expiresAt`だけを返し、endpointや鍵は返しません。paused中の`nextSendAt`はnull、再開・間隔変更で時刻を再計算します。
 
-10秒ごとに最大50件を抽出し、DB内のMemoryロックと状態再確認のもと、5秒以内にプロバイダへ送信します。送信時刻は厳密には保証しません。payloadは固定の一般文面と相対URL`/photo`だけで、位置・写真・セッションID・参加記号を含みません。正常2xxでは次回を間隔後へ、404/410では鍵を削除、その他の失敗は1分後に再試行します。Web Pushに配信のexactly-once保証はなく、プロバイダ受理後DB commit失敗時には重複し得ます。写真の初回`ready`時は同じトランザクションで次回を延期します。Memory削除準備・Memory/Live削除・Live停止・期限清掃は購読も削除します。#8を統合するとき、`store.AcceptArrival`の初回ArrivalEvent作成分岐で、到着確定と同じMemory Storeトランザクション内から`tx.EndPushForMemory(ctx, memoryID)`を呼んでください。このhookはMemoryに`push_stopped=true`を立て、購読を消去してMemory単独参加やLive削除後も再購読を禁止します。単純解除は`StopPushForMemory`（再購読可能）を使用します。到着時に確実に停止するにはこのhookの統合が必須です。
+10秒ごとに最大50件を抽出し、DB内のMemoryロックと状態再確認のもと、5秒以内にプロバイダへ送信します。送信時刻は厳密には保証しません。payloadは固定の一般文面と相対URL`/photo`だけで、位置・写真・セッションID・参加記号を含みません。正常2xxでは次回を間隔後へ、404/410では鍵を削除、その他の失敗は1分後に再試行します。Web Pushに配信のexactly-once保証はなく、プロバイダ受理後DB commit失敗時には重複し得ます。写真の初回`ready`時は同じトランザクションで次回を延期します。Memory削除準備・Memory/Live削除・Live停止・到着確定・期限清掃は購読も削除します。到着時は同じMemory Storeトランザクション内で`push_stopped=true`を確定し、再購読を禁止します。単純解除は再購読可能です。
+
+## 投影QRによる到着（既定無効）
+
+`TRACE_ARRIVAL_ENABLED=false`が既定です。有効化には`TRACE_ARRIVAL_VENUE`（会場ID）、`TRACE_ARRIVAL_CHECKPOINT_ID`（ブースID）、異なる32バイト以上の秘密値`TRACE_ARRIVAL_PROOF_KEY`（QR署名専用）、`TRACE_ARRIVAL_ISSUER_KEY`（運営発行API認証専用）が必須です。鍵を参加者サイト/QR/ログへ渡さず、Secret Manager等で配置してください。鍵の切替・失効は設定の更新と稼働revision切替で行い、旧proofと旧運営署名を即時失効させます。複数revisionを同時公開すると鍵・キューの一貫性が失われるため、切替前に受付停止し単一APIインスタンスを維持してください。大学の審査と運営導線が整うまでフラグは有効化しないでください。
+
+運営専用の`POST /v1/operator/arrival-proofs`へ空bodyでHTTPSアクセスします。認証ヘッダー`X-Trace-Issuer-Timestamp`には現在のUnix秒を十進表記、`X-Trace-Issuer-Signature`には`base64url(HMAC-SHA256(TRACE_ARRIVAL_ISSUER_KEY, "POST\n/v1/operator/arrival-proofs\n" + timestamp))`（paddingなし）を設定します。有効期間は前後15秒です。固定鍵自体を送信せず、署名を短命の運営資格として使います。投影機が取得した`checkpointToken`という**文字列だけ**をWeb URLではなくQRにエンコードし、例えば15秒ごとに交換します。`expiresAt`（UTC）到達後は掲示しません。端末はWeb App内のカメラで読み、既存Memoryセッションのまま送信します。会場用機器からのみ運営経路に到達できるよう、リバースプロキシ/Workerにも運営APIのアクセス制御を設定してください。ブラウザのOriginを伴う運営API要求は拒否します。参加用Bearer tokenやEdge共有シークレットだけでは発行できません。
+
+配置先が`TRACE_EDGE_SHARED_SECRET`を要求する場合、運営用プライベート経路も`X-Trace-Edge-Secret`を同時に送ります。サイトWorkerは参加者用経路から`/v1/operator/*`への転送を拒否し、運営用の認可済みプライベート入口を別に用意してください。現行運営監査は個人操作者ではなく資格情報を保有する`arrival_issuer`サービス名、操作時刻、到着IDのハッシュ短縮値、結果を24時間保持します。個人別の監査・運営権限分離は運営UIを構築する際に別途必要です。
+
+発行されるproofは`base64url(JSON).base64url(HMAC-SHA256(TRACE_ARRIVAL_PROOF_KEY, base64url(JSON)))`です。JSONには`checkpointId`、`venue`、`issuedAt`/`expiresAt`（Unix秒）、ランダム`nonce`を含み、有効期間は25秒です。参加端末は`POST /v1/memory-sessions/{memorySessionId}/arrival`へMemory Bearer、`Idempotency-Key`（ランダム値）、JSON `{"checkpointToken":"...","experienceLinkToken":"...","clientTime":"..."}`を送ります。`clientTime`は判定に使わずサーバー時刻を正とします。改変・他会場・期限切れ・未来発行は403、別トークンによる別セッションへの操作は認証で拒否します。投影QRは複数来場者が読むため同一proofを**別Memory間では共有可能**です。同一Memoryへの二重到着は1件のArrivalEventとなり、24時間の同一キー/同一内容の再送は期限切れQRでも元の結果を返します。同一キー/別内容は409、Memory削除と同時に到着・再送記録も消えます。
+
+有効なExperienceLinkを持つ場合は当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。GPSは`tracking`のまま、`on_site`は従来どおり本人の追加同意版が必要です。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。到着は写真機能無効でも有効、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOは最大32件、満杯でも到着自体を記録して`skipped`（`queue_full`）とし、開始されず2分経った候補も`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`は未再生の演出をスキップします。
+
+運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。本人GETにキュー順は出しません。描画機のリース、再生開始・完了・停止イベントと写真/経路素材の組立はIssue #9の統合まで提供しません。運営候補APIを呼んでも再生状態は`playing`へ移りません。DBは`006_arrivals.sql`です。展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。既存Live/位置APIのGPS廃止後の扱いはIssue #26の判断待ちです。
 
 ## 非公開写真の設定とライフサイクル
 
@@ -155,7 +176,7 @@ APIと清掃ジョブは起動時、APIは`/health/ready`と各`/v1/`リクエ�
 
 APIは起動時と稼働中30秒ごとにDBの期限データを清掃し、表示位置は稼働中毎秒プロセスメモリから消去します。期限切れ位置は清掃前でも読み出せません。別途5分ごとのDB清掃ジョブはAPIプロセスの位置メモリを消去できません。Cloud RunのAPIは最大1インスタンス・CPU常時割当とし、スケールアウト・再起動・新旧revision並存で直近の表示位置が失われたり分岐したりするため、追跡中の切替を避けます。
 
-`002_remove_live_positions.sql`で旧表示位置テーブルは破棄し、移行前の位置点は持ち越しません。既存のExperienceLinkは認証トークンの旧期限を`token_expires_at`へ移し、関連付けの保持期限を両セッションの早い`delete_after`へ更新します。再配備時はDBのschema版が非互換となるため、旧revisionを停止してからmigrationを実施します。切替中の位置表示欠落は仕様です。データ保護承認（設計Issue #9）、到着判定の経路（設計Issue #11/Backend Issue #8）は別途未確定です。
+`002_remove_live_positions.sql`で旧表示位置テーブルは破棄し、移行前の位置点は持ち越しません。既存のExperienceLinkは認証トークンの旧期限を`token_expires_at`へ移し、関連付けの保持期限を両セッションの早い`delete_after`へ更新します。再配備時はDBのschema版が非互換となるため、旧revisionを停止してからmigrationを実施します。切替中の位置表示欠落は仕様です。データ保護承認（設計Issue #9）と到着proofの暫定期限・運営導線の最終仕様（設計Issue #11）は未確定です。
 
 ## テスト
 
