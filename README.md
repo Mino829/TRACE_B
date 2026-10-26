@@ -155,7 +155,7 @@ CampusGraphは`internal/route/campus_graph.json`へ固定同梱します（TRACE
 
 署名付きPUTは削除後も期限まで生きるため、アップロード先はゼロバイトで占有し、期限後だけoutboxから消去します。これにより削除後の再送で画像が復活しません。画像バイト・GPS・PhotoMoment参照とそれに紐づくRouteSegmentは削除対象となり、この短期outboxにはランダムなobject keyと期限だけを保持します。ピン・派生特徴・別サムネイルはまだ生成しません。
 
-`004_route_segments.sql`〜`008_photo_checkpoints.sql`を番号順に適用し、`runtime-grants.sql`を再適用してください。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
+`004_route_segments.sql`〜`009_checkpoint_route_versions.sql`を番号順に適用し、`runtime-grants.sql`を再適用してください。`008_photo_checkpoints.sql`適用済み環境でも追加列は`009`で適用されます。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
 
 ## 最短のローカル起動
 
