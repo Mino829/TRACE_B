@@ -100,6 +100,9 @@ func FromEnv() (Config, error) {
 	cfg.OnSiteConsentVersion = env("TRACE_ON_SITE_CONSENT_VERSION", cfg.OnSiteConsentVersion)
 	cfg.ConsentLanguage = env("TRACE_CONSENT_LANGUAGE", cfg.ConsentLanguage)
 	cfg.ConsentBody = env("TRACE_CONSENT_BODY", cfg.ConsentBody)
+	if cfg.MemoryConsentVersion == "2026-memory-01" {
+		return Config{}, fmt.Errorf("TRACE_MEMORY_CONSENT_VERSION must not reuse the retired GPS consent version")
+	}
 	cfg.CoordinateVersion = env("TRACE_COORDINATE_VERSION", cfg.CoordinateVersion)
 	cfg.CampusGraphVersion = env("TRACE_CAMPUS_GRAPH_VERSION", cfg.CampusGraphVersion)
 	cfg.ThreeDMapVersion = env("TRACE_THREE_D_MAP_VERSION", cfg.ThreeDMapVersion)
@@ -213,12 +216,12 @@ func Default() Config {
 		Address:                    ":8080",
 		DatabaseMaxConnections:     5,
 		AllowedOrigins:             []string{"http://localhost:3000"},
-		RegistrationOpen:           true,
-		MemoryConsentVersion:       "2026-memory-01",
+		RegistrationOpen:           false,
+		MemoryConsentVersion:       "2026-memory-photo-no-gps-draft-1",
 		LiveConsentVersion:         "2026-live-01",
 		OnSiteConsentVersion:       "2026-on-site-01",
 		ConsentLanguage:            "ja",
-		ConsentBody:                "写真と位置情報の利用目的・保存期間を確認し、同意して参加してください。",
+		ConsentBody:                "写真による参加の同意文は未承認です。承認済み文面と保存期間を設定するまで新規受付を開始しないでください。",
 		Contact:                    "運営担当者へお問い合わせください",
 		PositionIntervalSeconds:    5,
 		LivePositionTTL:            60 * time.Second,

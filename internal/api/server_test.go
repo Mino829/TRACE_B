@@ -135,7 +135,7 @@ func TestConcurrentDeleteAcrossInstancesAndCredentialBinding(t *testing.T) {
 	}
 	defer second.Close()
 	other := api.New(cfg, second, nil)
-	created := createExperience(t, handler, cfg)
+	created := seedLegacyExperience(t, f.Store, cfg)
 	headers := map[string]string{"Authorization": "Bearer " + created.Live.ParticipantToken, "Idempotency-Key": "same-delete"}
 	path := "/v1/live-presence-sessions/" + created.Live.SessionID
 	var wg sync.WaitGroup
@@ -169,12 +169,18 @@ func TestConcurrentDeleteAcrossInstancesAndCredentialBinding(t *testing.T) {
 	}
 }
 
-func TestStopRaceAndRollback(t *testing.T) {
+func TestLegacyStopClearsPositionWhileWritesRetiredAndDeleteRollback(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
 	h := api.New(cfg, f.Store, nil)
-	c := createExperience(t, h, cfg)
+	c := seedLegacyExperience(t, f.Store, cfg)
 	path := "/v1/live-presence-sessions/" + c.Live.SessionID
+	now := time.Now().UTC()
+	if err := f.Store.SavePosition(t.Context(), c.Live.SessionID, store.Position{
+		X: 10, Z: 10, AccuracyM: 8, RecordedAt: now, ReceivedAt: now, ExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	start := make(chan struct{})
 	done := make(chan int, 2)
 	body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, time.Now().UTC().Format(time.RFC3339Nano))
@@ -187,11 +193,12 @@ func TestStopRaceAndRollback(t *testing.T) {
 		done <- request(t, h, "POST", path+"/stop", `{"reason":"participant_request"}`, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken, "Idempotency-Key": "stop-race"}).Code
 	}()
 	close(start)
-	for i := 0; i < 2; i++ {
-		status := <-done
-		if status != 200 && status != 409 {
-			t.Fatalf("race status %d", status)
-		}
+	got := map[int]int{}
+	for range 2 {
+		got[<-done]++
+	}
+	if got[http.StatusGone] != 1 || got[http.StatusOK] != 1 || len(got) != 2 {
+		t.Fatalf("position must be refused while stop succeeds: %v", got)
 	}
 	session, p, err := f.Store.LiveSession(t.Context(), c.Live.SessionID)
 	if err != nil || p != nil || session.TrackingStatus != "stopped" {
@@ -210,62 +217,42 @@ func TestStopRaceAndRollback(t *testing.T) {
 	}
 }
 
-func TestPositionValidationAndSessionIsolation(t *testing.T) {
+func TestPositionRetiredAndSessionIsolation(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
 	h := api.New(cfg, f.Store, nil)
-	c := createExperience(t, h, cfg)
+	c := seedLegacyExperience(t, f.Store, cfg)
 	path := "/v1/live-presence-sessions/" + c.Live.SessionID + "/position"
-	for _, tt := range []struct {
-		lat, accuracy float64
-		at            time.Time
-		code          string
-	}{
-		{36, 8, time.Now(), "OUTSIDE_GEOFENCE"}, {35, 200, time.Now(), "LOW_ACCURACY"},
-		{35, 8, time.Now().Add(-3 * time.Minute), "TOO_OLD"}, {35, 8, time.Now().Add(time.Minute), "FUTURE_TIME"},
-	} {
-		body := fmt.Sprintf(`{"point":{"latitude":%v,"longitude":135,"accuracyM":%v,"recordedAt":%q}}`, tt.lat, tt.accuracy, tt.at.UTC().Format(time.RFC3339Nano))
+	for _, body := range []string{"{", `{"point":{"latitude":35,"longitude":135}}`, ""} {
 		r := request(t, h, "POST", path, body, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken})
-		var response struct{ Error struct{ Code string } }
-		json.Unmarshal(r.Body.Bytes(), &response)
-		if r.Code != 422 || response.Error.Code != tt.code {
-			t.Fatalf("validation: %d %s", r.Code, r.Body.String())
+		if r.Code != http.StatusGone || !strings.Contains(r.Body.String(), `"code":"POSITION_DISABLED"`) {
+			t.Fatalf("retired position: %d %s", r.Code, r.Body.String())
 		}
 	}
-	r := request(t, h, "POST", path, "{}", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
-	if r.Code != 401 {
-		t.Fatal("memory credential accepted by live API")
+	for _, token := range []string{c.Memory.ParticipantToken, "wrong"} {
+		r := request(t, h, "POST", path, "{", map[string]string{"Authorization": "Bearer " + token})
+		if r.Code != http.StatusUnauthorized {
+			t.Fatalf("invalid live credential: %d %s", r.Code, r.Body.String())
+		}
+	}
+	_, point, err := f.Store.LiveSession(t.Context(), c.Live.SessionID)
+	if err != nil || point != nil {
+		t.Fatalf("position persisted: %v %v", point, err)
+	}
+	var events int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM display_events WHERE kind LIKE 'position.%'`).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("position display events: %d %v", events, err)
 	}
 }
 
-func TestExperiencePositionStopAndDelete(t *testing.T) {
+func TestLegacyExperienceStopAndDelete(t *testing.T) {
 	db := testdb.Open(t).Store
 	cfg := config.Default()
 	handler := api.New(cfg, db, nil)
-
-	created := createExperience(t, handler, cfg)
+	created := seedLegacyExperience(t, db, cfg)
 	if created.ExperienceID == "" || created.Memory.SessionID == "" || created.Live.SessionID == "" {
-		t.Fatalf("incomplete create response: %+v", created)
+		t.Fatalf("incomplete legacy fixture: %+v", created)
 	}
-
-	positionBody := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, time.Now().UTC().Format(time.RFC3339Nano))
-	position := request(t, handler, http.MethodPost, "/v1/live-presence-sessions/"+created.Live.SessionID+"/position", positionBody, map[string]string{
-		"Authorization": "Bearer " + created.Live.ParticipantToken,
-	})
-	if position.Code != http.StatusOK {
-		t.Fatalf("position status=%d body=%s", position.Code, position.Body.String())
-	}
-	_, storedPosition, err := db.LiveSession(t.Context(), created.Live.SessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if storedPosition == nil {
-		t.Fatal("position was not stored")
-	}
-	if storedPosition.X != 10 || storedPosition.Z != 10 {
-		t.Fatalf("position was not quantized: x=%v z=%v", storedPosition.X, storedPosition.Z)
-	}
-
 	stopHeaders := map[string]string{
 		"Authorization":   "Bearer " + created.Live.ParticipantToken,
 		"Idempotency-Key": "stop-once",
@@ -280,7 +267,7 @@ func TestExperiencePositionStopAndDelete(t *testing.T) {
 	if conflict.Code != http.StatusConflict {
 		t.Fatalf("expected idempotency conflict, got %d: %s", conflict.Code, conflict.Body.String())
 	}
-	_, storedPosition, err = db.LiveSession(t.Context(), created.Live.SessionID)
+	_, storedPosition, err := db.LiveSession(t.Context(), created.Live.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,10 +289,11 @@ func TestExperiencePositionStopAndDelete(t *testing.T) {
 func TestConsentAndAuthenticationFailures(t *testing.T) {
 	db := testdb.Open(t).Store
 	cfg := config.Default()
+	cfg.RegistrationOpen = true
 	handler := api.New(cfg, db, nil)
 
-	wrongConsent := fmt.Sprintf(`{"memoryConsentVersion":"old","livePresenceConsentVersion":%q,"enableLivePresence":true,"consentLanguage":"ja","clientTime":%q}`,
-		cfg.LiveConsentVersion, time.Now().UTC().Format(time.RFC3339Nano))
+	wrongConsent := fmt.Sprintf(`{"memoryConsentVersion":"old","enableLivePresence":false,"consentLanguage":%q,"clientTime":%q}`,
+		cfg.ConsentLanguage, time.Now().UTC().Format(time.RFC3339Nano))
 	response := request(t, handler, http.MethodPost, "/v1/experiences", wrongConsent, nil)
 	if response.Code != http.StatusConflict {
 		t.Fatalf("expected consent conflict, got %d: %s", response.Code, response.Body.String())
@@ -326,10 +314,36 @@ func TestConsentAndAuthenticationFailures(t *testing.T) {
 	}
 }
 
+func TestLiveEnrollmentRejectedWithoutPersistingExperience(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := config.Default()
+	cfg.RegistrationOpen = true
+	h := api.New(cfg, f.Store, nil)
+	body := fmt.Sprintf(`{"memoryConsentVersion":%q,"enableLivePresence":true,"consentLanguage":%q,"clientTime":%q}`,
+		cfg.MemoryConsentVersion, cfg.ConsentLanguage, time.Now().UTC().Format(time.RFC3339Nano))
+	r := request(t, h, http.MethodPost, "/v1/experiences", body, nil)
+	if r.Code != http.StatusConflict || !strings.Contains(r.Body.String(), `"code":"LIVE_PRESENCE_DISABLED"`) {
+		t.Fatalf("live enrollment: %d %s", r.Code, r.Body.String())
+	}
+	var count int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM experiences`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("retired enrollment created rows: count=%d err=%v", count, err)
+	}
+	created := createExperience(t, h, cfg)
+	if created.Memory.SessionID == "" || created.Live.SessionID != "" || created.LinkToken != "" {
+		t.Fatalf("memory-only registration response: %+v", created)
+	}
+	var liveCount int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM live_presence_sessions`).Scan(&liveCount); err != nil || liveCount != 0 {
+		t.Fatalf("memory-only created live session: %d %v", liveCount, err)
+	}
+}
+
 func TestCombinedDeletionRetainsPartialSuccessForRetry(t *testing.T) {
 	f := testdb.Open(t)
-	handler := api.New(config.Default(), f.Store, nil)
-	created := createExperience(t, handler, config.Default())
+	cfg := config.Default()
+	handler := api.New(cfg, f.Store, nil)
+	created := seedLegacyExperience(t, f.Store, cfg)
 	path := "/v1/experiences/" + created.ExperienceID
 	headers := map[string]string{
 		"Authorization":      "Bearer " + created.Memory.ParticipantToken,
@@ -393,34 +407,13 @@ FOR EACH ROW EXECUTE FUNCTION reject_memory_deletion()`); err != nil {
 	}
 }
 
-func TestRateLimitSeparatesSessionQuotasAndReturnsRetryAfter(t *testing.T) {
+func TestRateLimitSeparatesActiveSessionQuotasAndReturnsRetryAfter(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
+	cfg.RegistrationOpen = true
 	handler := api.New(cfg, f.Store, nil)
 	first := createExperience(t, handler, cfg)
-	second := createExperience(t, handler, cfg)
-	base := time.Now().Add(-10 * time.Second).UTC()
-	path := "/v1/live-presence-sessions/" + first.Live.SessionID + "/position"
-	for i := range 6 {
-		body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`,
-			base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano))
-		r := request(t, handler, http.MethodPost, path, body, map[string]string{
-			"Authorization": "Bearer " + first.Live.ParticipantToken, "X-Forwarded-For": fmt.Sprintf("192.0.2.%d", i+1),
-		})
-		if i < 5 && r.Code != http.StatusOK {
-			t.Fatalf("normal position %d: %d %s", i, r.Code, r.Body.String())
-		}
-		if i == 5 && (r.Code != http.StatusTooManyRequests || r.Header().Get("Retry-After") == "" ||
-			!bytes.Contains(r.Body.Bytes(), []byte(`"code":"RATE_LIMITED"`))) {
-			t.Fatalf("excess position: %d %s headers=%v", r.Code, r.Body.String(), r.Header())
-		}
-	}
-	otherPath := "/v1/live-presence-sessions/" + second.Live.SessionID + "/position"
-	body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, base.Format(time.RFC3339Nano))
-	if r := request(t, handler, http.MethodPost, otherPath, body,
-		map[string]string{"Authorization": "Bearer " + second.Live.ParticipantToken}); r.Code != http.StatusOK {
-		t.Fatalf("another participant blocked by same network: %d %s", r.Code, r.Body.String())
-	}
+	_ = createExperience(t, handler, cfg)
 	statePath := "/v1/experiences/" + first.ExperienceID
 	for range 30 {
 		if r := request(t, handler, http.MethodGet, statePath, "", map[string]string{
@@ -436,10 +429,38 @@ func TestRateLimitSeparatesSessionQuotasAndReturnsRetryAfter(t *testing.T) {
 	}
 }
 
+func seedLegacyExperience(t *testing.T, db *store.Store, cfg config.Config) createdExperience {
+	t.Helper()
+	now := time.Now().UTC()
+	created := createdExperience{ExperienceID: fmt.Sprintf("exp_legacy_%d", now.UnixNano())}
+	created.Memory.SessionID = fmt.Sprintf("mem_legacy_%d", now.UnixNano())
+	created.Live.SessionID = fmt.Sprintf("live_legacy_%d", now.UnixNano())
+	created.Memory.ParticipantToken = "memory-" + created.Memory.SessionID
+	created.Live.ParticipantToken = "live-" + created.Live.SessionID
+	created.LinkToken = "link-" + created.ExperienceID
+	created.Memory.ExpiresAt = now.Add(cfg.MemorySessionTTL)
+	created.Memory.DeleteAfter = created.Memory.ExpiresAt.Add(cfg.DataRetention)
+	created.Live.ExpiresAt = now.Add(cfg.LiveSessionTTL)
+	created.Live.DeleteAfter = created.Live.ExpiresAt.Add(cfg.DataRetention)
+	if err := db.CreateExperience(t.Context(), store.NewExperience{
+		ExperienceID: created.ExperienceID, MemorySessionID: created.Memory.SessionID,
+		LiveSessionID: created.Live.SessionID, LinkID: "link_" + created.ExperienceID,
+		MemoryTokenHash: tokenHash(created.Memory.ParticipantToken),
+		LiveTokenHash:   tokenHash(created.Live.ParticipantToken), LinkTokenHash: tokenHash(created.LinkToken),
+		MemoryConsent: cfg.MemoryConsentVersion, LiveConsent: cfg.LiveConsentVersion,
+		ConsentLanguage: cfg.ConsentLanguage, DisplayColor: "cyan", DisplaySymbol: "circle",
+		CreatedAt: now, MemoryExpiresAt: created.Memory.ExpiresAt, MemoryDeleteAfter: created.Memory.DeleteAfter,
+		LiveExpiresAt: created.Live.ExpiresAt, LiveDeleteAfter: created.Live.DeleteAfter, LivePresence: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
 func createExperience(t *testing.T, handler http.Handler, cfg config.Config) createdExperience {
 	t.Helper()
-	body := fmt.Sprintf(`{"memoryConsentVersion":%q,"livePresenceConsentVersion":%q,"enableLivePresence":true,"consentLanguage":%q,"clientTime":%q}`,
-		cfg.MemoryConsentVersion, cfg.LiveConsentVersion, cfg.ConsentLanguage, time.Now().UTC().Format(time.RFC3339Nano))
+	body := fmt.Sprintf(`{"memoryConsentVersion":%q,"enableLivePresence":false,"consentLanguage":%q,"clientTime":%q}`,
+		cfg.MemoryConsentVersion, cfg.ConsentLanguage, time.Now().UTC().Format(time.RFC3339Nano))
 	response := request(t, handler, http.MethodPost, "/v1/experiences", body, nil)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())

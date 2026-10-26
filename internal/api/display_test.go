@@ -114,7 +114,7 @@ func assertDisplaySafe(t *testing.T, frame displayFrameTest, experience createdE
 	t.Helper()
 	raw := string(frame.Data)
 	for _, forbidden := range []string{"latitude", "longitude", "uploadUrl", "imageUrl", "photoBytes", experience.Memory.ParticipantToken, experience.Live.ParticipantToken, experience.Live.SessionID, experience.Memory.SessionID} {
-		if strings.Contains(raw, forbidden) {
+		if forbidden != "" && strings.Contains(raw, forbidden) {
 			t.Fatalf("unsafe display payload (%s): %s", forbidden, raw)
 		}
 	}
@@ -135,11 +135,17 @@ func TestDisplayNativeWebsocketSnapshotFanoutDeletionAndReconnect(t *testing.T) 
 	if snapshot.EventID == "" || snapshot.SchemaVersion != 1 || snapshot.CoordinateVersion != cfg.CoordinateVersion {
 		t.Fatalf("versioned snapshot missing: %+v", snapshot)
 	}
-	created := createExperience(t, handler, cfg)
+	created := seedLegacyExperience(t, f.Store, cfg)
 	body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, time.Now().UTC().Format(time.RFC3339Nano))
 	path := "/v1/live-presence-sessions/" + created.Live.SessionID
-	if got := request(t, handler, "POST", path+"/position", body, map[string]string{"Authorization": "Bearer " + created.Live.ParticipantToken}); got.Code != 200 {
-		t.Fatalf("position: %d %s", got.Code, got.Body.String())
+	if got := request(t, handler, "POST", path+"/position", body, map[string]string{"Authorization": "Bearer " + created.Live.ParticipantToken}); got.Code != http.StatusGone || !strings.Contains(got.Body.String(), `"code":"POSITION_DISABLED"`) {
+		t.Fatalf("position retirement: %d %s", got.Code, got.Body.String())
+	}
+	now := time.Now().UTC()
+	if err := f.Store.SavePosition(t.Context(), created.Live.SessionID, store.Position{
+		X: 10, Z: 10, AccuracyM: 8, RecordedAt: now, ReceivedAt: now, ExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
 	}
 	updated := nextDisplay(t, conn, "position.updated")
 	assertDisplaySafe(t, updated, created)
@@ -203,7 +209,7 @@ func TestDisplayNativeWebsocketTTLRemovalAndFreshSnapshot(t *testing.T) {
 	}
 	defer conn.Close()
 	nextDisplay(t, conn, "display.snapshot")
-	created := createExperience(t, handler, cfg)
+	created := seedLegacyExperience(t, f.Store, cfg)
 	now := time.Now().UTC()
 	if err := f.Store.SavePosition(t.Context(), created.Live.SessionID, store.Position{
 		X: 12, Z: 15, AccuracyM: 8, RecordedAt: now, ReceivedAt: now, ExpiresAt: now.Add(2 * time.Second),

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -94,16 +93,9 @@ func (s *Server) createPhoto(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), &apiError{Code: "INVALID_PHOTO_METADATA", Message: "photo metadata is invalid", Status: http.StatusBadRequest})
 		return
 	}
-	var location *store.PhotoLocation
 	if input.Location != nil {
-		p := input.Location
-		if math.IsNaN(p.Latitude) || math.IsInf(p.Latitude, 0) || math.IsNaN(p.Longitude) || math.IsInf(p.Longitude, 0) ||
-			math.IsNaN(p.AccuracyM) || math.IsInf(p.AccuracyM, 0) || p.AccuracyM <= 0 || p.RecordedAt.IsZero() ||
-			p.Latitude < s.cfg.MinLatitude || p.Latitude > s.cfg.MaxLatitude || p.Longitude < s.cfg.MinLongitude || p.Longitude > s.cfg.MaxLongitude {
-			s.writeError(w, requestID(r), &apiError{Code: "INVALID_PHOTO_LOCATION", Message: "photo location is invalid or outside the campus", Status: http.StatusBadRequest})
-			return
-		}
-		location = &store.PhotoLocation{Latitude: p.Latitude, Longitude: p.Longitude, AccuracyM: p.AccuracyM, RecordedAt: p.RecordedAt.UTC()}
+		s.writeError(w, requestID(r), &apiError{Code: "PHOTO_LOCATION_DISABLED", Message: "photo location is no longer accepted", Status: http.StatusBadRequest})
+		return
 	}
 	now := s.now().UTC()
 	memoryID := r.PathValue("memorySessionId")
@@ -141,7 +133,7 @@ func (s *Server) createPhoto(w http.ResponseWriter, r *http.Request) {
 		id := randomID("photo")
 		result, err = tx.CreatePhoto(r.Context(), store.Photo{
 			ID: id, MemorySessionID: memoryID, ClientPhotoID: input.ClientPhotoID, RequestHash: requestHash,
-			CapturedAt: input.CapturedAt.UTC(), CreatedAt: now, UploadExpiresAt: expires, Location: location,
+			CapturedAt: input.CapturedAt.UTC(), CreatedAt: now, UploadExpiresAt: expires,
 			MIMEType: input.MIMEType, SizeBytes: input.SizeBytes, Width: input.Width, Height: input.Height,
 			SHA256: strings.ToLower(input.SHA256), StageKey: "uploads/" + randomSecret(), ObjectKey: "photos/" + randomSecret(),
 		}, now)

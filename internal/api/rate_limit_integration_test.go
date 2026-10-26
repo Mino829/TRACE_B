@@ -19,7 +19,7 @@ func TestCombinedDeletionHonorsBothControlBudgets(t *testing.T) {
 			f := testdb.Open(t)
 			cfg := config.Default()
 			handler := api.New(cfg, f.Store, nil)
-			created := createExperience(t, handler, cfg)
+			created := seedLegacyExperience(t, f.Store, cfg)
 			if _, err := f.SQL.ExecContext(t.Context(), "UPDATE live_presence_sessions SET presence_phase='arrived' WHERE id=$1", created.Live.SessionID); err != nil {
 				t.Fatal(err)
 			}
@@ -34,7 +34,11 @@ func TestCombinedDeletionHonorsBothControlBudgets(t *testing.T) {
 				}
 				for range 30 {
 					r := request(t, handler, method, path, body, map[string]string{"Authorization": "Bearer " + token})
-					if r.Code != http.StatusOK {
+					want := http.StatusOK
+					if kind == "live" {
+						want = http.StatusGone
+					}
+					if r.Code != want {
 						t.Fatalf("%s control request: %d %s", kind, r.Code, r.Body.String())
 					}
 				}
