@@ -44,8 +44,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    # Do not interrupt an in-flight traffic switch/rollback. Intermediate pending
-    # runs can be superseded; the script also rejects stale commits before release.
+    # Do not interrupt an in-flight traffic switch/recovery. Intermediate pending
+    # runs can be superseded; verified GPS-free releases never roll back to a GPS-writing revision.
     concurrency:
       group: trace-staging-deploy
       cancel-in-progress: false
@@ -105,7 +105,7 @@ jobs:
           id_token_include_email: true
           create_credentials_file: false
           export_environment_variables: false
-      - name: Verify candidate DB readiness and closed registration
+      - name: Verify candidate DB readiness, closed registration and disabled GPS
         env:
           TRACE_ID_TOKEN: ${{ steps.candidate_token.outputs.id_token }}
         run: python3 deploy/gcp/ci_staging.py verify
@@ -127,7 +127,7 @@ jobs:
         env:
           TRACE_ID_TOKEN: ${{ steps.release_token.outputs.id_token }}
         run: python3 deploy/gcp/ci_staging.py promote
-      - name: Restore the previous traffic and cleanup image on failure
+      - name: Recover safely on failure without restoring GPS writes
         if: ${{ failure() || cancelled() }}
         run: python3 deploy/gcp/ci_staging.py rollback
       - name: Remove this run's temporary tag and credential file

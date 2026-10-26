@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -165,7 +164,8 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 		vapidPublicKey = s.cfg.PushVAPIDPublicKey
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"registrationOpen": s.cfg.RegistrationOpen,
+		"registrationOpen":    s.cfg.RegistrationOpen,
+		"livePresenceEnabled": false,
 		"consent": map[string]any{
 			"version":  s.cfg.MemoryConsentVersion,
 			"language": s.cfg.ConsentLanguage,
@@ -217,8 +217,11 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), err)
 		return
 	}
-	if input.MemoryConsentVersion != s.cfg.MemoryConsentVersion ||
-		(input.EnableLivePresence && input.LivePresenceConsentVersion != s.cfg.LiveConsentVersion) {
+	if input.EnableLivePresence {
+		s.writeError(w, requestID(r), &apiError{Code: "LIVE_PRESENCE_DISABLED", Message: "live presence enrollment is unavailable", Status: http.StatusConflict})
+		return
+	}
+	if input.MemoryConsentVersion != s.cfg.MemoryConsentVersion {
 		s.writeError(w, requestID(r), &apiError{Code: "CONSENT_VERSION_MISMATCH", Message: "consent version is no longer current", Status: http.StatusConflict})
 		return
 	}
@@ -232,23 +235,17 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	memoryToken := randomSecret()
-	liveToken := randomSecret()
-	linkToken := randomSecret()
 	experienceID := randomID("exp")
 	memoryID := randomID("mem")
-	liveID := randomID("live")
 	memoryExpires := now.Add(s.cfg.MemorySessionTTL)
 	memoryDeleteAfter := memoryExpires.Add(s.cfg.DataRetention)
-	liveExpires := now.Add(s.cfg.LiveSessionTTL)
-	liveDeleteAfter := liveExpires.Add(s.cfg.DataRetention)
 	color, symbol := displayAlias(experienceID)
 	value := store.NewExperience{
-		ExperienceID: experienceID, MemorySessionID: memoryID, LiveSessionID: liveID, LinkID: randomID("link"),
-		MemoryTokenHash: hash(memoryToken), LiveTokenHash: hash(liveToken), LinkTokenHash: hash(linkToken),
-		MemoryConsent: input.MemoryConsentVersion, LiveConsent: input.LivePresenceConsentVersion,
+		ExperienceID: experienceID, MemorySessionID: memoryID,
+		MemoryTokenHash: hash(memoryToken),
+		MemoryConsent:   input.MemoryConsentVersion,
 		ConsentLanguage: input.ConsentLanguage, DisplayColor: color, DisplaySymbol: symbol,
 		CreatedAt: now, MemoryExpiresAt: memoryExpires, MemoryDeleteAfter: memoryDeleteAfter,
-		LiveExpiresAt: liveExpires, LiveDeleteAfter: liveDeleteAfter, LivePresence: input.EnableLivePresence,
 	}
 	if err := s.store.CreateExperience(r.Context(), value); err != nil {
 		slog.Error("create experience", "requestId", requestID(r), "error", err)
@@ -260,15 +257,7 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		"memorySession": map[string]any{
 			"sessionId": memoryID, "participantToken": memoryToken, "expiresAt": memoryExpires, "deleteAfter": memoryDeleteAfter,
 		},
-		"displayAlias":            map[string]string{"color": color, "symbol": symbol},
-		"positionIntervalSeconds": s.cfg.PositionIntervalSeconds,
-	}
-	if input.EnableLivePresence {
-		response["experienceLinkToken"] = linkToken
-		response["livePresenceSession"] = map[string]any{
-			"sessionId": liveID, "participantToken": liveToken, "trackingStatus": "tracking", "presencePhase": "approaching",
-			"expiresAt": liveExpires, "deleteAfter": liveDeleteAfter,
-		}
+		"displayAlias": map[string]string{"color": color, "symbol": symbol},
 	}
 	s.writeJSON(w, http.StatusCreated, response)
 }
@@ -306,14 +295,7 @@ func (s *Server) experienceState(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
-type positionRequest struct {
-	Point struct {
-		Latitude   float64   `json:"latitude"`
-		Longitude  float64   `json:"longitude"`
-		AccuracyM  float64   `json:"accuracyM"`
-		RecordedAt time.Time `json:"recordedAt"`
-	} `json:"point"`
-}
+// Positions are no longer collected; authenticate legacy credentials before responding.
 
 func (s *Server) updatePosition(w http.ResponseWriter, r *http.Request) {
 	liveID := r.PathValue("liveSessionId")
@@ -321,66 +303,7 @@ func (s *Server) updatePosition(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), err)
 		return
 	}
-	var input positionRequest
-	if err := decodeJSON(w, r, &input); err != nil {
-		s.writeError(w, requestID(r), err)
-		return
-	}
-	now := s.now().UTC()
-	point := input.Point
-	if point.Latitude < s.cfg.MinLatitude || point.Latitude > s.cfg.MaxLatitude ||
-		point.Longitude < s.cfg.MinLongitude || point.Longitude > s.cfg.MaxLongitude {
-		s.writeError(w, requestID(r), &apiError{Code: "OUTSIDE_GEOFENCE", Message: "position is outside the allowed area", Status: http.StatusUnprocessableEntity})
-		return
-	}
-	if point.AccuracyM <= 0 || point.AccuracyM > s.cfg.MaxPositionAccuracyMeters {
-		s.writeError(w, requestID(r), &apiError{Code: "LOW_ACCURACY", Message: "position accuracy is insufficient", Status: http.StatusUnprocessableEntity})
-		return
-	}
-	if point.RecordedAt.IsZero() || point.RecordedAt.Before(now.Add(-2*time.Minute)) {
-		s.writeError(w, requestID(r), &apiError{Code: "TOO_OLD", Message: "position is too old", Status: http.StatusUnprocessableEntity})
-		return
-	}
-	if point.RecordedAt.After(now.Add(15 * time.Second)) {
-		s.writeError(w, requestID(r), &apiError{Code: "FUTURE_TIME", Message: "position time is in the future", Status: http.StatusUnprocessableEntity})
-		return
-	}
-	session, previous, storeErr := s.store.LiveSession(r.Context(), liveID)
-	if storeErr != nil {
-		s.writeStoreError(w, r, storeErr)
-		return
-	}
-	if session.TrackingStatus != "tracking" || !now.Before(session.ExpiresAt) {
-		s.writeError(w, requestID(r), &apiError{Code: "TRACKING_STOPPED", Message: "tracking is not active", Status: http.StatusConflict})
-		return
-	}
-	if previous != nil && !point.RecordedAt.After(previous.RecordedAt) {
-		s.writeError(w, requestID(r), &apiError{Code: "TOO_OLD", Message: "a newer position was already accepted", Status: http.StatusUnprocessableEntity})
-		return
-	}
-	x, z := s.toLocal(point.Latitude, point.Longitude)
-	x = quantize(x, s.cfg.PositionQuantizationMeters)
-	z = quantize(z, s.cfg.PositionQuantizationMeters)
-	if previous != nil {
-		distance := math.Hypot(x-previous.X, z-previous.Z)
-		seconds := point.RecordedAt.Sub(previous.RecordedAt).Seconds()
-		allowed := 15*seconds + point.AccuracyM + previous.AccuracyM
-		if distance > allowed {
-			s.writeError(w, requestID(r), &apiError{Code: "IMPOSSIBLE_JUMP", Message: "position changed too quickly", Status: http.StatusUnprocessableEntity})
-			return
-		}
-	}
-	expires := now.Add(s.cfg.LivePositionTTL)
-	if expires.After(session.ExpiresAt) {
-		expires = session.ExpiresAt
-	}
-	if err := s.store.SavePosition(r.Context(), liveID, store.Position{
-		X: x, Z: z, AccuracyM: point.AccuracyM, RecordedAt: point.RecordedAt.UTC(), ReceivedAt: now, ExpiresAt: expires,
-	}); err != nil {
-		s.writeStoreError(w, r, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "latestRecordedAt": point.RecordedAt.UTC(), "expiresAt": expires})
+	s.writeError(w, requestID(r), &apiError{Code: "POSITION_DISABLED", Message: "position collection is unavailable", Status: http.StatusGone})
 }
 
 type onSiteRequest struct {
@@ -399,8 +322,8 @@ func (s *Server) onSite(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), err)
 		return
 	}
-	if input.Continue && input.ConsentVersion != s.cfg.OnSiteConsentVersion {
-		s.writeError(w, requestID(r), &apiError{Code: "CONSENT_VERSION_MISMATCH", Message: "consent version is no longer current", Status: http.StatusConflict})
+	if input.Continue {
+		s.writeError(w, requestID(r), &apiError{Code: "ON_SITE_DISABLED", Message: "live presence continuation is unavailable", Status: http.StatusGone})
 		return
 	}
 	if err := s.store.SetOnSite(r.Context(), liveID, input.ConsentVersion, input.Continue, s.now().UTC()); err != nil {
@@ -408,9 +331,6 @@ func (s *Server) onSite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	phase, tracking := "ended", "stopped"
-	if input.Continue {
-		phase, tracking = "on_site", "tracking"
-	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"trackingStatus": tracking, "presencePhase": phase, "displayGranularity": "area"})
 }
 
@@ -567,15 +487,6 @@ func (s *Server) authenticateLive(r *http.Request, id string) *apiError {
 		return internalError()
 	}
 	return nil
-}
-
-func (s *Server) toLocal(latitude, longitude float64) (float64, float64) {
-	const earthRadiusM = 6371000.0
-	latDelta := (latitude - s.cfg.OriginLatitude) * math.Pi / 180
-	lngDelta := (longitude - s.cfg.OriginLongitude) * math.Pi / 180
-	x := earthRadiusM * lngDelta * math.Cos(s.cfg.OriginLatitude*math.Pi/180)
-	z := earthRadiusM * latDelta
-	return x, z
 }
 
 func (s *Server) replayIdempotent(w http.ResponseWriter, r *http.Request, scope string, body []byte) bool {
@@ -736,8 +647,6 @@ func hashBytes(value []byte) string {
 	sum := sha256.Sum256(value)
 	return hex.EncodeToString(sum[:])
 }
-
-func quantize(value, step float64) float64 { return math.Round(value/step) * step }
 
 func nullableString(value string) any {
 	if value == "" {

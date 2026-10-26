@@ -21,6 +21,7 @@ import (
 
 func arrivalConfig() config.Config {
 	cfg := config.Default()
+	cfg.RegistrationOpen = true
 	cfg.ArrivalEnabled = true
 	cfg.ArrivalIssuerKey = "issuer-secret-independent-of-participant-token-123"
 	cfg.ArrivalProofKey = "proof-secret-independent-of-issuer-456789"
@@ -89,7 +90,7 @@ func TestArrivalIssuerIsolationAndProofBoundaries(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := arrivalConfig()
 	h := api.New(cfg, f.Store, nil)
-	c := createExperience(t, h, cfg)
+	c := seedLegacyExperience(t, f.Store, cfg)
 	path := "/v1/operator/arrival-proofs"
 	for name, headers := range map[string]map[string]string{
 		"participant bearer": {"Authorization": "Bearer " + c.Memory.ParticipantToken},
@@ -167,8 +168,11 @@ func TestArrivalIssuerIsolationAndProofBoundaries(t *testing.T) {
 	if state.Code != 200 || !strings.Contains(state.Body.String(), `"replayStatus":"queued"`) || strings.Contains(state.Body.String(), "queuePosition") {
 		t.Fatalf("private state: %d %s", state.Code, state.Body.String())
 	}
-	if r := request(t, h, "POST", "/v1/live-presence-sessions/"+c.Live.SessionID+"/on-site", `{"continue":true,"consentVersion":"`+cfg.OnSiteConsentVersion+`"}`, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken}); r.Code != 200 {
-		t.Fatalf("consented on-site transition: %d %s", r.Code, r.Body.String())
+	if r := request(t, h, "POST", "/v1/live-presence-sessions/"+c.Live.SessionID+"/on-site", `{"continue":true,"consentVersion":"`+cfg.OnSiteConsentVersion+`"}`, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken}); r.Code != http.StatusGone || !strings.Contains(r.Body.String(), `"code":"ON_SITE_DISABLED"`) {
+		t.Fatalf("retired on-site continuation: %d %s", r.Code, r.Body.String())
+	}
+	if r := request(t, h, "POST", "/v1/live-presence-sessions/"+c.Live.SessionID+"/on-site", `{"continue":false}`, map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken}); r.Code != http.StatusOK {
+		t.Fatalf("legacy on-site stop: %d %s", r.Code, r.Body.String())
 	}
 }
 
@@ -180,7 +184,7 @@ func TestArrivalStopsPushAtomicallyForLiveAndMemoryOnly(t *testing.T) {
 			h := api.New(cfg, f.Store, nil)
 			var memoryID, memoryToken, linkToken, experienceID string
 			if live {
-				c := createExperience(t, h, cfg)
+				c := seedLegacyExperience(t, f.Store, cfg)
 				memoryID, memoryToken, linkToken, experienceID = c.Memory.SessionID, c.Memory.ParticipantToken, c.LinkToken, c.ExperienceID
 			} else {
 				digest := sha256.Sum256([]byte("memory-only-token"))
@@ -236,7 +240,7 @@ func TestArrivalWithStoppedLiveStillRecordsMemoryEvent(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := arrivalConfig()
 	h := api.New(cfg, f.Store, nil)
-	c := createExperience(t, h, cfg)
+	c := seedLegacyExperience(t, f.Store, cfg)
 	stopPath := "/v1/live-presence-sessions/" + c.Live.SessionID + "/stop"
 	stopped := request(t, h, "POST", stopPath, `{"reason":"participant_request"}`,
 		map[string]string{"Authorization": "Bearer " + c.Live.ParticipantToken, "Idempotency-Key": "stop-before-arrival"})
@@ -368,7 +372,7 @@ func TestArrivalConcurrentDuplicateAndOperatorSkip(t *testing.T) {
 		t.Fatalf("redacted operator audit: %d %v", auditCount, err)
 	}
 	// New arrival after skip still has its own bounded queue slot.
-	other := createExperience(t, h, cfg)
+	other := seedLegacyExperience(t, f.Store, cfg)
 	if r := arriveRequest(t, h, other, proof, "other"); r.code != 200 {
 		t.Fatalf("arrival after skip: %d %s", r.code, r.body)
 	}

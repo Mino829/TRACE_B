@@ -1,14 +1,30 @@
 # TRACE Backend — PostgreSQL / Google Cloud MVP
 
-匿名参加セッションと短期リアルタイム位置を扱うGo APIです。DBはPostgreSQL 17、公開環境はGoogle Cloud Run＋Cloud SQL for PostgreSQLを想定しています。SQLiteドライバとローカルDBファイルへの保存は廃止しました。
+匿名参加セッションと非公開写真を扱うGo APIです。GPS受付廃止の移行中で、旧LivePresence・旧写真の本人操作と期限削除だけを維持します。DBはPostgreSQL 17、公開環境はGoogle Cloud Run＋Cloud SQL for PostgreSQLを想定しています。SQLiteドライバとローカルDBファイルへの保存は廃止しました。
+
+## GPS受付廃止の移行（Backend #26）
+
+| 方針 | 互換性・安全性 | 実装・期限 |
+|---|---|---|
+| **採用：新規受付と書込み停止、旧データは各`deleteAfter`まで保持** | 旧参加者の状態照会・停止・本人削除を維持。新規GPSは入らず、旧データだけ既定の期限清掃対象 | APIで拒否し、旧DB列と削除処理を残す。SQL migration不要。セッションごとの既存`deleteAfter`が削除期限 |
+| 即時消去 | 旧記録を早く減らせるが、本人の写真閲覧権・復元バックアップ・派生物・削除証跡の調整が必要 | DB/ストレージ/バックアップの消去計画、大学の個人情報責任者の承認、本人への説明が必要。実施日未承認 |
+
+Backend担当から採用方針の明示を受けた移行実装です。設計Issue #23の要件改訂、設計Issue #9の大学による同意文・保持期間の承認、Frontend/展示の接続契約はこの判断で承認されたものとは扱いません。
+
+`TRACE_REGISTRATION_OPEN=false`が既定です。参加受付を再開する前に、設計Issue #23のGPSなし要件・Backend #25の自己申告写真地点契約・設計Issue #9の同意文と保持期間を承認し、**旧版とは別の**Memory同意版と承認済み文面を設定してください。既定の同意文と版は未承認の開発用草案であり、公開してはいけません。Frontendの新規受付も承認待ちです。
+
+新規作成はMemorySessionのみ可能です。`enableLivePresence:true`は`409 LIVE_PRESENCE_DISABLED`、既存LiveSessionの`POST .../position`は本人認証後に`410 POSITION_DISABLED`、`POST .../on-site`の`continue:true`は`410 ON_SITE_DISABLED`を返します。旧Liveの`continue:false`・`/stop`・状態確認・個別削除・両トークンでの体験削除は引き続き本人の`deleteAfter`まで有効です。写真登録のGPS `location`は`400 PHOTO_LOCATION_DISABLED`で拒否し、地点の新契約が決まるまで新しい写真の地点を推定しません。到着QRはMemoryのみ・写真0枚でも使え、停止と期限清掃も継続します。
+
+旧GPS写真と旧LiveSessionは前倒し消去しません。既存写真の本人閲覧・削除、本人資格情報による状態確認と削除の冪等性記録、期限清掃を保持し、写真位置列・旧描画イベントの読み取り契約は旧データの期限が切れるまで残します。旧位置の最新表示は新たな更新なしでTTL内に失効します。既存データに新同意版を上書きしません。GPSを含む旧写真登録の再送は受付停止し、既に登録済みの写真のURL再発行・完了と本人削除は維持します。旧Memory同意版`2026-memory-01`を設定したままでは起動を拒否するため、**旧revisionを停止した移行窓で**新同意版と審査済み文面を設定します。旧版へのロールバックはGPS書込みを復活させるため行わず、問題があれば受付を閉じて修正版で復旧します。Cloud Runの旧revisionを止め、新旧revisionの並走を避けてから切り替えてください。DB migrationは不要ですが、既存の環境変数の更新とstagingでの確認が必要です。
+
+`/v1/public/config`の旧位置送信間隔・TTL・写真GPS保持時間は互換性のため残すだけで、新しいGPS受付を意味しません。`livePresenceEnabled:false`が新規Live受付状態です。旧写真のGPS由来ルートは閲覧・削除のため維持しますが、新規写真は地点契約 #25 の実装まで地点不明のルートとなります。設計/同意審査とstaging結合検証が済むまで一般公開しないでください。
 
 ## 実装範囲
 
-- MemorySession / LivePresenceSession / ExperienceLinkの分離発行、別Bearer token認証
-- 同意版検証、公開設定、キャンパス範囲・精度・時刻・ジャンプの検証
-- 生の通常GPSや履歴は保存しない。描画無効（既定）では量子化済み最新位置をGoプロセス内だけで30～60秒保持し、停止・期限切れ・削除時に消去する
-- 描画有効時は再起動・複数Backendのsnapshot再同期用に量子化済み最新位置1件だけをPostgreSQLへ保存し、TTL・停止・削除時にDBから消去する。過去位置を蓄積せず、投影用の不透明IDと安全な表示aliasだけを配信する
-- MemorySession / LivePresenceSessionごとの有効期限と削除期限。期限後も各`deleteAfter`までは本人の状態取得・削除が可能
+- MemorySessionの新規発行と、既存LivePresenceSession / ExperienceLinkの本人操作・別Bearer token認証
+- GPSなしの新規登録、旧位置のTTLと停止・期限切れ・削除時の消去
+- 旧位置の最新値は量子化済みのGoプロセスメモリでTTL・停止・削除時に消去し、DBに座標を保存しない。新規位置は受付・保存しない
+- MemorySession / 旧LivePresenceSessionごとの有効期限と削除期限。期限後も各`deleteAfter`までは本人の状態取得・削除が可能
 - 個別削除と両トークンによる体験単位削除。後者はLive側から順に個別に確定し、部分成功を24時間の記録と同じキーで再試行
 - DBロックとトランザクションで各削除・冪等性記録を一括確定
 - CORS応答（許可Originへのプリフライトでは一括削除用`X-Trace-Live-Token`も許可）、16KB JSON上限、ヘルスチェック、JSONログ
@@ -47,7 +63,7 @@
 | POST | /v1/operator/arrivals/{arrivalId}/retry |
 | GET (WSS) | /v1/display/ws |
 
-到着QRと描画WebSocketは機能フラグで個別に有効化します。写真ストーリーは写真撮影時GPSとCampusGraphから経路を推定し、通常GPS履歴を使いません。写真ピン・フォトスポット描画イベントと画像/経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
+到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定しますが、新規写真はGPS地点を受け付けません。写真ピン・フォトスポット描画イベントと画像/経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -56,7 +72,7 @@
 |---|---:|
 | 参加作成 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
 | 公開設定取得 | クライアントIPごとに60回/分・burst 60、全体10回/秒・burst 10 |
-| 位置送信 | Live参加トークンごとに12回/分・burst 5 |
+| 旧位置送信（常に拒否） | Live参加トークンごとに12回/分・burst 5 |
 | 本人状態取得、到着、演出skip、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
 | 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
 | Web Push購読・変更・解除 | Memory参加トークンごとに10回/分・burst 10 |
@@ -64,7 +80,7 @@
 | 描画token発行 | 有効な発行署名の要求を全体で1回/秒・burst 10 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
-超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。通常の5秒ごとの位置送信は12回/分の補充速度と一致します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。運営用到着APIと描画token発行はそれぞれ有効な署名の要求を全体で1回/秒・burst 10に制限します。描画WSは1接続あたり10メッセージ/秒、各256KiBで制限します。
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。旧位置送信の制限枠は拒否要求による負荷対策として残します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。運営用到着APIと描画token発行はそれぞれ有効な署名の要求を全体で1回/秒・burst 10に制限します。描画WSは1接続あたり10メッセージ/秒、各256KiBで制限します。
 許可Originには`Retry-After`をCORSで公開します。一括削除はMemoryのBearer tokenと`X-Trace-Live-Token`の両方の操作枠を同時に確認・消費し、片側が超過していれば削除を開始せず、もう片側の枠も消費しません。位置送信と操作のトークン別枠は分離されていますが、IP別・全体の追加上限は共通です。
 IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
 転送IPは単一のIPv4/IPv6だけを受け付けます。複数の同名ヘッダー、カンマ区切り、IPv6 zone付きなどは接続元IPへフォールバックします。
@@ -91,9 +107,9 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 発行されるproofは`base64url(JSON).base64url(HMAC-SHA256(TRACE_ARRIVAL_PROOF_KEY, base64url(JSON)))`です。JSONには`checkpointId`、`venue`、`issuedAt`/`expiresAt`（Unix秒）、ランダム`nonce`を含み、有効期間は25秒です。参加端末は`POST /v1/memory-sessions/{memorySessionId}/arrival`へMemory Bearer、`Idempotency-Key`（ランダム値）、JSON `{"checkpointToken":"...","experienceLinkToken":"...","clientTime":"..."}`を送ります。`clientTime`は判定に使わずサーバー時刻を正とします。改変・他会場・期限切れ・未来発行は403、別トークンによる別セッションへの操作は認証で拒否します。投影QRは複数来場者が読むため同一proofを**別Memory間では共有可能**です。同一Memoryへの二重到着は1件のArrivalEventとなり、24時間の同一キー/同一内容の再送は期限切れQRでも元の結果を返します。同一キー/別内容は409、Memory削除と同時に到着・再送記録も消えます。
 
-有効なExperienceLinkを持つ場合は当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。GPSは`tracking`のまま、`on_site`は従来どおり本人の追加同意版が必要です。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。到着は写真機能無効でも有効、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOは最大32件、満杯でも到着自体を記録して`skipped`（`queue_full`）とし、開始されず2分経った候補も`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`は未再生の演出をスキップします。
+有効なExperienceLinkを持つ旧MemorySessionでは当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。位置書込みと`on_site`継続は廃止済みで、旧Liveでも明示的な停止・本人削除はできます。新規MemorySessionはLiveとのlinkなしで写真0枚でも到着できます。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。到着は写真機能無効でも有効、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOは最大32件、満杯でも到着自体を記録して`skipped`（`queue_full`）とし、開始されず2分経った候補も`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`は未再生の演出をスキップします。
 
-運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。`POST /v1/operator/arrivals/{arrivalId}/retry`は描画機障害によるskipに限り、同じ運営署名で明示的に再キュー投入します。本人GETにキュー順は出しません。演出の状態変更は主描画機leaseを確認したWSSだけが行い、運営候補照会では`playing`へ移りません。適用DBは`004_route_segments.sql`、`005_push_subscriptions.sql`、`006_arrivals.sql`、`007_display.sql`の順です。展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。既存Live/位置APIのGPS廃止後の扱いはIssue #26の判断待ちです。
+運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。`POST /v1/operator/arrivals/{arrivalId}/retry`は描画機障害によるskipに限り、同じ運営署名で明示的に再キュー投入します。本人GETにキュー順は出しません。演出の状態変更は主描画機leaseを確認したWSSだけが行い、運営候補照会では`playing`へ移りません。適用DBは`004_route_segments.sql`、`005_push_subscriptions.sql`、`006_arrivals.sql`、`007_display.sql`の順です。展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。旧Live/位置APIの移行方針は冒頭のBackend #26を参照してください。
 
 ## 描画WebSocket（既定無効）
 
@@ -105,7 +121,7 @@ WS接続直後の`display.snapshot`は`data.cursor`、量子化済み最新位�
 
 送信JSONはすべて`schemaVersion:1`、3種のversion、`type`を含めます。`renderer.primary.acquire`で主リースを要求し、`renderer.primary.granted`の`data.leaseId`を保存します。他接続には`renderer.primary.conflict`を返します。`arrival.replay.started`、`arrival.replay.completed`、`arrival.replay.failed`にはクライアント生成の一意な`eventId`（8～128文字）、`arrivalId`、`leaseId`を指定します。成功は`renderer.ack`、競合・失効は`renderer.rejected`です。同じeventId・同じ操作の再送は24時間同じ結果となり、異なる内容は拒否します。切断/30秒heartbeat欠落/リース期限切れは再生中を`skipped`に確定し、別端末による自動再生はしません。運営の署名済み明示retryのみが再投入できます。10秒間隔のping/pong（または`renderer.heartbeat`）と30秒応答期限を設け、50分でWSを終了します。Cloud Run設定は3600秒で、クライアント側は切断時に指数バックオフで**新しい資格を取得し**snapshotから再接続します。
 
-最新の量子化済み位置は単一BackendのGoメモリにのみ保持し、PostgreSQLには保存しません。到着・再生イベントと主描画機leaseだけをDBに保存します。複数Backend間で位置は共有されないため、**APIとWebSocketは同じ1インスタンス**へ接続し、Cloud Runの最大インスタンス数を1としてください。旧revisionと並存させると表示が欠落し得るため、受付停止・旧revision停止後に切り替えます。複数インスタンス化には仕様で定めるRedis互換TTLストア/メッセージ基盤への移行と容量・プライバシー承認が必要です。DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。新規写真・位置受付を廃止する判断は設計Issue #23・Backend #25/#26待ちであり、旧位置イベントを新展示契約として確定しません。
+旧版で受け付けた最新の量子化済み位置は単一BackendのGoメモリにのみ保持し、PostgreSQLには保存しません。到着・再生イベントと主描画機leaseだけをDBに保存します。旧位置は新たに受け付けず、TTL切れ後は描画snapshotから消えます。複数Backend間で位置は共有されないため、**APIとWebSocketは同じ1インスタンス**へ接続し、Cloud Runの最大インスタンス数を1としてください。旧revisionと並存させるとGPS書込みが復活するため、受付停止・旧revision停止後に切り替えます。DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。新しい写真地点と描画契約は設計Issue #23・Backend #25待ちです。
 
 ## 非公開写真の設定とライフサイクル
 
@@ -114,7 +130,7 @@ WS接続直後の`display.snapshot`は`data.cursor`、量子化済み最新位�
 - bucketは東京`ASIA-NORTHEAST1`、Uniform bucket-level accessとPublic access preventionを有効にし、versioning・soft delete・retention/hold・独立したlifecycleルールを無効にします。起動時に検査し、稼働中に変更しないでください。
 - ADCとIAM `signBlob`を使用し、秘密鍵ファイルやローカルファイル保存へのフォールバックはありません。APIと清掃ジョブへ同じ保存先を設定します。必要権限とCORSは[配置手順](docs/google-cloud.md)を参照してください。
 
-写真はJPEG/WebP、5MiB以下、長辺1920px以下、1セッション12枚までです。登録時に撮影時GPSを省略でき、通常GPSから補完しません。保存後にサイズ・SHA-256・実形式・寸法・画像全体の復号・EXIF等の不在を検証するまで、画像URLは返しません。ブラウザの構造的なJFIF/Adobe情報は許可しますが、埋め込みサムネイル・任意メタデータ・アニメーションは拒否します。
+写真はJPEG/WebP、5MiB以下、長辺1920px以下、1セッション12枚までです。新規登録ではGPSの`location`を拒否します。保存後にサイズ・SHA-256・実形式・寸法・画像全体の復号・EXIF等の不在を検証するまで、画像URLは返しません。ブラウザの構造的なJFIF/Adobe情報は許可しますが、埋め込みサムネイル・任意メタデータ・アニメーションは拒否します。
 
 WebPはVP8Lの過大割り当てを修正した公式`x/image v0.47.0`を使い、独自デコーダのコピーは保持しません。公式のentropy group上限・疎なindexの再マッピングに加え、プロセス内のWebP全体復号を同時1件に制限します。待機はcontextで取消可能で、画像とALPHの両方の悪意ある入力を境界テストで検証します。512MiB構成での実負荷・接続待ちへの影響はstagingで確認してください。
 
@@ -122,7 +138,7 @@ WebPはVP8Lの過大割り当てを修正した公式`x/image v0.47.0`を使い�
 
 アップロードURLは最大5分（Memoryの`expiresAt`以下）の新規作成専用PUTです。返却する`uploadHeaders`の`Content-Type`、`x-goog-if-generation-match: 0`、`Cache-Control`を送信し、`Content-Length`はブラウザがBlobサイズから自動設定します。上書き・読み取り・一覧には使えません。`complete`はbodyなしで何度送っても同じ写真の状態へ収束します。未アップロードは409、不正画像は消去後`failed`となり、消去に失敗した間は`deleting`で新しいURLを発行しません。
 
-本人memoryは検証済み`ready`だけを撮影時刻順に返し、画像URLは5分と`deleteAfter`の早い方までです。`locationConfidence`はGPSなし/精度100m超をlow、30m超〜100mをmedium、30m以下をhighとする暫定値で、経路の信頼度ではありません。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
+本人memoryは検証済み`ready`だけを撮影時刻順に返し、画像URLは5分と`deleteAfter`の早い方までです。`locationConfidence`は新規GPSなし写真でlow、旧写真の精度100m超でlow、30m超〜100mでmedium、30m以下でhighとする暫定値で、経路の信頼度ではありません。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
 写真が`ready`になると、撮影時刻順の隣り合う写真ごとに`RouteSegment`を同一DBトランザクションで作成します。個別削除要求では`deleting`になった写真をただちに除外して残る前後の写真間を再計算し、画像消去完了・失敗時にも整合させます。写真0枚・1枚なら区間は空のままで到着/終了を妨げません。既存写真を保持するDBへ移行したときは本人memory取得時に欠損区間を再計算します。
 到着QRの確定情報は現時点ではブースcheckpointIdのみです。承認済みの会場checkpoint→CampusGraph座標の対応がないため、最後の写真から到着地点への区間は捏造しません。この依存が解決するまでは写真間の経路のみを提供します。
 
@@ -215,7 +231,7 @@ make integration
 GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合テストを必ず実行します。
 `go test ./internal/route -run TestGenerationP95 -count=1 -v`は同梱された実Graph上で100回の生成時間を採取し、昇順95番目（p95）をログへ出します。デプロイ環境で計測し、承認した目標値と照合してください。試験コードを追加しただけでは実測・合格を意味しません。
 
-検証対象：既存API導線、時刻型の往復、資格情報分離、複数接続からの同時削除、停止と位置保存の競合、再送記録失敗時のロールバック、保存期限・関連データ削除、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、CampusGraph上の既知経路/通行禁止/時間外/複数候補/欠損、Readyと写真削除時の区間再生成、Cloud Runポート・Cloud SQL接続設定。
+検証対象：Memoryのみの新規参加、旧GPS受付拒否、写真GPS拒否、旧セッションの資格情報分離・停止・同時削除・削除期限、再送記録失敗時のロールバック、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、既存GPS写真の経路/削除、CampusGraph上の既知経路/通行禁止/時間外/複数候補/欠損、Readyと写真削除時の区間再生成、Cloud Runポート・Cloud SQL接続設定。
 
 ## Google Cloudへ配置
 

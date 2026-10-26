@@ -43,7 +43,7 @@ def private_probe_server(edge_secret):
                 if self.headers.get("X-Trace-Edge-Secret") != edge_secret:
                     self.send_error(403)
                     return
-                payload = {"registrationOpen": False}
+                payload = {"registrationOpen": False, "livePresenceEnabled": False}
             elif self.path == "/health/ready":
                 payload = {"status": "ready"}
             else:
@@ -109,7 +109,7 @@ class ReleaseTests(unittest.TestCase):
             raise ci.urllib.error.HTTPError(url, 403, "Authentication required", {}, None)
         if self.http_failure and self.http_failure in url:
             return {"status": "bad", "registrationOpen": True}
-        return {"status": "ready"} if url.endswith("/health/ready") else {"registrationOpen": False}
+        return {"status": "ready"} if url.endswith("/health/ready") else {"registrationOpen": False, "livePresenceEnabled": False}
 
     def cloud(self, *args, **kwargs):
         self.calls.append(args)
@@ -302,16 +302,40 @@ class ReleaseTests(unittest.TestCase):
         ci.Release().rollback()
         self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], OLD_IMAGE)
 
-    def test_post_switch_failure_restores_api_and_cleanup(self):
+    def test_post_switch_failure_retains_gps_free_api_and_cleanup(self):
         self.candidate()
         self.release.verify()
         self.release.cleanup_job()
         self.http_failure = URL
         with self.assertRaises(ci.RefuseRelease):
             self.release.promote()
-        self.release.rollback()
+        ci.Release().rollback()
+        self.assertEqual(ci.active_revision(self.service), "new-revision")
+        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], NEW_IMAGE)
+
+    def test_partial_switch_never_restores_gps_accepting_revision(self):
+        self.candidate()
+        self.release.verify()
+        self.release.cleanup_job()
+        self.release.state["traffic_attempted"] = True
+        self.release.save()
+        ci.Release().rollback()
+        self.assertEqual(ci.active_revision(self.service), "new-revision")
+        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], NEW_IMAGE)
+
+    def test_candidate_without_gps_retirement_never_promotes(self):
+        self.candidate()
+        def pre_retirement(url, token, *, edge_secret=None):
+            result = self.http(url, token, edge_secret=edge_secret)
+            if token and url.endswith("/v1/public/config"):
+                del result["livePresenceEnabled"]
+            return result
+
+        with patch.object(ci, "request_json", side_effect=pre_retirement):
+            with self.assertRaisesRegex(ci.RefuseRelease, "GPS-free candidate"):
+                self.release.verify()
+        self.assertFalse(self.release.state.get("candidate_verified"))
         self.assertEqual(ci.active_revision(self.service), "old-revision")
-        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], OLD_IMAGE)
 
     def test_external_changes_are_not_overwritten(self):
         self.candidate()
@@ -350,7 +374,7 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ci.RefuseRelease, "Manual recovery"):
             self.release.rollback()
         self.assertEqual(ci.active_revision(self.service), "external-revision")
-        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], OLD_IMAGE)
+        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], NEW_IMAGE)
 
     def enable_edge(self):
         self.service["spec"]["template"]["spec"]["containers"][0]["env"].append({
@@ -398,7 +422,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotIn(credential, self.release.state_path.read_text())
             self.assertNotIn(credential, Path(os.environ["GITHUB_STEP_SUMMARY"]).read_text())
 
-    def test_edge_auth_failure_restores_api_and_cleanup_after_switch(self):
+    def test_edge_auth_failure_keeps_gps_free_api_after_switch(self):
         secret = "test-edge-secret-for-private-staging"
         self.enable_edge()
         with patch.dict(os.environ, {"TRACE_STAGING_EDGE_SHARED_SECRET": secret}):
@@ -418,8 +442,8 @@ class ReleaseTests(unittest.TestCase):
                     self.release.rollback()
                 finally:
                     self.http_patch.start()
-        self.assertEqual(ci.active_revision(self.service), "old-revision")
-        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], OLD_IMAGE)
+        self.assertEqual(ci.active_revision(self.service), "new-revision")
+        self.assertEqual(ci.job_spec(self.job)["containers"][0]["image"], NEW_IMAGE)
         self.assertFalse(self.release.state.get("success", False))
         self.assertNotIn(secret, self.release.state_path.read_text())
 

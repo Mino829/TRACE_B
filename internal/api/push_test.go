@@ -20,6 +20,7 @@ func testPushConfig(t *testing.T) (config.Config, *push.Service, string, string)
 	t.Helper()
 	enc := base64.RawURLEncoding
 	cfg := config.Default()
+	cfg.RegistrationOpen = true
 	cfg.PushEnabled = true
 	cfg.PushVAPIDPrivateKey = enc.EncodeToString(append(make([]byte, 31), 1))
 	x, y := elliptic.P256().ScalarBaseMult(append(make([]byte, 31), 1))
@@ -95,6 +96,7 @@ func TestPushAPIRequiresConsentAndNeverExposesCredentials(t *testing.T) {
 func TestPushUnavailableByDefault(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := config.Default()
+	cfg.RegistrationOpen = true
 	h := api.New(cfg, f.Store, nil)
 	created := createExperience(t, h, cfg)
 	r := request(t, h, http.MethodGet, "/v1/public/config", "", nil)

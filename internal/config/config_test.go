@@ -8,7 +8,7 @@ import (
 
 func baseEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_SESSION_TTL", "TRACE_MEMORY_SESSION_TTL", "TRACE_LIVE_SESSION_TTL", "TRACE_DATA_RETENTION", "TRACE_EDGE_SHARED_SECRET"} {
+	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_SESSION_TTL", "TRACE_MEMORY_SESSION_TTL", "TRACE_LIVE_SESSION_TTL", "TRACE_DATA_RETENTION", "TRACE_EDGE_SHARED_SECRET", "TRACE_REGISTRATION_OPEN", "TRACE_MEMORY_CONSENT_VERSION", "TRACE_CONSENT_BODY"} {
 		t.Setenv(k, "")
 	}
 	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
@@ -57,6 +57,15 @@ func TestCloudSQLSocketAndPasswordEncoding(t *testing.T) {
 		t.Fatal("connection settings not round-tripped")
 	}
 }
+
+func TestRetiredGPSConsentVersionCannotBeReused(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("TRACE_MEMORY_CONSENT_VERSION", "2026-memory-01")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("retired GPS consent version was accepted")
+	}
+}
+
 func TestRejectInvalidConfiguration(t *testing.T) {
 	for _, tt := range []struct{ key, value string }{
 		{"PORT", "0"}, {"PORT", "abc"}, {"TRACE_DB_MAX_CONNECTIONS", "0"},

@@ -25,6 +25,7 @@ func TestPhotoMemoryDeliversPrivateVersionedProjectedRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
+	cfg.RegistrationOpen = true
 	cfg.PhotoEnabled = true
 	cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion = "c1", "g1", "m1"
 	if err := f.Store.ConfigureRoutes(g, cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion); err != nil {

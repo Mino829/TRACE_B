@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -22,6 +23,7 @@ import (
 	"github.com/Mino829/trace_Backend/internal/config"
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/photoasset"
+	"github.com/Mino829/trace_Backend/internal/store"
 	"github.com/Mino829/trace_Backend/internal/testdb"
 )
 
@@ -211,11 +213,53 @@ func readyPhoto(t *testing.T, h http.Handler, c createdExperience, data []byte, 
 	return p
 }
 
+func TestPhotoRegistrationRejectsLocationWithoutCreatingPhoto(t *testing.T) {
+	f := testdb.Open(t)
+	assets := newPhotoObjects(t)
+	cfg := config.Default()
+	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
+	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
+	c := createExperience(t, h, cfg)
+	data := photoJPEG(t)
+	digest := sha256.Sum256(data)
+	body := fmt.Sprintf(`{"clientPhotoId":"gps-attempt","capturedAt":%q,"mimeType":"image/jpeg","sizeBytes":%d,"width":16,"height":12,"sha256":%q}`, time.Now().UTC().Format(time.RFC3339Nano), len(data), hex.EncodeToString(digest[:]))
+	path := "/v1/memory-sessions/" + c.Memory.SessionID + "/photos"
+	headers := map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken, "Idempotency-Key": "gps-rejected"}
+	for _, location := range []string{
+		`{"latitude":35.0,"longitude":135.0,"accuracyM":4,"recordedAt":"2025-01-01T00:00:00Z"}`,
+		`{}`,
+	} {
+		withLocation := strings.TrimSuffix(body, "}") + `,"location":` + location + `}`
+		r := request(t, h, "POST", path, withLocation, headers)
+		if r.Code != http.StatusBadRequest || !strings.Contains(r.Body.String(), `"code":"PHOTO_LOCATION_DISABLED"`) || strings.Contains(r.Body.String(), "135.0") {
+			t.Fatalf("GPS metadata rejection: %d %s", r.Code, r.Body.String())
+		}
+		photos, err := f.Store.Photos(t.Context(), c.Memory.SessionID)
+		if err != nil || len(photos) != 0 {
+			t.Fatalf("GPS metadata created a photo: %+v %v", photos, err)
+		}
+	}
+	withNull := strings.TrimSuffix(body, "}") + `,"location":null}`
+	r := request(t, h, "POST", path, withNull, headers)
+	if r.Code != http.StatusCreated {
+		t.Fatalf("null location failed or rejection consumed idempotency key: %d %s", r.Code, r.Body.String())
+	}
+	photos, err := f.Store.Photos(t.Context(), c.Memory.SessionID)
+	if err != nil || len(photos) != 1 || photos[0].Location != nil {
+		t.Fatalf("null location stored unexpected coordinates: %+v %v", photos, err)
+	}
+	if p, _ := registerPhoto(t, h, c, data, "omitted-location"); p.ID == "" {
+		t.Fatal("omitted location registration failed")
+	}
+}
+
 func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 	f := testdb.Open(t)
 	assets := newPhotoObjects(t)
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
 	other := createExperience(t, h, cfg)
@@ -230,7 +274,7 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 	if p.Expires.After(time.Now().Add(5 * time.Minute)) {
 		t.Fatal("upload capability too long")
 	}
-	for _, token := range []string{c.Live.ParticipantToken, other.Memory.ParticipantToken, "wrong-token"} {
+	for _, token := range []string{other.Memory.ParticipantToken, "wrong-token"} {
 		if got := request(t, h, "GET", path+"/photos", "", map[string]string{"Authorization": "Bearer " + token}).Code; got != 401 {
 			t.Fatalf("wrong credentials: %d", got)
 		}
@@ -266,6 +310,20 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 	if err != nil || response.StatusCode != 200 || !bytes.Equal(downloaded, data) {
 		t.Fatal("verified image unavailable")
 	}
+	// Represent a photo saved before new GPS registration was disabled.
+	recordedAt := time.Now().UTC()
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE photos SET latitude=$1, longitude=$2, accuracy_m=$3, location_recorded_at=$4 WHERE id=$5`,
+		35.0, 135.0, 4.0, recordedAt, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := f.Store.Photo(t.Context(), c.Memory.SessionID, p.ID)
+	if err != nil || legacy.Location == nil || legacy.Location.Latitude != 35.0 || legacy.Location.Longitude != 135.0 {
+		t.Fatalf("preexisting GPS photo was not readable: %+v %v", legacy, err)
+	}
+	story = request(t, h, "GET", path+"/memory", "", headers)
+	if err := json.Unmarshal(story.Body.Bytes(), &result); err != nil || story.Code != 200 || len(result.Moments) != 1 || result.Moments[0].Confidence != "high" {
+		t.Fatalf("preexisting GPS photo missing from story: %d %s", story.Code, story.Body.String())
+	}
 	retry := request(t, h, "POST", path+"/photos", body, map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "register-one"})
 	if retry.Code != 200 || !strings.Contains(retry.Body.String(), p.ID) || strings.Contains(retry.Body.String(), "uploadUrl") {
 		t.Fatalf("metadata replay: %d %s", retry.Code, retry.Body.String())
@@ -285,6 +343,9 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 			t.Fatalf("delete/replay: %d %s", r.Code, r.Body.String())
 		}
 	}
+	if _, err := f.Store.Photo(t.Context(), c.Memory.SessionID, p.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("preexisting GPS photo retained after deletion: %v", err)
+	}
 	response, err = http.Get(result.Moments[0].URL)
 	if err != nil {
 		t.Fatal(err)
@@ -297,9 +358,6 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 	if got := request(t, h, "POST", path+"/photos", body, map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "register-one"}).Code; got != 404 {
 		t.Fatalf("deleted registration resurrected photo: %d", got)
 	}
-	if err := f.Store.AuthenticateLive(t.Context(), c.Live.SessionID, tokenHash(c.Live.ParticipantToken), time.Now()); err != nil {
-		t.Fatal("photo deletion removed live session")
-	}
 }
 
 func TestFailedPhotoValidationRetainsDeletionIntentUntilErasure(t *testing.T) {
@@ -307,6 +365,7 @@ func TestFailedPhotoValidationRetainsDeletionIntentUntilErasure(t *testing.T) {
 	assets := newPhotoObjects(t)
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
 	service := photo.New(f.Store, assets)
 	h := api.New(cfg, f.Store, service)
 	c := createExperience(t, h, cfg)
@@ -348,8 +407,14 @@ func TestMemoryAndExperienceDeletionRetryPhotoErasure(t *testing.T) {
 			assets := newPhotoObjects(t)
 			cfg := config.Default()
 			cfg.PhotoEnabled = true
+			cfg.RegistrationOpen = true
 			h := api.New(cfg, f.Store, photo.New(f.Store, assets))
-			c := createExperience(t, h, cfg)
+			var c createdExperience
+			if combined {
+				c = seedLegacyExperience(t, f.Store, cfg)
+			} else {
+				c = createExperience(t, h, cfg)
+			}
 			p := readyPhoto(t, h, c, photoJPEG(t), "delete-session")
 			path := "/v1/memory-sessions/" + c.Memory.SessionID
 			headers := map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken, "Idempotency-Key": "delete-session"}
@@ -376,11 +441,6 @@ func TestMemoryAndExperienceDeletionRetryPhotoErasure(t *testing.T) {
 			if err := f.Store.AuthenticateMemory(t.Context(), c.Memory.SessionID, tokenHash(c.Memory.ParticipantToken), time.Now()); err == nil {
 				t.Fatal("memory survived completed deletion")
 			}
-			if !combined {
-				if err := f.Store.AuthenticateLive(t.Context(), c.Live.SessionID, tokenHash(c.Live.ParticipantToken), time.Now()); err != nil {
-					t.Fatal("memory deletion erased live")
-				}
-			}
 			putPhoto(t, p, photoJPEG(t), 412)
 		})
 	}
@@ -391,10 +451,18 @@ func TestExpiredMemoryErasesPhotosBeforeLosingCleanupKnowledge(t *testing.T) {
 	assets := newPhotoObjects(t)
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
 	service := photo.New(f.Store, assets)
 	h := api.New(cfg, f.Store, service)
 	c := createExperience(t, h, cfg)
 	p := readyPhoto(t, h, c, photoJPEG(t), "expire")
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE photos SET latitude=$1, longitude=$2, accuracy_m=$3, location_recorded_at=$4 WHERE id=$5`,
+		35.0, 135.0, 4.0, time.Now().UTC(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if legacy, err := f.Store.Photo(t.Context(), c.Memory.SessionID, p.ID); err != nil || legacy.Location == nil {
+		t.Fatalf("preexisting GPS photo missing before expiry: %+v %v", legacy, err)
+	}
 	future := c.Memory.DeleteAfter.Add(time.Second)
 	if err := f.Store.Cleanup(t.Context(), future); err != nil {
 		t.Fatal(err)
@@ -412,6 +480,9 @@ func TestExpiredMemoryErasesPhotosBeforeLosingCleanupKnowledge(t *testing.T) {
 	if _, err := f.Store.MemorySession(t.Context(), c.Memory.SessionID); err == nil {
 		t.Fatal("expired memory retained")
 	}
+	if _, err := f.Store.Photo(t.Context(), c.Memory.SessionID, p.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expired GPS photo retained: %v", err)
+	}
 	assets.mu.Lock()
 	remaining := len(assets.objects)
 	assets.mu.Unlock()
@@ -426,6 +497,7 @@ func TestPhotoCompleteRecoversAfterReadyCommitFailure(t *testing.T) {
 	assets := newPhotoObjects(t)
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
 	data := photoJPEG(t)
@@ -463,6 +535,7 @@ func TestPhotoMetadataLimitDoesNotBlockControlRequests(t *testing.T) {
 	assets := newPhotoObjects(t)
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
 	var body string

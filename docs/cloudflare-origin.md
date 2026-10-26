@@ -19,10 +19,10 @@
 
 1. stagingとproductionのCloud Run、Cloud SQL、Secret Manager、Worker、ドメイン、データを分離する。
 2. Web側の`TRACE_BACKEND_URL`とGo側のsecretを設定し、Worker経由は成功、Goへの直接リクエストは403になることを確認する。
-3. `TRACE_REGISTRATION_OPEN=false`で起動し、承認済み同意文、連絡先、保存期間、豊洲キャンパスのgeofenceと原点を設定する。コードの初期座標はサンプル値である。
-4. 匿名の参加作成と位置送信には[用途別の制限](../README.md#公開apiのレート制限)を実装済み。公開前にWorkerからのクライアントIP転送、共有NATでの通常参加、429と`Retry-After`、異常な超過、再起動時のカウンター消失をstagingで監視・検証する。単一プロセス内の集計なのでAPI最大1インスタンスを維持し、revision並存を避ける。
-5. Cloudflareサイトからの参加開始、位置送信、停止、両セッション削除を実機と検証DBで通す。写真、到着QR、描画WebSocketは実装後に別途試験する。
-6. 期限削除ジョブ、DB接続上限、障害時の受付停止、WebとGoのロールバック手順を確認する。
+3. `TRACE_REGISTRATION_OPEN=false`で起動し、GPSなしのMemory同意版・同意文、連絡先、保存期間を設計Issue #23/#9で承認する。写真地点の契約はBackend #25で決める。コードの初期座標は旧GPS用のサンプル値である。
+4. 匿名の参加作成と旧位置APIの拒否要求には[用途別の制限](../README.md#公開apiのレート制限)を実装済み。公開前にWorkerからのクライアントIP転送、共有NATでの通常参加、429と`Retry-After`、異常な超過、再起動時のカウンター消失をstagingで監視・検証する。単一プロセス内の集計なのでAPI最大1インスタンスを維持し、revision並存を避ける。
+5. CloudflareサイトからMemoryのみの参加、写真GPS拒否、旧Live位置受付の拒否、旧セッションの停止・削除、写真0枚での到着を実機と検証DBで通す。承認済みの写真地点・運営API・描画WebSocketは別途試験する。
+6. 期限削除ジョブ、DB接続上限、障害時の受付停止、旧GPS受付を復活させない修正版への復旧手順を確認する。
 
 Cloud RunのWebSocketにはリクエスト時間の上限がある。描画用APIを追加するときは、会場クライアントの再接続と状態再同期を検証する。
 

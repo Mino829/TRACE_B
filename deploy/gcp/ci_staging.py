@@ -261,6 +261,8 @@ class Release:
                 config = request_json(f"{url}/v1/public/config", token, edge_secret=edge_secret)
                 if ready.get("status") != "ready" or config.get("registrationOpen") is not False:
                     raise RefuseRelease("Health check failed or registration is not closed")
+                if config.get("livePresenceEnabled") is not False:
+                    raise RefuseRelease("GPS-free candidate is not active; refusing deployment")
                 return
             except (urllib.error.URLError, TimeoutError):
                 if attempt == 2:
@@ -270,6 +272,7 @@ class Release:
     def verify(self):
         require_private(self.state["candidate_url"])
         self.probe(self.state["candidate_url"])
+        self.state["retired_candidate"] = True
         self.state["candidate_verified"] = True
         self.save()
 
@@ -311,16 +314,21 @@ class Release:
         if not self.state or self.state.get("success"):
             return
         failures = []
+        retired_cutover = self.state.get("traffic_attempted") and self.state.get("retired_candidate")
         if self.state.get("traffic_attempted"):
             try:
                 current = active_revision(cloud("run", "services", "describe", SERVICE))
                 if current == self.state["candidate_revision"]:
-                    cloud("run", "services", "update-traffic", SERVICE, f"--to-revisions={self.state['old_revision']}=100")
-                elif current != self.state["old_revision"]:
+                    if not retired_cutover:
+                        cloud("run", "services", "update-traffic", SERVICE, f"--to-revisions={self.state['old_revision']}=100")
+                elif current == self.state["old_revision"]:
+                    if retired_cutover:
+                        cloud("run", "services", "update-traffic", SERVICE, f"--to-revisions={self.state['candidate_revision']}=100")
+                else:
                     raise RefuseRelease("Traffic changed externally; refusing to overwrite it")
             except Exception as error:
                 failures.append(str(error))
-        if self.state.get("job_attempted"):
+        if self.state.get("job_attempted") and not retired_cutover:
             try:
                 current = job_spec(cloud("run", "jobs", "describe", JOB))["containers"][0]["image"]
                 if current == self.state["image"]:
@@ -331,7 +339,8 @@ class Release:
                 failures.append(str(error))
         if failures:
             raise RefuseRelease("Manual recovery required: " + "; ".join(failures))
-        print("Previous traffic/cleanup image retained or restored; DB changes were never run.")
+        print("GPS-free candidate and cleanup retained; fix forward with registration closed." if retired_cutover else
+              "Previous traffic/cleanup image retained or restored; DB changes were never run.")
 
     def finish(self):
         if self.state.get("candidate_attempted"):
