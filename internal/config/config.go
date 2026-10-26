@@ -18,6 +18,7 @@ type Config struct {
 	EdgeSharedSecret           string
 	RegistrationOpen           bool
 	PhotoEnabled               bool
+	PhotoMetadataEnabled       bool
 	ArrivalEnabled             bool
 	ArrivalIssuerKey           string
 	ArrivalProofKey            string
@@ -144,6 +145,9 @@ func FromEnv() (Config, error) {
 	if cfg.PhotoEnabled, err = boolEnv("TRACE_PHOTO_ENABLED", false); err != nil {
 		return Config{}, err
 	}
+	if cfg.PhotoMetadataEnabled, err = boolEnv("TRACE_PHOTO_METADATA_ENABLED", false); err != nil {
+		return Config{}, err
+	}
 	if cfg.PushEnabled, err = boolEnv("TRACE_PUSH_ENABLED", false); err != nil {
 		return Config{}, err
 	}
@@ -162,6 +166,16 @@ func FromEnv() (Config, error) {
 	}
 	if (cfg.PhotoBucket == "") != (cfg.PhotoSignerEmail == "") {
 		return Config{}, fmt.Errorf("photo storage requires both TRACE_PHOTO_BUCKET and TRACE_PHOTO_SIGNER_EMAIL")
+	}
+	if cfg.PhotoMetadataEnabled && cfg.PhotoEnabled {
+		return Config{}, fmt.Errorf("device-only photo metadata cannot be enabled with legacy photo uploads")
+	}
+	if cfg.RegistrationOpen && (!cfg.PhotoMetadataEnabled ||
+		os.Getenv("TRACE_MEMORY_CONSENT_VERSION") == "" ||
+		os.Getenv("TRACE_CONSENT_BODY") == "" ||
+		cfg.MemoryConsentVersion == Default().MemoryConsentVersion ||
+		cfg.ConsentBody == Default().ConsentBody) {
+		return Config{}, fmt.Errorf("registration requires device-only photos and a separately configured, reviewed memory consent")
 	}
 	if strings.ContainsAny(cfg.PhotoBucket, "/\\ \t\r\n") ||
 		(cfg.PhotoSignerEmail != "" && (!strings.Contains(cfg.PhotoSignerEmail, "@") ||

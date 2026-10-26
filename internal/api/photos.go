@@ -34,12 +34,21 @@ type createPhotoRequest struct {
 }
 
 func (s *Server) photoAvailable(w http.ResponseWriter, r *http.Request, writing bool) bool {
-	if s.photos == nil || (writing && !s.cfg.PhotoEnabled) {
+	if s.photos == nil || (writing && (!s.cfg.PhotoEnabled || s.cfg.PhotoMetadataEnabled)) {
 		s.writeError(w, requestID(r), &apiError{Code: "PHOTO_DISABLED", Message: "photo storage is not enabled", Status: http.StatusServiceUnavailable})
 		return false
 	}
 	if err := s.authenticateMemory(r, r.PathValue("memorySessionId")); err != nil {
 		s.writeError(w, requestID(r), err)
+		return false
+	}
+	memory, err := s.store.MemorySession(r.Context(), r.PathValue("memorySessionId"))
+	if err != nil {
+		s.photoError(w, r, err)
+		return false
+	}
+	if memory.PhotoMode == store.PhotoModeDevice {
+		s.photoError(w, r, store.ErrNotFound)
 		return false
 	}
 	return true

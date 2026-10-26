@@ -88,7 +88,7 @@ func main() {
 		slog.Error("failed to erase subscriptions while push is disabled")
 		os.Exit(1)
 	}
-	if photos != nil || cfg.DisplayEnabled {
+	if photos != nil || cfg.PhotoMetadataEnabled || cfg.DisplayEnabled {
 		graph, err := route.Embedded()
 		if err != nil {
 			slog.Error("invalid embedded CampusGraph", "error", err)
@@ -96,6 +96,12 @@ func main() {
 		}
 		if err := db.ConfigureRoutes(graph, cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion); err != nil {
 			slog.Error("display/photo routing requires compatible graph, coordinate and 3D map versions", "error", err)
+			os.Exit(1)
+		}
+	}
+	if cfg.PhotoMetadataEnabled {
+		if err := db.QueueLegacyPendingPhotoUploads(startupCtx); err != nil {
+			slog.Error("failed to fence in-flight legacy photo uploads")
 			os.Exit(1)
 		}
 	}

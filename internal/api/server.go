@@ -76,6 +76,10 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service, sender ...*p
 	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete", server.limitedSession("session", server.completePhoto))
 	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}", server.limitedSession("session", server.deletePhoto))
 	mux.HandleFunc("GET /v1/memory-sessions/{memorySessionId}/memory", server.limitedSession("session", server.photoMemory))
+	mux.HandleFunc("GET /v2/memory-sessions/{memorySessionId}/photos", server.limitedSession("session", server.listPhotoMoments))
+	mux.HandleFunc("POST /v2/memory-sessions/{memorySessionId}/photos", server.limitedSession("photo-metadata", server.createPhotoMoment))
+	mux.HandleFunc("DELETE /v2/memory-sessions/{memorySessionId}/photos/{photoMomentId}", server.limitedSession("session", server.deletePhotoMoment))
+	mux.HandleFunc("GET /v2/memory-sessions/{memorySessionId}/memory", server.limitedSession("session", server.photoMomentMemory))
 	mux.HandleFunc("PUT /v1/memory-sessions/{memorySessionId}/push-subscription", server.limitedSession("push", server.putPush))
 	mux.HandleFunc("PATCH /v1/memory-sessions/{memorySessionId}/push-subscription", server.limitedSession("push", server.patchPush))
 	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}/push-subscription", server.limitedSession("push", server.deletePush))
@@ -88,7 +92,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", requestID)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		if strings.HasPrefix(r.URL.Path, "/v1/") && s.cfg.EdgeSharedSecret != "" &&
+		if (strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/v2/")) && s.cfg.EdgeSharedSecret != "" &&
 			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Trace-Edge-Secret")), []byte(s.cfg.EdgeSharedSecret)) != 1 {
 			s.writeError(w, requestID, &apiError{Code: "EDGE_ACCESS_DENIED", Message: "access denied", Status: http.StatusForbidden})
 			return
@@ -125,7 +129,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
 		}
 		defer cancel()
-		if strings.HasPrefix(r.URL.Path, "/v1/") && s.store.Ping(ctx) != nil {
+		if (strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/v2/")) && s.store.Ping(ctx) != nil {
 			s.writeError(w, requestID, &apiError{Code: "NOT_READY", Message: "required services are unavailable", Status: http.StatusServiceUnavailable})
 			return
 		}
@@ -163,7 +167,25 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 	if s.cfg.PushEnabled && s.push != nil {
 		vapidPublicKey = s.cfg.PushVAPIDPublicKey
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	var photoConfig map[string]any
+	if s.cfg.PhotoMetadataEnabled {
+		photoConfig = map[string]any{
+			"enabled":       true,
+			"storageMode":   "device",
+			"maxCount":      12,
+			"maxLocalBytes": 30 * 1024 * 1024,
+			"publicDisplay": false,
+		}
+	} else {
+		photoConfig = map[string]any{
+			"enabled":           s.cfg.PhotoEnabled && s.photos != nil,
+			"maxCount":          12,
+			"maxUploadBytes":    5 * 1024 * 1024,
+			"maxLongEdgePixels": 1920,
+			"publicDisplay":     false,
+		}
+	}
+	response := map[string]any{
 		"registrationOpen":    s.cfg.RegistrationOpen,
 		"livePresenceEnabled": false,
 		"consent": map[string]any{
@@ -171,32 +193,29 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 			"language": s.cfg.ConsentLanguage,
 			"body":     s.cfg.ConsentBody,
 		},
-		"livePresenceConsentVersion":  s.cfg.LiveConsentVersion,
-		"onSiteConsentVersion":        s.cfg.OnSiteConsentVersion,
-		"positionIntervalSeconds":     s.cfg.PositionIntervalSeconds,
-		"livePositionTtlSeconds":      int(s.cfg.LivePositionTTL.Seconds()),
-		"photoLocationRetentionHours": int(s.cfg.DataRetention.Hours()),
+		"livePresenceConsentVersion": s.cfg.LiveConsentVersion,
+		"onSiteConsentVersion":       s.cfg.OnSiteConsentVersion,
+		"positionIntervalSeconds":    s.cfg.PositionIntervalSeconds,
+		"livePositionTtlSeconds":     int(s.cfg.LivePositionTTL.Seconds()),
 		"spatial": map[string]string{
 			"coordinateVersion":  s.cfg.CoordinateVersion,
 			"campusGraphVersion": s.cfg.CampusGraphVersion,
 			"threeDMapVersion":   s.cfg.ThreeDMapVersion,
 		},
-		"photo": map[string]any{
-			"enabled":           s.cfg.PhotoEnabled && s.photos != nil,
-			"maxCount":          12,
-			"maxUploadBytes":    5 * 1024 * 1024,
-			"maxLongEdgePixels": 1920,
-			"publicDisplay":     false,
-		},
+		"photo": photoConfig,
 		"notification": map[string]any{
 			"enabled":                 s.cfg.PushEnabled && s.push != nil,
 			"defaultIntervalMinutes":  30,
-			"allowedIntervalsMinutes": []int{15, 30},
+			"allowedIntervalsMinutes": []int{30},
 			"exactDeliveryGuaranteed": false,
 			"vapidPublicKey":          vapidPublicKey,
 		},
 		"contact": s.cfg.Contact,
-	})
+	}
+	if !s.cfg.PhotoMetadataEnabled {
+		response["photoLocationRetentionHours"] = int(s.cfg.DataRetention.Hours())
+	}
+	s.writeJSON(w, http.StatusOK, response)
 }
 
 type createExperienceRequest struct {
@@ -247,6 +266,9 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		ConsentLanguage: input.ConsentLanguage, DisplayColor: color, DisplaySymbol: symbol,
 		CampusGraphVersion: s.cfg.CampusGraphVersion,
 		CreatedAt:          now, MemoryExpiresAt: memoryExpires, MemoryDeleteAfter: memoryDeleteAfter,
+	}
+	if s.cfg.PhotoMetadataEnabled {
+		value.PhotoMode = store.PhotoModeDevice
 	}
 	if err := s.store.CreateExperience(r.Context(), value); err != nil {
 		slog.Error("create experience", "requestId", requestID(r), "error", err)

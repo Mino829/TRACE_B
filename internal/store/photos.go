@@ -16,8 +16,17 @@ var (
 	ErrInvalidCheckpoint = errors.New("checkpoint is not a valid photo location")
 )
 
+const PhotoModeDevice = "device"
+
+func photoMode(mode string) string {
+	if mode == "" {
+		return "legacy"
+	}
+	return mode
+}
+
 type MemorySession struct {
-	ID, CampusGraphVersion            string
+	ID, CampusGraphVersion, PhotoMode string
 	CreatedAt, ExpiresAt, DeleteAfter time.Time
 	Deleting                          bool
 }
@@ -83,8 +92,8 @@ func scanPhoto(row photoScanner) (Photo, error) {
 
 func (s *Store) MemorySession(ctx context.Context, id string) (MemorySession, error) {
 	var m MemorySession
-	err := s.q.QueryRowContext(ctx, `SELECT id,created_at,expires_at,delete_after,deleting,COALESCE(campus_graph_version,'') FROM memory_sessions WHERE id=$1`, id).
-		Scan(&m.ID, &m.CreatedAt, &m.ExpiresAt, &m.DeleteAfter, &m.Deleting, &m.CampusGraphVersion)
+	err := s.q.QueryRowContext(ctx, `SELECT id,created_at,expires_at,delete_after,deleting,COALESCE(campus_graph_version,''),photo_mode FROM memory_sessions WHERE id=$1`, id).
+		Scan(&m.ID, &m.CreatedAt, &m.ExpiresAt, &m.DeleteAfter, &m.Deleting, &m.CampusGraphVersion, &m.PhotoMode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MemorySession{}, ErrNotFound
 	}
@@ -110,6 +119,9 @@ func (s *Store) CreatePhoto(ctx context.Context, p Photo, now time.Time) (Photo,
 		m, err := tx.activePhotoMemory(ctx, p.MemorySessionID, now)
 		if err != nil {
 			return err
+		}
+		if m.PhotoMode == PhotoModeDevice {
+			return ErrConflict
 		}
 		existing, err := scanPhoto(tx.q.QueryRowContext(ctx, "SELECT "+photoColumns+" FROM photos WHERE memory_session_id=$1 AND client_photo_id=$2", p.MemorySessionID, p.ClientPhotoID))
 		if err == nil {
@@ -371,6 +383,58 @@ func (s *Store) FinishPhotoDeletion(ctx context.Context, memoryID, photoID strin
 		}
 		return tx.reconcileRoutes(ctx, memoryID)
 	})
+}
+
+// QueueLegacyPendingPhotoUploads retires signed PUTs at the device-photo
+// cutover. Ready legacy photos stay readable; the existing object cleanup
+// outbox and upload fences handle pending stage keys after signed URL expiry.
+func (s *Store) QueueLegacyPendingPhotoUploads(ctx context.Context) error {
+	type pendingPhoto struct{ memoryID, photoID string }
+	pending := make([]pendingPhoto, 0, 100)
+	for {
+		rows, err := s.q.QueryContext(ctx, `SELECT p.memory_session_id,p.id FROM photos p
+ JOIN memory_sessions m ON m.id=p.memory_session_id
+ WHERE m.photo_mode='legacy' AND p.status='pending' ORDER BY p.memory_session_id,p.id LIMIT 100`)
+		if err != nil {
+			return err
+		}
+		pending = pending[:0]
+		for rows.Next() {
+			var p pendingPhoto
+			if err := rows.Scan(&p.memoryID, &p.photoID); err != nil {
+				rows.Close()
+				return err
+			}
+			pending = append(pending, p)
+		}
+		err = rows.Err()
+		if closeErr := rows.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return err
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		for _, p := range pending {
+			err := s.Transaction(ctx, p.memoryID, func(tx *Store) error {
+				var status string
+				err := tx.q.QueryRowContext(ctx, `SELECT p.status FROM photos p JOIN memory_sessions m ON m.id=p.memory_session_id
+ WHERE m.photo_mode='legacy' AND p.memory_session_id=$1 AND p.id=$2`, p.memoryID, p.photoID).Scan(&status)
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil
+				}
+				if err != nil || status != "pending" {
+					return err
+				}
+				return tx.QueuePhotoDeletion(ctx, p.memoryID, p.photoID, "deleted", "")
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (s *Store) enqueuePhotoFence(ctx context.Context, key string, notBefore time.Time) error {

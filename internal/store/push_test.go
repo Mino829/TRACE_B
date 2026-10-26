@@ -28,8 +28,8 @@ func TestPushLifecycleAndProviderResponses(t *testing.T) {
 	if err := f.Store.CreateExperience(t.Context(), v); err != nil {
 		t.Fatal(err)
 	}
-	p, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now)
-	if err != nil || !p.NextSendAt.Equal(now.Add(15*time.Minute)) || countPush(t, f) != 1 {
+	p, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now)
+	if err != nil || !p.NextSendAt.Equal(now.Add(30*time.Minute)) || countPush(t, f) != 1 {
 		t.Fatal("subscribe", err)
 	}
 	ids, err := f.Store.DuePushIDs(t.Context(), p.NextSendAt, 10)
@@ -51,39 +51,39 @@ func TestPushLifecycleAndProviderResponses(t *testing.T) {
 		t.Fatal("duplicate send", err)
 	}
 	paused := "paused"
-	p, err = f.Store.PatchPush(t.Context(), v.MemorySessionID, nil, &paused, now.Add(16*time.Minute))
+	p, err = f.Store.PatchPush(t.Context(), v.MemorySessionID, nil, &paused, now.Add(31*time.Minute))
 	if err != nil || p.Status != "paused" {
 		t.Fatal("pause", err)
 	}
-	ids, err = f.Store.DuePushIDs(t.Context(), now.Add(30*time.Minute), 10)
+	ids, err = f.Store.DuePushIDs(t.Context(), now.Add(45*time.Minute), 10)
 	if err != nil || len(ids) != 0 {
 		t.Fatal("paused job retained", err)
 	}
 	interval := 30
 	active := "active"
-	p, err = f.Store.PatchPush(t.Context(), v.MemorySessionID, &interval, &active, now.Add(17*time.Minute))
-	if err != nil || !p.NextSendAt.Equal(now.Add(47*time.Minute)) {
+	p, err = f.Store.PatchPush(t.Context(), v.MemorySessionID, &interval, &active, now.Add(32*time.Minute))
+	if err != nil || !p.NextSendAt.Equal(now.Add(62*time.Minute)) {
 		t.Fatal("resume", err)
 	}
 	// A photo-ready transition postpones only active subscriptions.
-	if err := f.Store.PostponePush(t.Context(), v.MemorySessionID, now.Add(20*time.Minute)); err != nil {
+	if err := f.Store.PostponePush(t.Context(), v.MemorySessionID, now.Add(35*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	ids, err = f.Store.DuePushIDs(t.Context(), now.Add(49*time.Minute), 10)
+	ids, err = f.Store.DuePushIDs(t.Context(), now.Add(64*time.Minute), 10)
 	if err != nil || len(ids) != 0 {
 		t.Fatal("photo did not postpone", err)
 	}
 	sendExpired := func(store.PushSubscription) (int, error) { sent++; return 410, nil }
-	if err := f.Store.DeliverPush(t.Context(), v.MemorySessionID, now.Add(50*time.Minute), sendExpired); err != nil || countPush(t, f) != 0 {
+	if err := f.Store.DeliverPush(t.Context(), v.MemorySessionID, now.Add(65*time.Minute), sendExpired); err != nil || countPush(t, f) != 0 {
 		t.Fatal("provider expired subscription not erased", err)
 	}
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now.Add(51*time.Minute)); err != nil {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now.Add(66*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Store.StopLive(t.Context(), v.LiveSessionID, "participant_request", now.Add(52*time.Minute)); err != nil || countPush(t, f) != 0 {
+	if err := f.Store.StopLive(t.Context(), v.LiveSessionID, "participant_request", now.Add(67*time.Minute)); err != nil || countPush(t, f) != 0 {
 		t.Fatal("stop retention", err)
 	}
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now.Add(53*time.Minute)); !errors.Is(err, store.ErrConflict) {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now.Add(68*time.Minute)); !errors.Is(err, store.ErrConflict) {
 		t.Fatal("stop resubscribed", err)
 	}
 }
@@ -107,7 +107,7 @@ func TestPushExpiryAndMemoryDeletion(t *testing.T) {
 	if err := f.Store.CreateExperience(t.Context(), other); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(other.MemorySessionID, 15), now); err != nil {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(other.MemorySessionID, 30), now); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Store.DeleteMemory(t.Context(), other.MemorySessionID); err != nil || countPush(t, f) != 0 {
@@ -119,7 +119,7 @@ func TestReadyPhotoPostponesOnceAndDeletionQueuesEraseKeys(t *testing.T) {
 	f := testdb.Open(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	v := fixtureExperience(t, f, now)
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now); err != nil {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now); err != nil {
 		t.Fatal(err)
 	}
 	photo := photoInput(v.MemorySessionID, "ready-push", now)
@@ -130,21 +130,21 @@ func TestReadyPhotoPostponesOnceAndDeletionQueuesEraseKeys(t *testing.T) {
 	if err := f.Store.ReadyPhoto(t.Context(), v.MemorySessionID, photo.ID, at); err != nil {
 		t.Fatal(err)
 	}
-	ids, err := f.Store.DuePushIDs(t.Context(), now.Add(19*time.Minute), 10)
+	ids, err := f.Store.DuePushIDs(t.Context(), now.Add(34*time.Minute), 10)
 	if err != nil || len(ids) != 0 {
 		t.Fatal("ready did not postpone", err)
 	}
 	if err := f.Store.ReadyPhoto(t.Context(), v.MemorySessionID, photo.ID, now.Add(6*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	ids, err = f.Store.DuePushIDs(t.Context(), now.Add(20*time.Minute), 10)
+	ids, err = f.Store.DuePushIDs(t.Context(), now.Add(35*time.Minute), 10)
 	if err != nil || len(ids) != 1 {
 		t.Fatal("ready replay reset schedule", err)
 	}
 	if err := f.Store.QueueMemoryPhotoDeletion(t.Context(), v.MemorySessionID); err != nil || countPush(t, f) != 0 {
 		t.Fatal("deleting memory retained keys", err)
 	}
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now.Add(7*time.Minute)); !errors.Is(err, store.ErrConflict) {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now.Add(7*time.Minute)); !errors.Is(err, store.ErrConflict) {
 		t.Fatal("deleting memory resubscribed", err)
 	}
 }
@@ -153,7 +153,7 @@ func TestArrivalHookAndNoResubscribe(t *testing.T) {
 	f := testdb.Open(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	v := fixtureExperience(t, f, now)
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now); err != nil {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE live_presence_sessions SET presence_phase='arrived' WHERE id=$1", v.LiveSessionID); err != nil {
@@ -167,7 +167,7 @@ func TestArrivalHookAndNoResubscribe(t *testing.T) {
 	if countPush(t, f) != 0 {
 		t.Fatal("arrival retained subscription")
 	}
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now.Add(time.Minute)); !errors.Is(err, store.ErrConflict) {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now.Add(time.Minute)); !errors.Is(err, store.ErrConflict) {
 		t.Fatal("arrival resubscribed", err)
 	}
 }
@@ -179,7 +179,7 @@ func TestMemoryOnlyArrivalBlocksResubscribe(t *testing.T) {
 	if err := f.Store.CreateExperience(t.Context(), v); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now); err != nil {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Store.Transaction(t.Context(), v.MemorySessionID, func(tx *store.Store) error {
@@ -187,7 +187,7 @@ func TestMemoryOnlyArrivalBlocksResubscribe(t *testing.T) {
 	}); err != nil || countPush(t, f) != 0 {
 		t.Fatal("memory-only arrival retained subscription", err)
 	}
-	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now.Add(time.Minute)); !errors.Is(err, store.ErrConflict) {
+	if _, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now.Add(time.Minute)); !errors.Is(err, store.ErrConflict) {
 		t.Fatal("memory-only arrival resubscribed", err)
 	}
 }
@@ -196,7 +196,10 @@ func TestStopWaitsForInflightPushAndFencesFutureSends(t *testing.T) {
 	f := testdb.Open(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	v := fixtureExperience(t, f, now)
-	p, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now)
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE live_presence_sessions SET expires_at=$2 WHERE id=$1`, v.LiveSessionID, now.Add(50*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	p, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +239,10 @@ func TestPushRetriesAndUnsubscribePreventsDelivery(t *testing.T) {
 	f := testdb.Open(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	v := fixtureExperience(t, f, now)
-	p, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 15), now)
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE live_presence_sessions SET expires_at=$2 WHERE id=$1`, v.LiveSessionID, now.Add(50*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	p, err := f.Store.PutPush(t.Context(), pushFixture(v.MemorySessionID, 30), now)
 	if err != nil {
 		t.Fatal(err)
 	}

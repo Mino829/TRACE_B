@@ -5,7 +5,9 @@ GRANT CONNECT ON DATABASE trace TO trace_app;
 GRANT USAGE ON SCHEMA public TO trace_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   memory_sessions, live_presence_sessions, experiences,
-  experience_links, idempotency_records, photos, photo_upload_fences, push_subscriptions, route_segments,
+  experience_links, idempotency_records, photos, photo_upload_fences,
+  photo_moments, photo_moment_fences, moment_route_segments,
+  push_subscriptions, route_segments,
   arrival_events, arrival_receipts, arrival_operator_audit,
   display_events, display_cursor, display_primary_lease, display_renderer_receipts TO trace_app;
 GRANT SELECT ON schema_migrations TO trace_app;
