@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	ArrivalQueueLimit   = 32
-	ArrivalQueueTimeout = 2 * time.Minute
+	ArrivalQueueLimit   = 10
+	ArrivalQueueTimeout = 30 * time.Second
 	ArrivalPhotoWait    = 15 * time.Second
 )
 
