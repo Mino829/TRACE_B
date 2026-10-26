@@ -21,8 +21,11 @@ import (
 
 	"github.com/Mino829/trace_Backend/internal/api"
 	"github.com/Mino829/trace_Backend/internal/config"
+	"math"
+
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/photoasset"
+	"github.com/Mino829/trace_Backend/internal/route"
 	"github.com/Mino829/trace_Backend/internal/store"
 	"github.com/Mino829/trace_Backend/internal/testdb"
 )
@@ -170,10 +173,37 @@ type photoUploadResponse struct {
 	Expires time.Time         `json:"uploadExpiresAt"`
 }
 
-func registerPhoto(t *testing.T, h http.Handler, c createdExperience, data []byte, clientID string) (photoUploadResponse, string) {
+// photoGraphFixture pins a small graph with two checkpoints so checkpoint
+// validation and route generation run against deterministic data.
+func photoGraphFixture(t *testing.T, f *testdb.Fixture, cfg *config.Config) {
+	t.Helper()
+	lonStep := 20 / (6378137 * math.Cos(35*math.Pi/180) * math.Pi / 180)
+	raw := fmt.Sprintf(`{"schemaVersion":1,"campusGraphVersion":"g1","coordinateVersion":"c1","threeDMapVersion":"m1","nodes":[`+
+		`{"id":"cp-a","lat":35,"lon":139,"local":{"east":0,"north":0},"gpsSnap":true,"role":"checkpoint"},`+
+		`{"id":"mid","lat":35,"lon":%.9f,"local":{"east":20,"north":0},"gpsSnap":true},`+
+		`{"id":"cp-b","lat":35,"lon":%.9f,"local":{"east":40,"north":0},"gpsSnap":true,"role":"checkpoint"}],`+
+		`"edges":[{"id":"am","from":"cp-a","to":"mid","kind":"ground","lengthMetres":20,"passable":true},`+
+		`{"id":"mb","from":"mid","to":"cp-b","kind":"ground","lengthMetres":20,"passable":true}]}`, 139+lonStep, 139+2*lonStep)
+	g, err := route.Parse([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion = "c1", "g1", "m1"
+	if err := f.Store.ConfigureRoutes(g, cfg.CoordinateVersion, cfg.CampusGraphVersion, cfg.ThreeDMapVersion); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func photoRegistrationBody(t *testing.T, data []byte, clientID, checkpointID string) string {
 	t.Helper()
 	digest := sha256.Sum256(data)
-	body := fmt.Sprintf(`{"clientPhotoId":%q,"capturedAt":%q,"mimeType":"image/jpeg","sizeBytes":%d,"width":16,"height":12,"sha256":%q}`, clientID, time.Now().UTC().Format(time.RFC3339Nano), len(data), hex.EncodeToString(digest[:]))
+	return fmt.Sprintf(`{"clientPhotoId":%q,"capturedAt":%q,"checkpointId":%q,"mimeType":"image/jpeg","sizeBytes":%d,"width":16,"height":12,"sha256":%q}`,
+		clientID, time.Now().UTC().Format(time.RFC3339Nano), checkpointID, len(data), hex.EncodeToString(digest[:]))
+}
+
+func registerPhoto(t *testing.T, h http.Handler, c createdExperience, data []byte, clientID string) (photoUploadResponse, string) {
+	t.Helper()
+	body := photoRegistrationBody(t, data, clientID, "cp-a")
 	r := request(t, h, "POST", "/v1/memory-sessions/"+c.Memory.SessionID+"/photos", body, map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken, "Idempotency-Key": "register-" + clientID})
 	if r.Code != 201 {
 		t.Fatalf("register: %d %s", r.Code, r.Body.String())
@@ -219,6 +249,7 @@ func TestPhotoRegistrationRejectsLocationWithoutCreatingPhoto(t *testing.T) {
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
 	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
 	data := photoJPEG(t)
@@ -240,13 +271,13 @@ func TestPhotoRegistrationRejectsLocationWithoutCreatingPhoto(t *testing.T) {
 			t.Fatalf("GPS metadata created a photo: %+v %v", photos, err)
 		}
 	}
-	withNull := strings.TrimSuffix(body, "}") + `,"location":null}`
+	withNull := strings.TrimSuffix(photoRegistrationBody(t, data, "null-location", "cp-a"), "}") + `,"location":null}`
 	r := request(t, h, "POST", path, withNull, headers)
 	if r.Code != http.StatusCreated {
-		t.Fatalf("null location failed or rejection consumed idempotency key: %d %s", r.Code, r.Body.String())
+		t.Fatalf("explicit null location must stay accepted: %d %s", r.Code, r.Body.String())
 	}
 	photos, err := f.Store.Photos(t.Context(), c.Memory.SessionID)
-	if err != nil || len(photos) != 1 || photos[0].Location != nil {
+	if err != nil || len(photos) != 1 || photos[0].Location != nil || photos[0].CheckpointID != "cp-a" {
 		t.Fatalf("null location stored unexpected coordinates: %+v %v", photos, err)
 	}
 	if p, _ := registerPhoto(t, h, c, data, "omitted-location"); p.ID == "" {
@@ -260,6 +291,7 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
 	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
 	other := createExperience(t, h, cfg)
@@ -366,6 +398,7 @@ func TestFailedPhotoValidationRetainsDeletionIntentUntilErasure(t *testing.T) {
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
 	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
 	service := photo.New(f.Store, assets)
 	h := api.New(cfg, f.Store, service)
 	c := createExperience(t, h, cfg)
@@ -408,6 +441,7 @@ func TestMemoryAndExperienceDeletionRetryPhotoErasure(t *testing.T) {
 			cfg := config.Default()
 			cfg.PhotoEnabled = true
 			cfg.RegistrationOpen = true
+			photoGraphFixture(t, f, &cfg)
 			h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 			var c createdExperience
 			if combined {
@@ -452,6 +486,7 @@ func TestExpiredMemoryErasesPhotosBeforeLosingCleanupKnowledge(t *testing.T) {
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
 	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
 	service := photo.New(f.Store, assets)
 	h := api.New(cfg, f.Store, service)
 	c := createExperience(t, h, cfg)
@@ -498,6 +533,7 @@ func TestPhotoCompleteRecoversAfterReadyCommitFailure(t *testing.T) {
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
 	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
 	data := photoJPEG(t)
@@ -536,6 +572,7 @@ func TestPhotoMetadataLimitDoesNotBlockControlRequests(t *testing.T) {
 	cfg := config.Default()
 	cfg.PhotoEnabled = true
 	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
 	var body string
@@ -555,5 +592,119 @@ func TestPhotoMetadataLimitDoesNotBlockControlRequests(t *testing.T) {
 	}
 	if err := json.Unmarshal(state.Body.Bytes(), &result); err != nil || state.Code != 200 || result.Summary.Pending != 6 {
 		t.Fatalf("metadata burst blocked control or miscounted photos: %d %s", state.Code, state.Body.String())
+	}
+}
+
+func photoInputFor(memoryID, id string) store.Photo {
+	return store.Photo{ID: id, MemorySessionID: memoryID, ClientPhotoID: "client-" + id, RequestHash: "request-" + id,
+		CapturedAt: time.Now().UTC(), UploadExpiresAt: time.Now().UTC().Add(5 * time.Minute), MIMEType: "image/jpeg", SHA256: "legacy-digest",
+		SizeBytes: 1024, Width: 640, Height: 480, StageKey: "stage-" + id, ObjectKey: "object-" + id}
+}
+
+func TestPhotoRegistrationRequiresCheckpoint(t *testing.T) {
+	f := testdb.Open(t)
+	assets := newPhotoObjects(t)
+	cfg := config.Default()
+	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
+	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
+	c := createExperience(t, h, cfg)
+	data := photoJPEG(t)
+	path := "/v1/memory-sessions/" + c.Memory.SessionID + "/photos"
+	headers := map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken, "Idempotency-Key": "checkpoint-missing"}
+
+	r := request(t, h, "POST", path, photoRegistrationBody(t, data, "no-checkpoint", ""), headers)
+	if r.Code != http.StatusBadRequest || strings.Contains(r.Body.String(), `"code":"INVALID_CHECKPOINT"`) == false {
+		t.Fatalf("missing checkpoint must be rejected with INVALID_CHECKPOINT: %d %s", r.Code, r.Body.String())
+	}
+	// An unknown ID fails closed even when it is a checkpoint of another mapping.
+	r = request(t, h, "POST", path, photoRegistrationBody(t, data, "unknown-checkpoint", "classroom-entrance"), headers)
+	if r.Code != http.StatusBadRequest || strings.Contains(r.Body.String(), `"code":"INVALID_CHECKPOINT"`) == false {
+		t.Fatalf("unknown checkpoint must be rejected: %d %s", r.Code, r.Body.String())
+	}
+	if photos, err := f.Store.Photos(t.Context(), c.Memory.SessionID); err != nil || len(photos) != 0 {
+		t.Fatalf("invalid checkpoint created a photo: %+v %v", photos, err)
+	}
+	// A rejected creation must not consume the idempotency key for the next attempt.
+	reused := map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "checkpoint-retry"}
+	r = request(t, h, "POST", path, photoRegistrationBody(t, data, "retry", ""), reused)
+	if r.Code != 400 || !strings.Contains(r.Body.String(), `"code":"INVALID_CHECKPOINT"`) {
+		t.Fatalf("retry without checkpoint: %d %s", r.Code, r.Body.String())
+	}
+	r = request(t, h, "POST", path, photoRegistrationBody(t, data, "retry", "cp-a"), reused)
+	if r.Code != http.StatusCreated {
+		t.Fatalf("valid checkpoint after rejected attempt: %d %s", r.Code, r.Body.String())
+	}
+	photos, err := f.Store.Photos(t.Context(), c.Memory.SessionID)
+	if err != nil || len(photos) != 1 || photos[0].CheckpointID != "cp-a" || photos[0].CampusGraphVersion != "g1" || photos[0].Location != nil {
+		t.Fatalf("checkpoint photo not stored: %+v %v", photos, err)
+	}
+}
+
+func TestPhotoMemoryReturnsCheckpointAndArrivalSegment(t *testing.T) {
+	f := testdb.Open(t)
+	assets := newPhotoObjects(t)
+	cfg := config.Default()
+	cfg.PhotoEnabled = true
+	cfg.RegistrationOpen = true
+	photoGraphFixture(t, f, &cfg)
+	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
+	c := createExperience(t, h, cfg)
+	// A photo registered before checkpoint registration existed keeps null.
+	legacy := photoInputFor(c.Memory.SessionID, "legacy")
+	legacy.Location = &store.PhotoLocation{Latitude: 35, Longitude: 139, AccuracyM: 4, RecordedAt: time.Now().UTC()}
+	if _, err := f.Store.CreatePhoto(t.Context(), legacy, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Store.ReadyPhoto(t.Context(), c.Memory.SessionID, legacy.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	readyPhoto(t, h, c, photoJPEG(t), "checkpoint-photo")
+	r := request(t, h, "GET", "/v1/memory-sessions/"+c.Memory.SessionID+"/memory", "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
+	if r.Code != 200 {
+		t.Fatalf("memory response: %d %s", r.Code, r.Body.String())
+	}
+	var body struct {
+		Moments []struct {
+			PhotoMomentID string  `json:"photoMomentId"`
+			CheckpointID  *string `json:"checkpointId"`
+		} `json:"moments"`
+		Segments []store.RouteSegment `json:"segments"`
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Moments) != 2 || body.Moments[0].CheckpointID != nil ||
+		body.Moments[1].CheckpointID == nil || *body.Moments[1].CheckpointID != "cp-a" {
+		t.Fatalf("checkpoint exposure: %+v", body.Moments)
+	}
+	// One photo pair plus one arrival segment; drivers stay versioned.
+	var arrivedAt = time.Now().UTC()
+	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
+ (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until,replay_deadline)
+ VALUES ('arr',$1,'qr','cp-b','skipped','operator',$2,$2,$3)`, c.Memory.SessionID, arrivedAt, arrivedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	r = request(t, h, "GET", "/v1/memory-sessions/"+c.Memory.SessionID+"/memory", "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
+	if r.Code != 200 {
+		t.Fatalf("memory after arrival: %d %s", r.Code, r.Body.String())
+	}
+	body = struct {
+		Moments []struct {
+			PhotoMomentID string  `json:"photoMomentId"`
+			CheckpointID  *string `json:"checkpointId"`
+		} `json:"moments"`
+		Segments []store.RouteSegment `json:"segments"`
+	}{}
+	if err := json.Unmarshal(r.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Segments) != 2 {
+		t.Fatalf("arrival must add a segment: %s", r.Body.String())
+	}
+	arrival := body.Segments[1]
+	if arrival.ToPhotoMomentID != nil || arrival.AlgorithmVersion != route.CheckpointAlgorithmVersion || arrival.Confidence != "high" {
+		t.Fatalf("arrival segment: %+v", arrival)
 	}
 }

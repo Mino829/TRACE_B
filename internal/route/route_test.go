@@ -165,3 +165,64 @@ func TestGenerationP95(t *testing.T) {
 	sort.Slice(timings, func(i, j int) bool { return timings[i] < timings[j] })
 	t.Logf("route generation p95 (%d samples, real graph): %s", len(timings), timings[94])
 }
+
+func TestEmbeddedGraphResolvesCheckpointsOnly(t *testing.T) {
+	g, err := Embedded()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var known, waypoint int
+	for _, n := range g.Nodes {
+		if index, ok := g.CheckpointNode(n.ID); ok {
+			if index < 0 || index >= len(g.Nodes) {
+				t.Fatalf("checkpoint %q resolved to a non-node", n.ID)
+			}
+			known++
+		} else if n.Role != "checkpoint" {
+			waypoint++
+		}
+	}
+	if known == 0 || waypoint == 0 {
+		t.Fatalf("graph lost checkpoint roles: %d checkpoints, %d others", known, waypoint)
+	}
+	if _, ok := g.CheckpointNode("definitely-missing"); ok {
+		t.Fatal("unknown checkpoint accepted")
+	}
+}
+
+func TestConnectResolvesCheckpointPairs(t *testing.T) {
+	g := smallGraph(t, func(g *Graph) {
+		g.Nodes[0].Role = "checkpoint"
+		g.Nodes[2].Role = "checkpoint"
+	})
+	a, c := "a", "c"
+	if _, ok := g.CheckpointNode(a); !ok {
+		t.Fatal("checkpoint role lost after parse")
+	}
+	now := time.Now()
+	result := g.Connect(&Endpoint{Checkpoint: "a", CapturedAt: now}, &Endpoint{Checkpoint: c, CapturedAt: now.Add(time.Minute)})
+	if result.Confidence != "high" || len(result.Path) != 3 || result.LengthM != 40 {
+		t.Fatalf("straight pair: %+v", result)
+	}
+	if result.Path[0].T != 0 || result.Path[2].T != 1 || result.Path[1].T != 0.5 {
+		t.Fatalf("parametrisation broken: %+v", result.Path)
+	}
+	same := g.Connect(&Endpoint{Checkpoint: "a", CapturedAt: now}, &Endpoint{Checkpoint: "a", CapturedAt: now})
+	if same.Confidence != "high" || len(same.Path) != 2 || same.LengthM != 0 {
+		t.Fatalf("identical checkpoints: %+v", same)
+	}
+	// A mixed pair resolves the GPS anchor onto edges reachable from the node.
+	mixed := g.Connect(&Endpoint{Checkpoint: "a", CapturedAt: now},
+		&Endpoint{Anchor: anchorOn(g, g.Edges[1], 0.5, 1, now.Add(time.Minute)), CapturedAt: now.Add(time.Minute)})
+	if mixed.Confidence != "high" || len(mixed.Path) < 3 {
+		t.Fatalf("mixed pair: %+v", mixed)
+	}
+	missing := g.Connect(&Endpoint{Checkpoint: "definitely-missing", CapturedAt: now}, &Endpoint{Checkpoint: "a", CapturedAt: now})
+	if missing.Confidence != "low" || len(missing.Path) != 0 {
+		t.Fatalf("unroutable pair accepted: %+v", missing)
+	}
+	reversed := g.Connect(&Endpoint{Checkpoint: a, CapturedAt: now.Add(time.Minute)}, &Endpoint{Checkpoint: "c", CapturedAt: now})
+	if reversed.Confidence != "low" || len(reversed.Path) != 0 {
+		t.Fatalf("reversed capture order accepted: %+v", reversed)
+	}
+}

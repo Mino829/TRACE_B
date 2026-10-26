@@ -25,6 +25,13 @@ type ReplayCandidate struct {
 	ReadyPhotoCount int    `json:"readyPhotoCount"`
 }
 
+// ArrivalConfirmed reports whether the memory has a durable arrival event.
+func (s *Store) ArrivalConfirmed(ctx context.Context, memoryID string) (bool, error) {
+	var confirmed bool
+	err := s.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM arrival_events WHERE memory_session_id=$1)`, memoryID).Scan(&confirmed)
+	return confirmed, err
+}
+
 func (s *Store) arrivalForMemory(ctx context.Context, memoryID string) (Arrival, error) {
 	var a Arrival
 	var skip sql.NullString
@@ -116,6 +123,12 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
  VALUES ($1,$2,'qr',$3,$4,$5,$6,$7,$8,$9)`, a.ID, memoryID, checkpointID, a.Status, reason, now,
 					a.PhotoWaitUntil, a.ReplayDeadline, finished)
 				if err != nil {
+					return err
+				}
+				// The arrival is durable; its checkpoint may now extend the route
+				// from the session's newest photo. Photos absent or unresolvable
+				// simply produce no additional segment.
+				if err := tx.reconcileRoutes(ctx, memoryID); err != nil {
 					return err
 				}
 				alias, err := tx.arrivalDisplayAlias(ctx, memoryID)

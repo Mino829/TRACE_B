@@ -10,9 +10,10 @@ import (
 )
 
 var (
-	ErrPhotoLimit   = errors.New("photo limit reached")
-	ErrUploadLimit  = errors.New("upload attempt limit reached")
-	ErrPhotoPending = errors.New("photo deletion pending")
+	ErrPhotoLimit        = errors.New("photo limit reached")
+	ErrUploadLimit       = errors.New("upload attempt limit reached")
+	ErrPhotoPending      = errors.New("photo deletion pending")
+	ErrInvalidCheckpoint = errors.New("checkpoint is not a valid photo location")
 )
 
 type MemorySession struct {
@@ -31,6 +32,7 @@ type Photo struct {
 	CapturedAt, CreatedAt, DeleteAfter, UploadExpiresAt time.Time
 	Location                                            *PhotoLocation
 	MIMEType, SHA256, Status, StageKey, ObjectKey       string
+	CheckpointID, CampusGraphVersion                    string
 	SizeBytes                                           int64
 	Width, Height, SequenceNo, UploadAttempts           int
 	FailureCode, DeleteTarget                           string
@@ -49,7 +51,8 @@ const photoColumns = `id,memory_session_id,client_photo_id,request_hash,
  captured_at,created_at,delete_after,upload_expires_at,
  latitude,longitude,accuracy_m,location_recorded_at,
  mime_type,sha256,size_bytes,width,height,sequence_no,upload_attempts,
- status,COALESCE(stage_key,''),COALESCE(object_key,''),failure_code,delete_target`
+ status,COALESCE(stage_key,''),COALESCE(object_key,''),failure_code,delete_target,
+ COALESCE(checkpoint_id,''),COALESCE(campus_graph_version,'')`
 
 type photoScanner interface {
 	Scan(...any) error
@@ -63,7 +66,8 @@ func scanPhoto(row photoScanner) (Photo, error) {
 		&p.CapturedAt, &p.CreatedAt, &p.DeleteAfter, &p.UploadExpiresAt,
 		&latitude, &longitude, &accuracy, &recorded,
 		&p.MIMEType, &p.SHA256, &p.SizeBytes, &p.Width, &p.Height, &p.SequenceNo, &p.UploadAttempts,
-		&p.Status, &p.StageKey, &p.ObjectKey, &p.FailureCode, &p.DeleteTarget)
+		&p.Status, &p.StageKey, &p.ObjectKey, &p.FailureCode, &p.DeleteTarget,
+		&p.CheckpointID, &p.CampusGraphVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Photo{}, ErrNotFound
 	}
@@ -131,6 +135,20 @@ func (s *Store) CreatePhoto(ctx context.Context, p Photo, now time.Time) (Photo,
 		}
 		p.CreatedAt, p.DeleteAfter = now, m.DeleteAfter
 		p.Status, p.UploadAttempts, p.FailureCode, p.DeleteTarget = "pending", 1, "", ""
+		// Location sources never mix: legacy photos keep their GPS columns and
+		// the checkpoint columns, new photos carry a checkpoint only.
+		if p.Location != nil && p.CheckpointID != "" {
+			return ErrConflict
+		}
+		if p.CheckpointID != "" {
+			if tx.routes == nil {
+				return ErrConflict
+			}
+			if _, ok := tx.routes.CheckpointNode(p.CheckpointID); !ok {
+				return ErrInvalidCheckpoint
+			}
+			p.CampusGraphVersion = tx.routes.CampusGraphVersion
+		}
 		if err := tx.q.QueryRowContext(ctx, `UPDATE memory_sessions SET photo_sequence=GREATEST(photo_sequence,
  (SELECT COALESCE(MAX(sequence_no),0) FROM photos WHERE memory_session_id=$1))+1 WHERE id=$1 RETURNING photo_sequence`, p.MemorySessionID).Scan(&p.SequenceNo); err != nil {
 			return err
@@ -139,15 +157,22 @@ func (s *Store) CreatePhoto(ctx context.Context, p Photo, now time.Time) (Photo,
 		if p.Location != nil {
 			latitude, longitude, accuracy, recorded = p.Location.Latitude, p.Location.Longitude, p.Location.AccuracyM, p.Location.RecordedAt
 		}
+		// Legacy photos and legacy sessions keep NULL columns for the checkpoint.
+		var checkpoint, campusVersion any
+		if p.CheckpointID != "" {
+			checkpoint = p.CheckpointID
+			campusVersion = p.CampusGraphVersion
+		}
 		digest := sha256.Sum256([]byte(p.ID))
 		insert, err := tx.q.ExecContext(ctx, `INSERT INTO photos
  (id,id_hash,memory_session_id,client_photo_id,request_hash,captured_at,created_at,delete_after,upload_expires_at,
  latitude,longitude,accuracy_m,location_recorded_at,mime_type,sha256,size_bytes,width,height,
- sequence_no,upload_attempts,status,stage_key,object_key)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,1,'pending',$20,$21)
+ sequence_no,upload_attempts,status,stage_key,object_key,checkpoint_id,campus_graph_version)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,1,'pending',$20,$21,$22,$23)
  ON CONFLICT DO NOTHING`, p.ID, hex.EncodeToString(digest[:]), p.MemorySessionID, p.ClientPhotoID, p.RequestHash,
 			p.CapturedAt, p.CreatedAt, p.DeleteAfter, p.UploadExpiresAt, latitude, longitude, accuracy, recorded,
-			p.MIMEType, p.SHA256, p.SizeBytes, p.Width, p.Height, p.SequenceNo, p.StageKey, p.ObjectKey)
+			p.MIMEType, p.SHA256, p.SizeBytes, p.Width, p.Height, p.SequenceNo, p.StageKey, p.ObjectKey,
+			checkpoint, campusVersion)
 		if err != nil {
 			return err
 		}
