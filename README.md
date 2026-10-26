@@ -13,11 +13,13 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 
 `TRACE_REGISTRATION_OPEN=false`が既定です。参加受付を再開する前に、設計Issue #23のGPSなし要件・Backend #25の自己申告写真地点契約・設計Issue #9の同意文と保持期間を承認し、**旧版とは別の**Memory同意版と承認済み文面を設定してください。既定の同意文と版は未承認の開発用草案であり、公開してはいけません。Frontendの新規受付も承認待ちです。
 
-新規作成はMemorySessionのみ可能です。`enableLivePresence:true`は`409 LIVE_PRESENCE_DISABLED`、既存LiveSessionの`POST .../position`は本人認証後に`410 POSITION_DISABLED`、`POST .../on-site`の`continue:true`は`410 ON_SITE_DISABLED`を返します。旧Liveの`continue:false`・`/stop`・状態確認・個別削除・両トークンでの体験削除は引き続き本人の`deleteAfter`まで有効です。写真登録のGPS `location`は`400 PHOTO_LOCATION_DISABLED`で拒否し、地点の新契約が決まるまで新しい写真の地点を推定しません。到着QRはMemoryのみ・写真0枚でも使え、停止と期限清掃も継続します。
+新規作成はMemorySessionのみ可能です。`enableLivePresence:true`は`409 LIVE_PRESENCE_DISABLED`、既存LiveSessionの`POST .../position`は本人認証後に`410 POSITION_DISABLED`、`POST .../on-site`の`continue:true`は`410 ON_SITE_DISABLED`を返します。旧Liveの`continue:false`・`/stop`・状態確認・個別削除・両トークンでの体験削除は引き続き本人の`deleteAfter`まで有効です。写真登録のGPS `location`は`400 PHOTO_LOCATION_DISABLED`で拒否し、新しい写真は参加者が撮影時に選んだCampusGraph上のチェックポイントID（`checkpointId`）を必須で受け取る。GPS列は送らず、不正・欠落・既知だが同梱Graphに存在しないIDは`400 INVALID_CHECKPOINT`を返す。保存時に本人memoryの各`moments`へ`checkpointId`を返し、旧GPS写真はnullを返す。到着QRはMemoryのみ・写真0枚でも使え、停止と期限清掃も継続します。
+
+新規MemorySessionには受付時のCampusGraph版を固定し、作成レスポンスの`memorySession.campusGraphVersion`で返します。写真登録時に現行版と一致しなければ`409 STATE_CONFLICT`で拒否します。旧Sessionには版がないため新しいチェックポイント写真を追加できませんが、既存写真の閲覧・削除は継続します。写真の保存版が現行Graphと違う場合、同じチェックポイントIDが残っていても新しい座標へ読み替えず、その区間を解決不能として扱います。
 
 旧GPS写真と旧LiveSessionは前倒し消去しません。既存写真の本人閲覧・削除、本人資格情報による状態確認と削除の冪等性記録、期限清掃を保持し、写真位置列・旧描画イベントの読み取り契約は旧データの期限が切れるまで残します。旧位置の最新表示は新たな更新なしでTTL内に失効します。既存データに新同意版を上書きしません。GPSを含む旧写真登録の再送は受付停止し、既に登録済みの写真のURL再発行・完了と本人削除は維持します。旧Memory同意版`2026-memory-01`を設定したままでは起動を拒否するため、**旧revisionを停止した移行窓で**新同意版と審査済み文面を設定します。旧版へのロールバックはGPS書込みを復活させるため行わず、問題があれば受付を閉じて修正版で復旧します。Cloud Runの旧revisionを止め、新旧revisionの並走を避けてから切り替えてください。DB migrationは不要ですが、既存の環境変数の更新とstagingでの確認が必要です。
 
-`/v1/public/config`の旧位置送信間隔・TTL・写真GPS保持時間は互換性のため残すだけで、新しいGPS受付を意味しません。`livePresenceEnabled:false`が新規Live受付状態です。旧写真のGPS由来ルートは閲覧・削除のため維持しますが、新規写真は地点契約 #25 の実装まで地点不明のルートとなります。設計/同意審査とstaging結合検証が済むまで一般公開しないでください。
+`/v1/public/config`の旧位置送信間隔・TTL・写真GPS保持時間は互換性のため残すだけで、新しいGPS受付を意味しません。`livePresenceEnabled:false`が新規Live受付状態です。旧写真のGPS由来ルートは閲覧・削除のため維持します。新規写真は`checkpoint-dijkstra-1`でチェックポイント間の最短経路を作り、本人memoryの`segments`に`pathNodeIds`と表示用の`path`を返します。旧GPS区間は`photo-edges-dijkstra-1`を維持します。設計/同意審査とstaging結合検証が済むまで一般公開しないでください。
 
 ## 実装範囲
 
@@ -63,7 +65,7 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | POST | /v1/operator/arrivals/{arrivalId}/retry |
 | GET (WSS) | /v1/display/ws |
 
-到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定しますが、新規写真はGPS地点を受け付けません。写真ピン・フォトスポット描画イベントと画像/経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
+到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定しますが、新規写真は`checkpointId`で自己申告したチェックポイントを地点とする。写真ピン・フォトスポット描画イベントと画像/経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
 写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -109,7 +111,7 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 有効なExperienceLinkを持つ旧MemorySessionでは当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。位置書込みと`on_site`継続は廃止済みで、旧Liveでも明示的な停止・本人削除はできます。新規MemorySessionはLiveとのlinkなしで写真0枚でも到着できます。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。到着は写真機能無効でも有効、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOは最大32件、満杯でも到着自体を記録して`skipped`（`queue_full`）とし、開始されず2分経った候補も`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`は未再生の演出をスキップします。
 
-運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。`POST /v1/operator/arrivals/{arrivalId}/retry`は描画機障害によるskipに限り、同じ運営署名で明示的に再キュー投入します。本人GETにキュー順は出しません。演出の状態変更は主描画機leaseを確認したWSSだけが行い、運営候補照会では`playing`へ移りません。適用DBは`004_route_segments.sql`、`005_push_subscriptions.sql`、`006_arrivals.sql`、`007_display.sql`の順です。展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。旧Live/位置APIの移行方針は冒頭のBackend #26を参照してください。
+運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。`POST /v1/operator/arrivals/{arrivalId}/retry`は描画機障害によるskipに限り、同じ運営署名で明示的に再キュー投入します。本人GETにキュー順は出しません。演出の状態変更は主描画機leaseを確認したWSSだけが行い、運営候補照会では`playing`へ移りません。適用DBは`004_route_segments.sql`〜`008_photo_checkpoints.sql`の順です。展開前に受付停止・API旧revision停止・明示migration・実行ユーザーへの権限再適用が必要です。旧Live/位置APIの移行方針は冒頭のBackend #26を参照してください。
 
 ## 描画WebSocket（既定無効）
 
@@ -138,21 +140,22 @@ WebPはVP8Lの過大割り当てを修正した公式`x/image v0.47.0`を使い�
 
 アップロードURLは最大5分（Memoryの`expiresAt`以下）の新規作成専用PUTです。返却する`uploadHeaders`の`Content-Type`、`x-goog-if-generation-match: 0`、`Cache-Control`を送信し、`Content-Length`はブラウザがBlobサイズから自動設定します。上書き・読み取り・一覧には使えません。`complete`はbodyなしで何度送っても同じ写真の状態へ収束します。未アップロードは409、不正画像は消去後`failed`となり、消去に失敗した間は`deleting`で新しいURLを発行しません。
 
-本人memoryは検証済み`ready`だけを撮影時刻順に返し、画像URLは5分と`deleteAfter`の早い方までです。`locationConfidence`は新規GPSなし写真でlow、旧写真の精度100m超でlow、30m超〜100mでmedium、30m以下でhighとする暫定値で、経路の信頼度ではありません。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
+本人memoryは検証済み`ready`だけを撮影時刻順に返し、画像URLは5分と`deleteAfter`の早い方までです。`moments`の各要素へ`checkpointId`（参加者が選んだチェックポイント、旧GPS写真はnull）を返し、写真一覧でも同じ地点を返します。`locationConfidence`は旧GPS写真だけに返す互換項目で、精度100m超はlow、30m超〜100mはmedium、30m以下はhighです。経路の信頼度ではありません。
+
+経路生成は写真を撮影時刻順に並べ、隣接するready写真の対についてCampusGraph上で接続する。両端ともチェックポイント（または混合でGPSアンカー+チェックポイントノード解決）ならノード間/最短経路で区間を作成し、`algorithmVersion`を`checkpoint-dijkstra-1`とする。両端とも旧GPS由来なら従来のスナップ推定（`photo-edges-dijkstra-1`）を維持する。ノード解決不能（旧GPSの精度不足・経路不在など）は`confidence:low, path:[]`で記録し、撮影順は変更しない。到着イベント確定のトランザクション内で、セッションにready写真が残る場合のみ、最後の写真から到着チェックポイントへの区間を同じ方式で追加する（写真0枚の到着では区間を作らない、写真削除時も再計算で整合を保つ）。到着区間の`toPhotoMomentId`はnullになる。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
 写真が`ready`になると、撮影時刻順の隣り合う写真ごとに`RouteSegment`を同一DBトランザクションで作成します。個別削除要求では`deleting`になった写真をただちに除外して残る前後の写真間を再計算し、画像消去完了・失敗時にも整合させます。写真0枚・1枚なら区間は空のままで到着/終了を妨げません。既存写真を保持するDBへ移行したときは本人memory取得時に欠損区間を再計算します。
-到着QRの確定情報は現時点ではブースcheckpointIdのみです。承認済みの会場checkpoint→CampusGraph座標の対応がないため、最後の写真から到着地点への区間は捏造しません。この依存が解決するまでは写真間の経路のみを提供します。
 
 CampusGraphは`internal/route/campus_graph.json`へ固定同梱します（TRACE_F main、2026-10-23取得、JSON記載版`toyosu-graph-2026-10-21.1.draft`）。Graph付属READMEの記述版`toyosu-graph-2026-10-18.2.draft`とは異なるため、JSON自身の版を正として使います。Graphの`coordinateVersion`=`toyosu-2026-08-28.1`、`threeDMapVersion`=`キャンパス全体.blend 2026-10-21`と公開設定の三つが一致しないと写真ストレージを用いるAPI/清掃ジョブの起動を拒否します。既定の`campus-2026-01`等を黙って上書きしません。承認済みの地図・表示機側にも同じ版を事前配布・ヘルス確認してから`TRACE_COORDINATE_VERSION`、`TRACE_CAMPUS_GRAPH_VERSION`、`TRACE_THREE_D_MAP_VERSION`と豊洲のジオフェンスを設定し、受け付け切替・ロールバックを行ってください。Graphの更新では固定JSON、互換版、試験点の測定を併せて更新します。
 
 アンカーはGraphのローカルENU（東=x、北=z）へ変換し、GPS精度円内の通行可能な`gpsSnap=true`両端を持つ辺だけへ投影します。`passable=false`、`restricted=true`、`closed=true`、時刻付き`closures`内、および`openingHours`（曜日0=日曜〜6=土曜、`open`/`close`は`HH:MM`・日本時間）の時間外辺は候補・探索の両方から除外します。現行Graphは`passable`のみを収録し、現場の一時通行止め・利用時間の運用入力は未提供です。運用データが正式に渡されるまでは実際の臨時閉鎖や時間外利用を防げないため公開運用に使用しないでください。階や屋内はGPSで確定できないため`gpsSnap=false`の辺へ吸着しません。
 
-本人専用memoryレスポンスの`segments`は`routeSegmentId`、両端の写真ID、`coordinateVersion`、`campusGraphVersion`、`threeDMapVersion`、`algorithmVersion`=`photo-edges-dijkstra-1`、`confidence`、`lengthM`、`path`を返します。`path`はGraph沿いの表示用ローカル点列`{t,x,z}`で、GPS履歴や生緯度経度は含みません。同程度の複数辺・撮影GPS欠損/精度不足・撮影地点から60秒超過去/10秒超未来の位置情報・経路不在・極端な移動速度は`confidence=low,path=[]`です。推定経路は実歩行の完全再現ではありません。公開イベント/スクリーンへ本人の写真・正確な撮影時刻・経路を流しません。
+本人専用memoryレスポンスの`segments`は`routeSegmentId`、両端の写真ID（到着区間の終点はnull）、`coordinateVersion`、`campusGraphVersion`、`threeDMapVersion`、`algorithmVersion`、`confidence`、`lengthM`、`path`、`pathNodeIds`を返します。チェックポイント区間の`pathNodeIds`は最短経路のGraphノードID列で、旧GPS区間と解決不能な区間は空配列です。`path`は従来の表示用ローカル点列`{t,x,z}`を維持します。旧写真のGPS履歴や生緯度経度は返しません。同程度の複数辺・撮影GPS欠損/精度不足・経路不在の旧区間は`confidence=low,path=[]`です。到着地点が現行Graphで解決できない場合や最後の写真が到着後に撮影された場合は到着区間を作らず、本人memoryを閲覧不能にはしません。
 
 削除はまず永続的な`deleting`を確定し、画像の消去が成功するまで参照・認証材料を捨てません。写真DELETE成功は204、写真・Memoryの消去失敗は503となり、同じ冪等性キーで再試行します。体験単位削除は従来どおりLive削除後にMemoryを処理し、写真消去失敗時は`memory: pending`です。期限切れはAPI常駐清掃と清掃ジョブで同じ処理を再開します。
 
 署名付きPUTは削除後も期限まで生きるため、アップロード先はゼロバイトで占有し、期限後だけoutboxから消去します。これにより削除後の再送で画像が復活しません。画像バイト・GPS・PhotoMoment参照とそれに紐づくRouteSegmentは削除対象となり、この短期outboxにはランダムなobject keyと期限だけを保持します。ピン・派生特徴・別サムネイルはまだ生成しません。
 
-DBに`004_route_segments.sql`を追加します。適用後に`runtime-grants.sql`を実行し、APIと清掃ジョブを同じschema対応版へ更新してください。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
+`004_route_segments.sql`〜`009_checkpoint_route_versions.sql`を番号順に適用し、`runtime-grants.sql`を再適用してください。`008_photo_checkpoints.sql`適用済み環境でも追加列は`009`で適用されます。旧バイナリは新版schemaを拒否するため、受付停止の移行窓と手動migration確認が必要です。SDKの検証は公式クライアントのHTTP fixture、API実動作は専用PostgreSQLと明示的な一時object emulatorで確認しています。実GCSのIAM・bucket CORS・端末アップロードは、承認済みstagingで別途必要です。
 
 ## 最短のローカル起動
 
@@ -231,7 +234,7 @@ make integration
 GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合テストを必ず実行します。
 `go test ./internal/route -run TestGenerationP95 -count=1 -v`は同梱された実Graph上で100回の生成時間を採取し、昇順95番目（p95）をログへ出します。デプロイ環境で計測し、承認した目標値と照合してください。試験コードを追加しただけでは実測・合格を意味しません。
 
-検証対象：Memoryのみの新規参加、旧GPS受付拒否、写真GPS拒否、旧セッションの資格情報分離・停止・同時削除・削除期限、再送記録失敗時のロールバック、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、既存GPS写真の経路/削除、CampusGraph上の既知経路/通行禁止/時間外/複数候補/欠損、Readyと写真削除時の区間再生成、Cloud Runポート・Cloud SQL接続設定。
+検証対象：Memoryのみの新規参加、旧GPS受付拒否、写真GPS拒否、新規写真の`checkpointId`必須・不明ID拒否・グラフ版自動記録、チェックポイント経路と到着区間・混合区間・削除時の再計算、旧セッションの資格情報分離・停止・同時削除・削除期限、再送記録失敗時のロールバック、DB migrationの初回・追加・再実行・並行実行・失敗時ロールバック・不整合履歴・旧アプリのready拒否、既存GPS写真の経路/削除、CampusGraph上の既知経路/通行禁止/時間外/複数候補/欠損、Readyと写真削除時の区間再生成、Cloud Runポート・Cloud SQL接続設定。
 
 ## Google Cloudへ配置
 

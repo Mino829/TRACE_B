@@ -65,25 +65,25 @@ func TestRoutesUpdateOnReadyAndDeletion(t *testing.T) {
 	if err := f.Store.ReadyPhoto(t.Context(), id, c.ID, now.Add(3*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if r := segments(); len(r) != 1 || r[0].ToPhotoMomentID != c.ID {
+	if r := segments(); len(r) != 1 || r[0].ToPhotoMomentID == nil || *r[0].ToPhotoMomentID != c.ID {
 		t.Fatalf("out-of-order completion: %+v", r)
 	}
 	if err := f.Store.ReadyPhoto(t.Context(), id, b.ID, now.Add(3*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if r := segments(); len(r) != 2 || r[0].ToPhotoMomentID != b.ID || r[1].ToPhotoMomentID != c.ID || r[0].Confidence == "low" || r[0].CoordinateVersion != "c1" || r[0].AlgorithmVersion != route.AlgorithmVersion {
+	if r := segments(); len(r) != 2 || r[0].ToPhotoMomentID == nil || *r[0].ToPhotoMomentID != b.ID || r[1].ToPhotoMomentID == nil || *r[1].ToPhotoMomentID != c.ID || r[0].Confidence == "low" || r[0].CoordinateVersion != "c1" || r[0].AlgorithmVersion != route.PhotoEdgeAlgorithmVersion {
 		t.Fatalf("persisted versioned routes: %+v", r)
 	}
 	if err := f.Store.QueuePhotoDeletion(t.Context(), id, b.ID, "deleted", ""); err != nil {
 		t.Fatal(err)
 	}
-	if r := segments(); len(r) != 1 || r[0].FromPhotoMomentID != a.ID || r[0].ToPhotoMomentID != c.ID {
+	if r := segments(); len(r) != 1 || r[0].FromPhotoMomentID != a.ID || r[0].ToPhotoMomentID == nil || *r[0].ToPhotoMomentID != c.ID {
 		t.Fatalf("did not bridge deleted photo: %+v", r)
 	}
 	if err := f.Store.FinishPhotoDeletion(t.Context(), id, b.ID); err != nil {
 		t.Fatal(err)
 	}
-	if r := segments(); len(r) != 1 || r[0].ToPhotoMomentID != c.ID {
+	if r := segments(); len(r) != 1 || r[0].ToPhotoMomentID == nil || *r[0].ToPhotoMomentID != c.ID {
 		t.Fatalf("deleted photo still referenced: %+v", r)
 	}
 	if err := f.Store.QueuePhotoDeletion(t.Context(), id, a.ID, "deleted", ""); err != nil {

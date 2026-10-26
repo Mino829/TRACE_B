@@ -25,6 +25,27 @@ type ReplayCandidate struct {
 	ReadyPhotoCount int    `json:"readyPhotoCount"`
 }
 
+// ArrivalRouteExpected mirrors the conditions for appendArrivalSegment. A
+// confirmed arrival need not yield a segment when its checkpoint was retired
+// or the last ready photo was captured after arrival.
+func (s *Store) ArrivalRouteExpected(ctx context.Context, memoryID string, lastCaptured time.Time) (bool, error) {
+	if s.routes == nil || lastCaptured.IsZero() {
+		return false, nil
+	}
+	var checkpointID string
+	var arrivedAt time.Time
+	err := s.q.QueryRowContext(ctx, `SELECT checkpoint_id,arrived_at FROM arrival_events WHERE memory_session_id=$1`,
+		memoryID).Scan(&checkpointID, &arrivedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, ok := s.routes.CheckpointNode(checkpointID)
+	return ok && !lastCaptured.After(arrivedAt), nil
+}
+
 func (s *Store) arrivalForMemory(ctx context.Context, memoryID string) (Arrival, error) {
 	var a Arrival
 	var skip sql.NullString
@@ -116,6 +137,12 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
  VALUES ($1,$2,'qr',$3,$4,$5,$6,$7,$8,$9)`, a.ID, memoryID, checkpointID, a.Status, reason, now,
 					a.PhotoWaitUntil, a.ReplayDeadline, finished)
 				if err != nil {
+					return err
+				}
+				// The arrival is durable; its checkpoint may now extend the route
+				// from the session's newest photo. Photos absent or unresolvable
+				// simply produce no additional segment.
+				if err := tx.reconcileRoutes(ctx, memoryID); err != nil {
 					return err
 				}
 				alias, err := tx.arrivalDisplayAlias(ctx, memoryID)

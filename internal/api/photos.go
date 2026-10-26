@@ -25,11 +25,12 @@ type createPhotoRequest struct {
 		AccuracyM  float64   `json:"accuracyM"`
 		RecordedAt time.Time `json:"recordedAt"`
 	} `json:"location"`
-	MIMEType  string `json:"mimeType"`
-	SizeBytes int64  `json:"sizeBytes"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	SHA256    string `json:"sha256"`
+	CheckpointID string `json:"checkpointId"`
+	MIMEType     string `json:"mimeType"`
+	SizeBytes    int64  `json:"sizeBytes"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	SHA256       string `json:"sha256"`
 }
 
 func (s *Server) photoAvailable(w http.ResponseWriter, r *http.Request, writing bool) bool {
@@ -55,6 +56,8 @@ func (s *Server) photoError(w http.ResponseWriter, r *http.Request, err error) {
 		failure = &apiError{Code: "UPLOAD_URL_LIMIT_REACHED", Message: "the upload URL issuance limit was reached", Status: http.StatusConflict}
 	case errors.Is(err, photo.ErrUploadIncomplete):
 		failure = &apiError{Code: "UPLOAD_INCOMPLETE", Message: "upload the image before completing it", Status: http.StatusConflict}
+	case errors.Is(err, store.ErrInvalidCheckpoint):
+		failure = &apiError{Code: "INVALID_CHECKPOINT", Message: "checkpointId is missing or not a known checkpoint", Status: http.StatusBadRequest}
 	case errors.Is(err, store.ErrConflict):
 		failure = &apiError{Code: "STATE_CONFLICT", Message: "photo state or request content conflicts", Status: http.StatusConflict}
 	}
@@ -97,6 +100,10 @@ func (s *Server) createPhoto(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), &apiError{Code: "PHOTO_LOCATION_DISABLED", Message: "photo location is no longer accepted", Status: http.StatusBadRequest})
 		return
 	}
+	if input.CheckpointID == "" {
+		s.writeError(w, requestID(r), &apiError{Code: "INVALID_CHECKPOINT", Message: "a participant-chosen checkpointId is required", Status: http.StatusBadRequest})
+		return
+	}
 	now := s.now().UTC()
 	memoryID := r.PathValue("memorySessionId")
 	token, _ := bearerToken(r)
@@ -136,6 +143,7 @@ func (s *Server) createPhoto(w http.ResponseWriter, r *http.Request) {
 			CapturedAt: input.CapturedAt.UTC(), CreatedAt: now, UploadExpiresAt: expires,
 			MIMEType: input.MIMEType, SizeBytes: input.SizeBytes, Width: input.Width, Height: input.Height,
 			SHA256: strings.ToLower(input.SHA256), StageKey: "uploads/" + randomSecret(), ObjectKey: "photos/" + randomSecret(),
+			CheckpointID: input.CheckpointID,
 		}, now)
 		if err != nil {
 			return err
@@ -242,7 +250,11 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]map[string]any, 0, len(photos))
 	for _, p := range photos {
-		item := map[string]any{"photoMomentId": p.ID, "clientPhotoId": p.ClientPhotoID, "sequenceNo": p.SequenceNo, "capturedAt": p.CapturedAt, "status": p.Status}
+		var checkpointID any
+		if p.CheckpointID != "" {
+			checkpointID = p.CheckpointID
+		}
+		item := map[string]any{"photoMomentId": p.ID, "clientPhotoId": p.ClientPhotoID, "checkpointId": checkpointID, "sequenceNo": p.SequenceNo, "capturedAt": p.CapturedAt, "status": p.Status}
 		if p.FailureCode != "" {
 			item["failureCode"] = p.FailureCode
 		}
@@ -271,37 +283,52 @@ func (s *Server) photoMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	moments := make([]map[string]any, 0, len(photos))
+	var lastReady time.Time
 	for _, p := range photos {
 		if p.Status != "ready" {
 			continue
 		}
+		lastReady = p.CapturedAt
 		url, err := s.photos.View(r.Context(), p, s.now().UTC())
 		if err != nil {
 			s.photoError(w, r, err)
 			return
 		}
-		confidence := "low"
-		if p.Location != nil && p.Location.AccuracyM <= 30 {
-			confidence = "high"
-		} else if p.Location != nil && p.Location.AccuracyM <= 100 {
-			confidence = "medium"
+		var checkpointID any
+		if p.CheckpointID != "" {
+			checkpointID = p.CheckpointID
 		}
-		moments = append(moments, map[string]any{"photoMomentId": p.ID, "capturedAt": p.CapturedAt, "imageUrl": url, "locationConfidence": confidence})
+		moment := map[string]any{"photoMomentId": p.ID, "capturedAt": p.CapturedAt, "imageUrl": url, "checkpointId": checkpointID}
+		if p.Location != nil {
+			confidence := "low"
+			if p.Location.AccuracyM <= 30 {
+				confidence = "high"
+			} else if p.Location.AccuracyM <= 100 {
+				confidence = "medium"
+			}
+			moment["locationConfidence"] = confidence // Legacy GPS photos only.
+		}
+		moments = append(moments, moment)
 	}
 	segments, err := s.store.RouteSegments(r.Context(), memoryID)
 	if err != nil {
 		s.photoError(w, r, err)
 		return
 	}
+	arrivalExpected, err := s.store.ArrivalRouteExpected(r.Context(), memoryID, lastReady)
+	if err != nil {
+		s.photoError(w, r, err)
+		return
+	}
 	// A previous schema may have ready photos but no persisted segments.
 	// Rebuild once, under the same memory lock used by complete and delete.
-	if len(segments) != max(0, len(moments)-1) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
+	if !segmentsMatchPhotos(segments, photos, arrivalExpected) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
 		if err := s.store.RefreshRoutes(r.Context(), memoryID, s.now().UTC()); err != nil {
 			s.photoError(w, r, err)
 			return
 		}
 		segments, err = s.store.RouteSegments(r.Context(), memoryID)
-		if err != nil || len(segments) != max(0, len(moments)-1) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
+		if err != nil || !segmentsMatchPhotos(segments, photos, arrivalExpected) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
 			s.photoError(w, r, store.ErrConflict)
 			return
 		}
@@ -309,10 +336,34 @@ func (s *Server) photoMemory(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "moments": moments, "segments": segments, "deleteAfter": memory.DeleteAfter})
 }
 
+func segmentsMatchPhotos(segments []store.RouteSegment, photos []store.Photo, arrivalExpected bool) bool {
+	previous := ""
+	index := 0
+	for _, p := range photos {
+		if p.Status != "ready" {
+			continue
+		}
+		if previous != "" {
+			if index >= len(segments) || segments[index].FromPhotoMomentID != previous ||
+				segments[index].ToPhotoMomentID == nil || *segments[index].ToPhotoMomentID != p.ID {
+				return false
+			}
+			index++
+		}
+		previous = p.ID
+	}
+	if !arrivalExpected {
+		return index == len(segments)
+	}
+	return previous != "" && index+1 == len(segments) &&
+		segments[index].FromPhotoMomentID == previous && segments[index].ToPhotoMomentID == nil
+}
+
 func staleSegments(segments []store.RouteSegment, coordinate, graph, threeD string) bool {
 	for _, segment := range segments {
 		if segment.CoordinateVersion != coordinate || segment.CampusGraphVersion != graph ||
-			segment.ThreeDMapVersion != threeD || segment.AlgorithmVersion != route.AlgorithmVersion {
+			segment.ThreeDMapVersion != threeD || (segment.AlgorithmVersion != route.PhotoEdgeAlgorithmVersion &&
+			segment.AlgorithmVersion != route.CheckpointAlgorithmVersion) {
 			return true
 		}
 	}

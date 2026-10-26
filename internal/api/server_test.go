@@ -24,10 +24,11 @@ type createdExperience struct {
 	ExperienceID string `json:"experienceId"`
 	LinkToken    string `json:"experienceLinkToken"`
 	Memory       struct {
-		SessionID        string    `json:"sessionId"`
-		ParticipantToken string    `json:"participantToken"`
-		ExpiresAt        time.Time `json:"expiresAt"`
-		DeleteAfter      time.Time `json:"deleteAfter"`
+		SessionID          string    `json:"sessionId"`
+		ParticipantToken   string    `json:"participantToken"`
+		ExpiresAt          time.Time `json:"expiresAt"`
+		CampusGraphVersion string    `json:"campusGraphVersion"`
+		DeleteAfter        time.Time `json:"deleteAfter"`
 	} `json:"memorySession"`
 	Live struct {
 		SessionID        string    `json:"sessionId"`

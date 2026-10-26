@@ -13,7 +13,13 @@ import (
 //go:embed campus_graph.json
 var campusGraph []byte
 
-const AlgorithmVersion = "photo-edges-dijkstra-1"
+// PhotoEdgeAlgorithmVersion is used for segments between legacy GPS-anchored
+// photos. Checkpoint-anchored pairs use CheckpointAlgorithmVersion.
+const PhotoEdgeAlgorithmVersion = "photo-edges-dijkstra-1"
+
+// CheckpointAlgorithmVersion marks segments built on checkpoint node pairs,
+// where snap ambiguity and capture-time spacing do not apply.
+const CheckpointAlgorithmVersion = "checkpoint-dijkstra-1"
 const earthRadius = 6378137.0
 
 var japanTime = time.FixedZone("JST", 9*3600)
@@ -35,6 +41,7 @@ type Anchor struct {
 type Result struct {
 	Confidence string
 	Path       []Point
+	NodeIDs    []string
 	LengthM    float64
 }
 
@@ -46,7 +53,8 @@ type node struct {
 		East  float64 `json:"east"`
 		North float64 `json:"north"`
 	} `json:"local"`
-	GPSSnap bool `json:"gpsSnap"`
+	GPSSnap bool   `json:"gpsSnap"`
+	Role    string `json:"role"`
 }
 
 type hours struct {
@@ -76,14 +84,16 @@ type edge struct {
 }
 
 type Graph struct {
-	SchemaVersion                                 int    `json:"schemaVersion"`
-	CampusGraphVersion                            string `json:"campusGraphVersion"`
-	CoordinateVersion                             string `json:"coordinateVersion"`
-	ThreeDMapVersion                              string `json:"threeDMapVersion"`
-	Nodes                                         []node `json:"nodes"`
-	Edges                                         []edge `json:"edges"`
-	adj                                           [][]int
-	originLat, originLon, originEast, originNorth float64
+	SchemaVersion           int    `json:"schemaVersion"`
+	CampusGraphVersion      string `json:"campusGraphVersion"`
+	CoordinateVersion       string `json:"coordinateVersion"`
+	ThreeDMapVersion        string `json:"threeDMapVersion"`
+	Nodes                   []node `json:"nodes"`
+	Edges                   []edge `json:"edges"`
+	adj                     [][]int
+	checkpointNodes         map[string]int
+	originLat, originLon    float64
+	originEast, originNorth float64
 }
 
 func Embedded() (*Graph, error) { return Parse(campusGraph) }
@@ -115,6 +125,7 @@ func Parse(data []byte) (*Graph, error) {
 	g.originLat, g.originLon = g.Nodes[0].Latitude, g.Nodes[0].Longitude
 	g.originEast, g.originNorth = g.Nodes[0].Local.East, g.Nodes[0].Local.North
 	ids := make(map[string]int, len(g.Nodes))
+	checkpoints := make(map[string]int, len(g.Nodes))
 	g.adj = make([][]int, len(g.Nodes))
 	for i, n := range g.Nodes {
 		if n.ID == "" || !finite(n.Latitude) || !finite(n.Longitude) || !finite(n.Local.East) || !finite(n.Local.North) || n.Latitude < -90 || n.Latitude > 90 || n.Longitude < -180 || n.Longitude > 180 {
@@ -124,6 +135,9 @@ func Parse(data []byte) (*Graph, error) {
 			return nil, errors.New("duplicate graph node")
 		}
 		ids[n.ID] = i
+		if n.Role == "checkpoint" {
+			checkpoints[n.ID] = i
+		}
 		x, z := g.project(n.Latitude, n.Longitude)
 		if math.Hypot(x-n.Local.East, z-n.Local.North) > 0.3 {
 			return nil, errors.New("graph local and WGS84 coordinates disagree")
@@ -168,7 +182,18 @@ func Parse(data []byte) (*Graph, error) {
 		g.adj[e.a] = append(g.adj[e.a], i)
 		g.adj[e.b] = append(g.adj[e.b], i)
 	}
+	g.checkpointNodes = checkpoints
 	return &g, nil
+}
+
+// CheckpointNode resolves a participant-chosen checkpoint ID to a graph node
+// index. Only role=="checkpoint" nodes count; every other ID fails.
+func (g *Graph) CheckpointNode(id string) (int, bool) {
+	if id == "" {
+		return -1, false
+	}
+	i, ok := g.checkpointNodes[id]
+	return i, ok
 }
 
 func clock(s string) (int, error) {
@@ -436,22 +461,117 @@ func (g *Graph) Reconstruct(from, to *Anchor) Result {
 	if confidence == "low" {
 		return unknown
 	}
-	// Drop duplicate junction points; preserve sharp turns; never interpolate a GPS history.
-	path := make([]Point, 0, len(best.path))
-	for _, p := range best.path {
-		if len(path) == 0 || math.Hypot(path[len(path)-1].X-p.X, path[len(path)-1].Z-p.Z) > 0.01 {
-			path = append(path, p)
-		}
-	}
-	if len(path) > 200 {
-		confidence = "low"
+	if len(best.path) > 200 {
 		return unknown
 	}
-	if len(path) == 1 {
-		path = append(path, path[0])
+	return Result{Confidence: confidence, Path: condense(best.path), LengthM: best.length}
+}
+
+func condense(path []Point) []Point {
+	// Drop duplicate junction points; preserve sharp turns; never interpolate a
+	// GPS history. A single point path is still kept renderable.
+	out := make([]Point, 0, len(path))
+	for _, p := range path {
+		if len(out) == 0 || math.Hypot(out[len(out)-1].X-p.X, out[len(out)-1].Z-p.Z) > 0.01 {
+			out = append(out, p)
+		}
 	}
-	for i := range path {
-		path[i].T = float64(i) / float64(len(path)-1)
+	if len(out) == 0 {
+		return out
 	}
-	return Result{Confidence: confidence, Path: path, LengthM: best.length}
+	if len(out) == 1 {
+		out = append(out, out[0])
+	}
+	for i := range out {
+		out[i].T = float64(i) / float64(len(out)-1)
+	}
+	return out
+}
+
+type Endpoint struct {
+	// Anchor is set for legacy photos that stored GPS. Checkpoint is the ID of
+	// the participant-chosen checkpoint node, or empty without one.
+	Anchor     *Anchor
+	Checkpoint string
+	CapturedAt time.Time
+}
+
+type mount struct {
+	node  int
+	extra float64
+	point Point
+}
+
+func (g *Graph) placements(e *Endpoint, startAt, endAt time.Time) []mount {
+	if e.Checkpoint != "" {
+		node, ok := g.CheckpointNode(e.Checkpoint)
+		if !ok {
+			return nil
+		}
+		p := g.Nodes[node].Local
+		return []mount{{node, 0, Point{X: p.East, Z: p.North}}}
+	}
+	if e.Anchor == nil {
+		return nil
+	}
+	var out []mount
+	for _, c := range g.candidates(*e.Anchor, e.CapturedAt) {
+		ed := g.Edges[c.edge]
+		if !ed.availableBetween(startAt, endAt) {
+			continue
+		}
+		pt := Point{X: c.x, Z: c.z}
+		out = append(out, mount{ed.a, c.fraction * ed.Length, pt}, mount{ed.b, (1 - c.fraction) * ed.Length, pt})
+	}
+	return out
+}
+
+// Connect builds the short route between two photo endpoints without coupling
+// it to capture interval, snap competition or GPS plausibility checks: any pair
+// that resolves to graph nodes uses checkpoint semantics. A segment between
+// GPS-anchored photos must instead use Reconstruct.
+func (g *Graph) Connect(from, to *Endpoint) Result {
+	unknown := Result{Confidence: "low", Path: []Point{}}
+	if from == nil || to == nil || to.CapturedAt.Before(from.CapturedAt) {
+		return unknown
+	}
+	a, b := g.placements(from, from.CapturedAt, to.CapturedAt), g.placements(to, from.CapturedAt, to.CapturedAt)
+	if len(a) == 0 || len(b) == 0 {
+		return unknown
+	}
+	best := option{score: math.Inf(1)}
+	var bestNodes []int
+	for _, left := range a {
+		for _, right := range b {
+			length, nodes := g.shortest(left.node, right.node, from.CapturedAt, to.CapturedAt)
+			if nodes == nil {
+				continue
+			}
+			score := length + left.extra + right.extra
+			if score >= best.score {
+				continue
+			}
+			path := make([]Point, 0, len(nodes)+2)
+			path = append(path, left.point)
+			for _, n := range nodes {
+				p := g.Nodes[n].Local
+				if n == left.node && len(path) == 1 &&
+					math.Hypot(left.point.X-p.East, left.point.Z-p.North) <= 0.01 {
+					continue // The mount point already coincides with the start node.
+				}
+				path = append(path, Point{X: p.East, Z: p.North})
+			}
+			path = append(path, right.point)
+			best = option{score: score, path: path}
+			bestNodes = nodes
+		}
+	}
+	if math.IsInf(best.score, 1) {
+		return unknown
+	}
+	nodeIDs := make([]string, len(bestNodes))
+	for i, n := range bestNodes {
+		nodeIDs[i] = g.Nodes[n].ID
+	}
+	return Result{Confidence: "high", Path: condense(best.path), NodeIDs: nodeIDs, LengthM: best.score}
 }

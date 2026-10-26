@@ -88,6 +88,28 @@ func migrationSteps(t *testing.T, extras ...string) []migration {
 	return steps
 }
 
+func TestCheckpointRouteVersionMigrationAfterApplied008(t *testing.T) {
+	store, db := migrationTestStore(t)
+	ctx := t.Context()
+	steps := migrationSteps(t)
+	if err := store.migrate(ctx, steps[:8]); err != nil {
+		t.Fatal(err)
+	}
+	const columns = `SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema()
+ AND ((table_name='memory_sessions' AND column_name='campus_graph_version')
+ OR (table_name='route_segments' AND column_name='path_node_ids'))`
+	var count int
+	if err := db.QueryRowContext(ctx, columns).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("008 unexpectedly has review columns: count=%d err=%v", count, err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, columns).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("009 did not add review columns: count=%d err=%v", count, err)
+	}
+}
+
 func TestMigrationIncrementalAndReadiness(t *testing.T) {
 	store, db := migrationTestStore(t)
 	ctx := t.Context()

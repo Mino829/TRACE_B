@@ -59,7 +59,7 @@ func TestPhotoMemoryDeliversPrivateVersionedProjectedRoutes(t *testing.T) {
 		t.Fatalf("segment response: %s %v", r.Body.String(), err)
 	}
 	s := body.Segments[0]
-	if s.Confidence == "low" || s.AlgorithmVersion != route.AlgorithmVersion || s.CampusGraphVersion != "g1" || len(s.Path) < 2 || strings.Contains(r.Body.String(), `"latitude"`) || strings.Contains(r.Body.String(), `"longitude"`) {
+	if s.Confidence == "low" || s.AlgorithmVersion != route.PhotoEdgeAlgorithmVersion || s.CampusGraphVersion != "g1" || len(s.Path) < 2 || strings.Contains(r.Body.String(), `"latitude"`) || strings.Contains(r.Body.String(), `"longitude"`) {
 		t.Fatalf("story omitted graph path or leaked raw GPS: %s", r.Body.String())
 	}
 }

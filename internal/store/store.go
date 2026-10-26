@@ -60,7 +60,7 @@ type NewExperience struct {
 	ExperienceID, MemorySessionID, LiveSessionID, LinkID string
 	MemoryTokenHash, LiveTokenHash, LinkTokenHash        string
 	MemoryConsent, LiveConsent, ConsentLanguage          string
-	DisplayColor, DisplaySymbol                          string
+	DisplayColor, DisplaySymbol, CampusGraphVersion      string
 	CreatedAt, MemoryExpiresAt, MemoryDeleteAfter        time.Time
 	LiveExpiresAt, LiveDeleteAfter                       time.Time
 	LivePresence                                         bool
@@ -187,9 +187,13 @@ func (s *Store) lockTransaction(ctx context.Context, key string) error {
 }
 func (s *Store) CreateExperience(ctx context.Context, v NewExperience) error {
 	return s.Transaction(ctx, "", func(tx *Store) error {
+		var graphVersion any
+		if v.CampusGraphVersion != "" {
+			graphVersion = v.CampusGraphVersion
+		}
 		_, err := tx.q.ExecContext(ctx, `INSERT INTO memory_sessions
-  (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after)
-  VALUES ($1,$2,$3,$4,$5,$6,$7)`, v.MemorySessionID, v.MemoryConsent, v.ConsentLanguage, v.MemoryTokenHash, v.CreatedAt, v.MemoryExpiresAt, v.MemoryDeleteAfter)
+  (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after,campus_graph_version)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, v.MemorySessionID, v.MemoryConsent, v.ConsentLanguage, v.MemoryTokenHash, v.CreatedAt, v.MemoryExpiresAt, v.MemoryDeleteAfter, graphVersion)
 		if err != nil {
 			return err
 		}
