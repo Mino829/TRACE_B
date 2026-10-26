@@ -13,7 +13,7 @@ import (
 
 func TestArrivalQueueLimitAcrossSessionsAndRecovery(t *testing.T) {
 	f := testdb.Open(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	for i := range 11 {
 		id := fmt.Sprintf("queue-memory-%d", i)
 		err := f.Store.CreateExperience(t.Context(), store.NewExperience{
@@ -86,7 +86,7 @@ func TestArrivalQueueLimitAcrossSessionsAndRecovery(t *testing.T) {
 
 func TestRendererRetryKeepsArrivalDeadline(t *testing.T) {
 	f := testdb.Open(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	err := f.Store.CreateExperience(t.Context(), store.NewExperience{
 		ExperienceID: "retry-experience", MemorySessionID: "retry-memory",
 		MemoryTokenHash: "retry-token", MemoryConsent: "memory", ConsentLanguage: "ja",
