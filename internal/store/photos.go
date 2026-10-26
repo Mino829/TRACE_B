@@ -17,7 +17,7 @@ var (
 )
 
 type MemorySession struct {
-	ID                                string
+	ID, CampusGraphVersion            string
 	CreatedAt, ExpiresAt, DeleteAfter time.Time
 	Deleting                          bool
 }
@@ -83,8 +83,8 @@ func scanPhoto(row photoScanner) (Photo, error) {
 
 func (s *Store) MemorySession(ctx context.Context, id string) (MemorySession, error) {
 	var m MemorySession
-	err := s.q.QueryRowContext(ctx, `SELECT id,created_at,expires_at,delete_after,deleting FROM memory_sessions WHERE id=$1`, id).
-		Scan(&m.ID, &m.CreatedAt, &m.ExpiresAt, &m.DeleteAfter, &m.Deleting)
+	err := s.q.QueryRowContext(ctx, `SELECT id,created_at,expires_at,delete_after,deleting,COALESCE(campus_graph_version,'') FROM memory_sessions WHERE id=$1`, id).
+		Scan(&m.ID, &m.CreatedAt, &m.ExpiresAt, &m.DeleteAfter, &m.Deleting, &m.CampusGraphVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MemorySession{}, ErrNotFound
 	}
@@ -142,6 +142,9 @@ func (s *Store) CreatePhoto(ctx context.Context, p Photo, now time.Time) (Photo,
 		}
 		if p.CheckpointID != "" {
 			if tx.routes == nil {
+				return ErrConflict
+			}
+			if m.CampusGraphVersion != tx.routes.CampusGraphVersion {
 				return ErrConflict
 			}
 			if _, ok := tx.routes.CheckpointNode(p.CheckpointID); !ok {

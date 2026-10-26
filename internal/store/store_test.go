@@ -12,7 +12,7 @@ func fixtureExperience(t *testing.T, f *testdb.Fixture, now time.Time) store.New
 	t.Helper()
 	v := store.NewExperience{ExperienceID: "exp1", MemorySessionID: "mem1", LiveSessionID: "live1", LinkID: "link1",
 		MemoryTokenHash: "memory-hash", LiveTokenHash: "live-hash", LinkTokenHash: "link-hash", MemoryConsent: "memory-v1", LiveConsent: "live-v1",
-		ConsentLanguage: "ja", DisplayColor: "cyan", DisplaySymbol: "circle", CreatedAt: now,
+		ConsentLanguage: "ja", DisplayColor: "cyan", DisplaySymbol: "circle", CampusGraphVersion: "g1", CreatedAt: now,
 		MemoryExpiresAt: now.Add(time.Hour), MemoryDeleteAfter: now.Add(2 * time.Hour),
 		LiveExpiresAt: now.Add(30 * time.Minute), LiveDeleteAfter: now.Add(90 * time.Minute), LivePresence: true}
 	if err := f.Store.CreateExperience(t.Context(), v); err != nil {

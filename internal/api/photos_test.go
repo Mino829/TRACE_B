@@ -330,7 +330,7 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 			Confidence string `json:"locationConfidence"`
 		} `json:"moments"`
 	}
-	if err := json.Unmarshal(story.Body.Bytes(), &result); err != nil || story.Code != 200 || len(result.Moments) != 1 || result.Moments[0].ID != p.ID || result.Moments[0].Confidence != "low" {
+	if err := json.Unmarshal(story.Body.Bytes(), &result); err != nil || story.Code != 200 || len(result.Moments) != 1 || result.Moments[0].ID != p.ID {
 		t.Fatalf("story: %d %s", story.Code, story.Body.String())
 	}
 	response, err := http.Get(result.Moments[0].URL)
@@ -344,7 +344,7 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 	}
 	// Represent a photo saved before new GPS registration was disabled.
 	recordedAt := time.Now().UTC()
-	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE photos SET latitude=$1, longitude=$2, accuracy_m=$3, location_recorded_at=$4 WHERE id=$5`,
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE photos SET checkpoint_id=NULL, campus_graph_version=NULL, latitude=$1, longitude=$2, accuracy_m=$3, location_recorded_at=$4 WHERE id=$5`,
 		35.0, 135.0, 4.0, recordedAt, p.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +449,19 @@ func TestMemoryAndExperienceDeletionRetryPhotoErasure(t *testing.T) {
 			} else {
 				c = createExperience(t, h, cfg)
 			}
+			if combined {
+				// Exercise the legacy combined deletion path with an existing stored photo.
+				// Pin temporarily so the current checkpoint registration can create it.
+				if _, err := f.SQL.ExecContext(t.Context(), "UPDATE memory_sessions SET campus_graph_version=$1 WHERE id=$2", cfg.CampusGraphVersion, c.Memory.SessionID); err != nil {
+					t.Fatal(err)
+				}
+			}
 			p := readyPhoto(t, h, c, photoJPEG(t), "delete-session")
+			if combined {
+				if _, err := f.SQL.ExecContext(t.Context(), "UPDATE memory_sessions SET campus_graph_version=NULL WHERE id=$1", c.Memory.SessionID); err != nil {
+					t.Fatal(err)
+				}
+			}
 			path := "/v1/memory-sessions/" + c.Memory.SessionID
 			headers := map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken, "Idempotency-Key": "delete-session"}
 			if combined {
@@ -610,6 +622,9 @@ func TestPhotoRegistrationRequiresCheckpoint(t *testing.T) {
 	photoGraphFixture(t, f, &cfg)
 	h := api.New(cfg, f.Store, photo.New(f.Store, assets))
 	c := createExperience(t, h, cfg)
+	if c.Memory.CampusGraphVersion != cfg.CampusGraphVersion {
+		t.Fatalf("created session graph version = %q, want %q", c.Memory.CampusGraphVersion, cfg.CampusGraphVersion)
+	}
 	data := photoJPEG(t)
 	path := "/v1/memory-sessions/" + c.Memory.SessionID + "/photos"
 	headers := map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken, "Idempotency-Key": "checkpoint-missing"}
@@ -640,6 +655,14 @@ func TestPhotoRegistrationRequiresCheckpoint(t *testing.T) {
 	if err != nil || len(photos) != 1 || photos[0].CheckpointID != "cp-a" || photos[0].CampusGraphVersion != "g1" || photos[0].Location != nil {
 		t.Fatalf("checkpoint photo not stored: %+v %v", photos, err)
 	}
+	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE memory_sessions SET campus_graph_version='previous-graph' WHERE id=$1", c.Memory.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	mismatch := map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "graph-mismatch"}
+	r = request(t, h, "POST", path, photoRegistrationBody(t, data, "different-version", "cp-a"), mismatch)
+	if r.Code != http.StatusConflict || !strings.Contains(r.Body.String(), `"code":"STATE_CONFLICT"`) {
+		t.Fatalf("checkpoint from a different session graph accepted: %d %s", r.Code, r.Body.String())
+	}
 }
 
 func TestPhotoMemoryReturnsCheckpointAndArrivalSegment(t *testing.T) {
@@ -661,6 +684,20 @@ func TestPhotoMemoryReturnsCheckpointAndArrivalSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	readyPhoto(t, h, c, photoJPEG(t), "checkpoint-photo")
+	list := request(t, h, "GET", "/v1/memory-sessions/"+c.Memory.SessionID+"/photos", "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
+	if list.Code != http.StatusOK {
+		t.Fatalf("photo list: %d %s", list.Code, list.Body.String())
+	}
+	var listed struct {
+		Photos []struct {
+			CheckpointID *string `json:"checkpointId"`
+		} `json:"photos"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &listed); err != nil || len(listed.Photos) != 2 ||
+		listed.Photos[0].CheckpointID != nil || listed.Photos[1].CheckpointID == nil ||
+		*listed.Photos[1].CheckpointID != "cp-a" {
+		t.Fatalf("photo list must expose the participant's chosen checkpoint: %+v %v", listed, err)
+	}
 	r := request(t, h, "GET", "/v1/memory-sessions/"+c.Memory.SessionID+"/memory", "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
 	if r.Code != 200 {
 		t.Fatalf("memory response: %d %s", r.Code, r.Body.String())
@@ -704,7 +741,44 @@ func TestPhotoMemoryReturnsCheckpointAndArrivalSegment(t *testing.T) {
 		t.Fatalf("arrival must add a segment: %s", r.Body.String())
 	}
 	arrival := body.Segments[1]
-	if arrival.ToPhotoMomentID != nil || arrival.AlgorithmVersion != route.CheckpointAlgorithmVersion || arrival.Confidence != "high" {
+	if arrival.ToPhotoMomentID != nil || arrival.AlgorithmVersion != route.CheckpointAlgorithmVersion ||
+		arrival.Confidence != "high" || len(arrival.PathNodeIDs) == 0 ||
+		arrival.PathNodeIDs[len(arrival.PathNodeIDs)-1] != "cp-b" {
 		t.Fatalf("arrival segment: %+v", arrival)
+	}
+}
+
+func TestPhotoMemoryWithoutRoutableArrivalSegment(t *testing.T) {
+	for _, tc := range []struct {
+		name, arrivalCheckpoint string
+		latePhoto               bool
+	}{
+		{"retired arrival checkpoint", "retired-checkpoint", false},
+		{"photo captured after arrival", "cp-b", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := testdb.Open(t)
+			assets := newPhotoObjects(t)
+			cfg := config.Default()
+			cfg.PhotoEnabled = true
+			cfg.RegistrationOpen = true
+			photoGraphFixture(t, f, &cfg)
+			h := api.New(cfg, f.Store, photo.New(f.Store, assets))
+			c := createExperience(t, h, cfg)
+			readyPhoto(t, h, c, photoJPEG(t), "before-arrival")
+			arrivedAt := time.Now().UTC()
+			if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
+ (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until,replay_deadline)
+ VALUES ('arr',$1,'qr',$2,'skipped','operator',$3,$3,$4)`, c.Memory.SessionID, tc.arrivalCheckpoint, arrivedAt, arrivedAt.Add(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			if tc.latePhoto {
+				readyPhoto(t, h, c, photoJPEG(t), "after-arrival")
+			}
+			r := request(t, h, "GET", "/v1/memory-sessions/"+c.Memory.SessionID+"/memory", "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
+			if r.Code != http.StatusOK {
+				t.Fatalf("memory unavailable without an arrival segment: %d %s", r.Code, r.Body.String())
+			}
+		})
 	}
 }

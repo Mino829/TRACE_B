@@ -101,8 +101,28 @@ func TestCheckpointRouteSegments(t *testing.T) {
 	if len(segment.Path) != 3 || segment.Path[0].X != 0 || segment.Path[2].X != 40 || segment.LengthM != 40 {
 		t.Fatalf("checkpoint path: %+v", segment.Path)
 	}
+	if len(segment.PathNodeIDs) != 3 || segment.PathNodeIDs[0] != "cp-a" ||
+		segment.PathNodeIDs[1] != "mid" || segment.PathNodeIDs[2] != "cp-b" {
+		t.Fatalf("checkpoint path node IDs were not persisted: %+v", segment.PathNodeIDs)
+	}
 	if *segment.ToPhotoMomentID != two.ID || segment.FromPhotoMomentID != one.ID {
 		t.Fatalf("pair endpoints: %+v", segment)
+	}
+	// A checkpoint ID reused in a newer Graph must not relocate an old photo.
+	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE photos SET campus_graph_version='previous-graph' WHERE id=$1", one.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Store.RefreshRoutes(t.Context(), id, now.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got := segments(); len(got) != 1 || got[0].Confidence != "low" || len(got[0].Path) != 0 {
+		t.Fatalf("old checkpoint resolved against a different graph: %+v", got)
+	}
+	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE photos SET campus_graph_version='g1' WHERE id=$1", one.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Store.RefreshRoutes(t.Context(), id, now.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
 	}
 	// A legacy GPS photo between the checkpoints mixes into a node route.
 	mixed := photoInput(id, "photo-legacy", now.Add(2*time.Minute))

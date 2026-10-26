@@ -41,6 +41,7 @@ type Anchor struct {
 type Result struct {
 	Confidence string
 	Path       []Point
+	NodeIDs    []string
 	LengthM    float64
 }
 
@@ -501,7 +502,7 @@ type mount struct {
 	point Point
 }
 
-func (g *Graph) placements(e *Endpoint) []mount {
+func (g *Graph) placements(e *Endpoint, startAt, endAt time.Time) []mount {
 	if e.Checkpoint != "" {
 		node, ok := g.CheckpointNode(e.Checkpoint)
 		if !ok {
@@ -516,6 +517,9 @@ func (g *Graph) placements(e *Endpoint) []mount {
 	var out []mount
 	for _, c := range g.candidates(*e.Anchor, e.CapturedAt) {
 		ed := g.Edges[c.edge]
+		if !ed.availableBetween(startAt, endAt) {
+			continue
+		}
 		pt := Point{X: c.x, Z: c.z}
 		out = append(out, mount{ed.a, c.fraction * ed.Length, pt}, mount{ed.b, (1 - c.fraction) * ed.Length, pt})
 	}
@@ -531,11 +535,12 @@ func (g *Graph) Connect(from, to *Endpoint) Result {
 	if from == nil || to == nil || to.CapturedAt.Before(from.CapturedAt) {
 		return unknown
 	}
-	a, b := g.placements(from), g.placements(to)
+	a, b := g.placements(from, from.CapturedAt, to.CapturedAt), g.placements(to, from.CapturedAt, to.CapturedAt)
 	if len(a) == 0 || len(b) == 0 {
 		return unknown
 	}
 	best := option{score: math.Inf(1)}
+	var bestNodes []int
 	for _, left := range a {
 		for _, right := range b {
 			length, nodes := g.shortest(left.node, right.node, from.CapturedAt, to.CapturedAt)
@@ -549,18 +554,24 @@ func (g *Graph) Connect(from, to *Endpoint) Result {
 			path := make([]Point, 0, len(nodes)+2)
 			path = append(path, left.point)
 			for _, n := range nodes {
-				if n == left.node && len(path) == 1 {
-					continue // Skip the start node when the mount point stands in for it.
-				}
 				p := g.Nodes[n].Local
+				if n == left.node && len(path) == 1 &&
+					math.Hypot(left.point.X-p.East, left.point.Z-p.North) <= 0.01 {
+					continue // The mount point already coincides with the start node.
+				}
 				path = append(path, Point{X: p.East, Z: p.North})
 			}
 			path = append(path, right.point)
 			best = option{score: score, path: path}
+			bestNodes = nodes
 		}
 	}
 	if math.IsInf(best.score, 1) {
 		return unknown
 	}
-	return Result{Confidence: "high", Path: condense(best.path), LengthM: best.score}
+	nodeIDs := make([]string, len(bestNodes))
+	for i, n := range bestNodes {
+		nodeIDs[i] = g.Nodes[n].ID
+	}
+	return Result{Confidence: "high", Path: condense(best.path), NodeIDs: nodeIDs, LengthM: best.score}
 }

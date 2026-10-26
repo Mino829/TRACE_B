@@ -250,7 +250,11 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]map[string]any, 0, len(photos))
 	for _, p := range photos {
-		item := map[string]any{"photoMomentId": p.ID, "clientPhotoId": p.ClientPhotoID, "sequenceNo": p.SequenceNo, "capturedAt": p.CapturedAt, "status": p.Status}
+		var checkpointID any
+		if p.CheckpointID != "" {
+			checkpointID = p.CheckpointID
+		}
+		item := map[string]any{"photoMomentId": p.ID, "clientPhotoId": p.ClientPhotoID, "checkpointId": checkpointID, "sequenceNo": p.SequenceNo, "capturedAt": p.CapturedAt, "status": p.Status}
 		if p.FailureCode != "" {
 			item["failureCode"] = p.FailureCode
 		}
@@ -279,56 +283,80 @@ func (s *Server) photoMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	moments := make([]map[string]any, 0, len(photos))
+	var lastReady time.Time
 	for _, p := range photos {
 		if p.Status != "ready" {
 			continue
 		}
+		lastReady = p.CapturedAt
 		url, err := s.photos.View(r.Context(), p, s.now().UTC())
 		if err != nil {
 			s.photoError(w, r, err)
 			return
 		}
-		confidence := "low"
-		if p.Location != nil && p.Location.AccuracyM <= 30 {
-			confidence = "high"
-		} else if p.Location != nil && p.Location.AccuracyM <= 100 {
-			confidence = "medium"
-		}
 		var checkpointID any
 		if p.CheckpointID != "" {
 			checkpointID = p.CheckpointID
 		}
-		moments = append(moments, map[string]any{"photoMomentId": p.ID, "capturedAt": p.CapturedAt, "imageUrl": url, "locationConfidence": confidence, "checkpointId": checkpointID})
+		moment := map[string]any{"photoMomentId": p.ID, "capturedAt": p.CapturedAt, "imageUrl": url, "checkpointId": checkpointID}
+		if p.Location != nil {
+			confidence := "low"
+			if p.Location.AccuracyM <= 30 {
+				confidence = "high"
+			} else if p.Location.AccuracyM <= 100 {
+				confidence = "medium"
+			}
+			moment["locationConfidence"] = confidence // Legacy GPS photos only.
+		}
+		moments = append(moments, moment)
 	}
 	segments, err := s.store.RouteSegments(r.Context(), memoryID)
 	if err != nil {
 		s.photoError(w, r, err)
 		return
 	}
-	// A confirmed arrival adds a final segment that ends at its checkpoint.
-	confirmed, err := s.store.ArrivalConfirmed(r.Context(), memoryID)
+	arrivalExpected, err := s.store.ArrivalRouteExpected(r.Context(), memoryID, lastReady)
 	if err != nil {
 		s.photoError(w, r, err)
 		return
 	}
-	expected := max(0, len(moments)-1)
-	if confirmed && len(moments) > 0 {
-		expected++
-	}
 	// A previous schema may have ready photos but no persisted segments.
 	// Rebuild once, under the same memory lock used by complete and delete.
-	if len(segments) != expected || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
+	if !segmentsMatchPhotos(segments, photos, arrivalExpected) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
 		if err := s.store.RefreshRoutes(r.Context(), memoryID, s.now().UTC()); err != nil {
 			s.photoError(w, r, err)
 			return
 		}
 		segments, err = s.store.RouteSegments(r.Context(), memoryID)
-		if err != nil || len(segments) != expected || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
+		if err != nil || !segmentsMatchPhotos(segments, photos, arrivalExpected) || staleSegments(segments, s.cfg.CoordinateVersion, s.cfg.CampusGraphVersion, s.cfg.ThreeDMapVersion) {
 			s.photoError(w, r, store.ErrConflict)
 			return
 		}
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "moments": moments, "segments": segments, "deleteAfter": memory.DeleteAfter})
+}
+
+func segmentsMatchPhotos(segments []store.RouteSegment, photos []store.Photo, arrivalExpected bool) bool {
+	previous := ""
+	index := 0
+	for _, p := range photos {
+		if p.Status != "ready" {
+			continue
+		}
+		if previous != "" {
+			if index >= len(segments) || segments[index].FromPhotoMomentID != previous ||
+				segments[index].ToPhotoMomentID == nil || *segments[index].ToPhotoMomentID != p.ID {
+				return false
+			}
+			index++
+		}
+		previous = p.ID
+	}
+	if !arrivalExpected {
+		return index == len(segments)
+	}
+	return previous != "" && index+1 == len(segments) &&
+		segments[index].FromPhotoMomentID == previous && segments[index].ToPhotoMomentID == nil
 }
 
 func staleSegments(segments []store.RouteSegment, coordinate, graph, threeD string) bool {

@@ -32,12 +32,13 @@ type RouteSegment struct {
 	AlgorithmVersion   string        `json:"algorithmVersion"`
 	Confidence         string        `json:"confidence"`
 	Path               []route.Point `json:"path"`
+	PathNodeIDs        []string      `json:"pathNodeIds"`
 	LengthM            float64       `json:"lengthM"`
 }
 
 func (s *Store) RouteSegments(ctx context.Context, memoryID string) ([]RouteSegment, error) {
 	rows, err := s.q.QueryContext(ctx, `SELECT id,from_photo_moment_id,to_photo_moment_id,coordinate_version,campus_graph_version,
- three_d_map_version,algorithm_version,confidence,path,length_m FROM route_segments WHERE memory_session_id=$1
+ three_d_map_version,algorithm_version,confidence,path,path_node_ids,length_m FROM route_segments WHERE memory_session_id=$1
  ORDER BY (SELECT captured_at FROM photos WHERE id=from_photo_moment_id),
  (SELECT sequence_no FROM photos WHERE id=from_photo_moment_id)`, memoryID)
 	if err != nil {
@@ -48,8 +49,8 @@ func (s *Store) RouteSegments(ctx context.Context, memoryID string) ([]RouteSegm
 	for rows.Next() {
 		var v RouteSegment
 		var to sql.NullString
-		var raw []byte
-		if err := rows.Scan(&v.ID, &v.FromPhotoMomentID, &to, &v.CoordinateVersion, &v.CampusGraphVersion, &v.ThreeDMapVersion, &v.AlgorithmVersion, &v.Confidence, &raw, &v.LengthM); err != nil {
+		var raw, rawNodes []byte
+		if err := rows.Scan(&v.ID, &v.FromPhotoMomentID, &to, &v.CoordinateVersion, &v.CampusGraphVersion, &v.ThreeDMapVersion, &v.AlgorithmVersion, &v.Confidence, &raw, &rawNodes, &v.LengthM); err != nil {
 			return nil, err
 		}
 		if to.Valid {
@@ -57,6 +58,9 @@ func (s *Store) RouteSegments(ctx context.Context, memoryID string) ([]RouteSegm
 			v.ToPhotoMomentID = &id
 		}
 		if err := json.Unmarshal(raw, &v.Path); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(rawNodes, &v.PathNodeIDs); err != nil {
 			return nil, err
 		}
 		segments = append(segments, v)
@@ -69,7 +73,11 @@ func (s *Store) RouteSegments(ctx context.Context, memoryID string) ([]RouteSegm
 // that resolves to nothing produces no endpoint and blocks its segments.
 func (s *Store) photoEndpoint(p *Photo) *route.Endpoint {
 	if p.CheckpointID != "" {
-		// Unresolvable checkpoints (retired graph nodes) produce no endpoint.
+		// A graph revision can reuse the same ID at a different place. Never
+		// reinterpret a saved photo against a different version of the graph.
+		if p.CampusGraphVersion != s.routes.CampusGraphVersion {
+			return nil
+		}
 		if _, ok := s.routes.CheckpointNode(p.CheckpointID); !ok {
 			return nil
 		}
@@ -117,6 +125,14 @@ func (s *Store) reconcileRoutes(ctx context.Context, memoryID string) error {
 		if err != nil {
 			return err
 		}
+		nodes := result.NodeIDs
+		if nodes == nil {
+			nodes = []string{}
+		}
+		pathNodeIDs, err := json.Marshal(nodes)
+		if err != nil {
+			return err
+		}
 		pair := previous.ID
 		if toPhoto != nil {
 			pair += "\x00" + *toPhoto
@@ -124,10 +140,10 @@ func (s *Store) reconcileRoutes(ctx context.Context, memoryID string) error {
 		key := sha256.Sum256([]byte(memoryID + "\x00" + pair))
 		_, err = s.q.ExecContext(ctx, `INSERT INTO route_segments
  (id,memory_session_id,from_photo_moment_id,to_photo_moment_id,coordinate_version,campus_graph_version,
- three_d_map_version,algorithm_version,confidence,path,length_m)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, "route-"+hex.EncodeToString(key[:16]), memoryID, previous.ID,
+ three_d_map_version,algorithm_version,confidence,path,path_node_ids,length_m)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, "route-"+hex.EncodeToString(key[:16]), memoryID, previous.ID,
 			toPhoto, s.routes.CoordinateVersion, s.routes.CampusGraphVersion, s.routes.ThreeDMapVersion,
-			algorithm, result.Confidence, path, result.LengthM)
+			algorithm, result.Confidence, path, pathNodeIDs, result.LengthM)
 		return err
 	}
 	for i := range ready {

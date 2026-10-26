@@ -207,9 +207,15 @@ func TestConnectResolvesCheckpointPairs(t *testing.T) {
 	if result.Path[0].T != 0 || result.Path[2].T != 1 || result.Path[1].T != 0.5 {
 		t.Fatalf("parametrisation broken: %+v", result.Path)
 	}
+	if len(result.NodeIDs) != 3 || result.NodeIDs[0] != "a" || result.NodeIDs[1] != "b" || result.NodeIDs[2] != "c" {
+		t.Fatalf("display needs the graph's ordered node IDs: %+v", result.NodeIDs)
+	}
 	same := g.Connect(&Endpoint{Checkpoint: "a", CapturedAt: now}, &Endpoint{Checkpoint: "a", CapturedAt: now})
 	if same.Confidence != "high" || len(same.Path) != 2 || same.LengthM != 0 {
 		t.Fatalf("identical checkpoints: %+v", same)
+	}
+	if len(same.NodeIDs) != 1 || same.NodeIDs[0] != "a" {
+		t.Fatalf("identical checkpoint needs its graph node: %+v", same.NodeIDs)
 	}
 	// A mixed pair resolves the GPS anchor onto edges reachable from the node.
 	mixed := g.Connect(&Endpoint{Checkpoint: "a", CapturedAt: now},
@@ -224,5 +230,34 @@ func TestConnectResolvesCheckpointPairs(t *testing.T) {
 	reversed := g.Connect(&Endpoint{Checkpoint: a, CapturedAt: now.Add(time.Minute)}, &Endpoint{Checkpoint: "c", CapturedAt: now})
 	if reversed.Confidence != "low" || len(reversed.Path) != 0 {
 		t.Fatalf("reversed capture order accepted: %+v", reversed)
+	}
+}
+
+func TestConnectPreservesGPSMountJunction(t *testing.T) {
+	g := smallGraph(t, func(g *Graph) {
+		g.Nodes[3].Role = "checkpoint"
+	})
+	now := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
+	from := &Endpoint{Anchor: anchorOn(g, g.Edges[0], .5, 1, now), CapturedAt: now}
+	to := &Endpoint{Checkpoint: "d", CapturedAt: now.Add(time.Minute)}
+	got := g.Connect(from, to)
+	if got.Confidence != "high" || math.Abs(got.LengthM-18) > .01 || len(got.Path) != 3 ||
+		math.Abs(got.Path[0].X-10) > .1 || got.Path[1].X != 0 || got.Path[1].Z != 0 ||
+		got.Path[2].X != 0 || got.Path[2].Z != 8 {
+		t.Fatalf("route must follow the GPS mount through node a: %+v", got)
+	}
+}
+
+func TestConnectRejectsGPSMountClosedBetweenPhotos(t *testing.T) {
+	now := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
+	g := smallGraph(t, func(g *Graph) {
+		g.Nodes[1].Role = "checkpoint"
+		g.Edges[0].Closures = []closure{{Start: now.Add(20 * time.Second), End: now.Add(40 * time.Second)}}
+	})
+	from := &Endpoint{Anchor: anchorOn(g, g.Edges[0], .5, 1, now), CapturedAt: now}
+	to := &Endpoint{Checkpoint: "b", CapturedAt: now.Add(time.Minute)}
+	got := g.Connect(from, to)
+	if got.Confidence != "low" || len(got.Path) != 0 {
+		t.Fatalf("closed GPS mount disclosed as a passable route: %+v", got)
 	}
 }

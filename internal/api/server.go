@@ -245,7 +245,8 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		MemoryTokenHash: hash(memoryToken),
 		MemoryConsent:   input.MemoryConsentVersion,
 		ConsentLanguage: input.ConsentLanguage, DisplayColor: color, DisplaySymbol: symbol,
-		CreatedAt: now, MemoryExpiresAt: memoryExpires, MemoryDeleteAfter: memoryDeleteAfter,
+		CampusGraphVersion: s.cfg.CampusGraphVersion,
+		CreatedAt:          now, MemoryExpiresAt: memoryExpires, MemoryDeleteAfter: memoryDeleteAfter,
 	}
 	if err := s.store.CreateExperience(r.Context(), value); err != nil {
 		slog.Error("create experience", "requestId", requestID(r), "error", err)
@@ -256,6 +257,7 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		"experienceId": experienceID,
 		"memorySession": map[string]any{
 			"sessionId": memoryID, "participantToken": memoryToken, "expiresAt": memoryExpires, "deleteAfter": memoryDeleteAfter,
+			"campusGraphVersion": s.cfg.CampusGraphVersion,
 		},
 		"displayAlias": map[string]string{"color": color, "symbol": symbol},
 	}

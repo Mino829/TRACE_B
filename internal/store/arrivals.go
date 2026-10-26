@@ -25,11 +25,25 @@ type ReplayCandidate struct {
 	ReadyPhotoCount int    `json:"readyPhotoCount"`
 }
 
-// ArrivalConfirmed reports whether the memory has a durable arrival event.
-func (s *Store) ArrivalConfirmed(ctx context.Context, memoryID string) (bool, error) {
-	var confirmed bool
-	err := s.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM arrival_events WHERE memory_session_id=$1)`, memoryID).Scan(&confirmed)
-	return confirmed, err
+// ArrivalRouteExpected mirrors the conditions for appendArrivalSegment. A
+// confirmed arrival need not yield a segment when its checkpoint was retired
+// or the last ready photo was captured after arrival.
+func (s *Store) ArrivalRouteExpected(ctx context.Context, memoryID string, lastCaptured time.Time) (bool, error) {
+	if s.routes == nil || lastCaptured.IsZero() {
+		return false, nil
+	}
+	var checkpointID string
+	var arrivedAt time.Time
+	err := s.q.QueryRowContext(ctx, `SELECT checkpoint_id,arrived_at FROM arrival_events WHERE memory_session_id=$1`,
+		memoryID).Scan(&checkpointID, &arrivedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, ok := s.routes.CheckpointNode(checkpointID)
+	return ok && !lastCaptured.After(arrivedAt), nil
 }
 
 func (s *Store) arrivalForMemory(ctx context.Context, memoryID string) (Arrival, error) {
