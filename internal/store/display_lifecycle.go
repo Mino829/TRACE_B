@@ -100,9 +100,10 @@ func (s *Store) RetryDisplayArrival(ctx context.Context, id string, now time.Tim
 			return ErrConflict
 		}
 		result, err := tx.q.ExecContext(ctx, `UPDATE arrival_events a SET replay_status='queued',skip_reason=NULL,replay_started_at=NULL,
- replay_finished_at=NULL,renderer_lease_id=NULL,photo_wait_until=$2,replay_deadline=$3
+ replay_finished_at=NULL,renderer_lease_id=NULL,photo_wait_until=$2,replay_deadline=a.arrived_at+$3
  FROM memory_sessions m WHERE a.id=$1 AND a.memory_session_id=m.id AND m.deleting=FALSE AND m.expires_at>$2
- AND a.replay_status='skipped' AND a.skip_reason='renderer_failure'`, id, now, now.Add(ArrivalQueueTimeout))
+ AND a.replay_status='skipped' AND a.skip_reason='renderer_failure' AND a.arrived_at+$3>$2`,
+			id, now, ArrivalQueueTimeout)
 		if err != nil {
 			return err
 		}
