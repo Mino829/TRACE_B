@@ -78,7 +78,7 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | POST | /v1/operator/arrivals/{arrivalId}/retry |
 | GET (WSS) | /v1/display/ws |
 
-到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定し、端末内写真は`checkpointId`から別のメタデータ経路を作ります。写真ピン・フォトスポット描画イベントと経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
+到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定し、端末内写真は`checkpointId`から別のメタデータ経路を作ります。端末内写真の到着時・描画機再接続時・到着後の写真追加/削除時には写真地点とノード経路を描画WSへ投影します。Frontend `/display`での再生、旧写真の到着演出素材、写真ピン・フォトスポット、およびその他の運営APIは未統合です。
 新規写真メタデータは既定で無効です。旧写真ストレージは既存データが消えるまで必要であり、コードのローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -138,11 +138,11 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 運営の専用発行器から空bodyの`POST /v1/operator/display-tokens`へ、`X-Trace-Display-Issuer-Timestamp: <Unix秒>`と`X-Trace-Display-Issuer-Signature: base64url(HMAC-SHA256(TRACE_DISPLAY_ISSUER_KEY, \"POST\\n/v1/operator/display-tokens\\n\" + timestamp))`を送ります（時差最大15秒）。レスポンス`displayToken`は2分有効で、参加者Bearer/到着運営署名と互換性がありません。`GET /v1/display/ws`へ`Authorization: Bearer <displayToken>`、`X-Trace-Schema-Version: 1`、`X-Trace-Coordinate-Version`、`X-Trace-Campus-Graph-Version`、`X-Trace-Three-D-Map-Version`（現行設定と完全一致）を付け、Origin・query stringは付けません。不一致はHTTP 409、資格エラーは401、機能無効は503です。
 
-WS接続直後の`display.snapshot`は`data.cursor`、量子化済み最新位置の`participants`、再生待ち/再生中の`arrivals`を含みます。写真marker配列は#10統合前なので**含まれません**。到着・再生イベントの`eventId`はDB連番で、欠番や再接続時はsnapshotで全置換します。`position.updated`、`position.expired`、`tracking.stopped`は各接続で最新のGoメモリ状態から生成する一時的な差分であり、`eventId`は不透明な重複排除キーです。位置差分はDBに保存・再送せず、位置のTTLは最大60秒、接続断後は次のsnapshotで復元します。写真/trajectory未提供の`participant.arrived`、`participant.phase.changed`、`participant.on_site`、`arrival.replay.requested/started/completed/failed/skipped`は永続差分です。画像、写真URL、元のGPS、参加者資格、内部セッションIDは含みません。映像へ正確な時刻やIDを表示しないでください。
+WS接続直後の`display.snapshot`は`data.cursor`、旧版の量子化済み最新位置の`participants`、再生待ち/再生中の`arrivals`を含みます。到着・再生イベントの`eventId`はDB連番で、欠番や再接続時はsnapshotで全置換します。旧`position.updated`、`position.expired`、`tracking.stopped`は各接続で最新のGoメモリ状態から生成する一時的な差分であり、`eventId`は不透明な重複排除キーです。位置差分はDBに保存・再送せず、位置のTTLは最大60秒、接続断後は次のsnapshotで復元します。`participant.arrived`とsnapshotの各`arrivals`には端末内写真の`pathNodeIds`、撮影順の`photoCheckpoints`（`checkpointId`と`capturedAt`のみ）、`replayDurationSeconds`を含めます。到着後の`photo.moment.created/deleted`は同じ到着の**更新後の全経路と写真地点**を送るため、同じ地点・撮影時刻の写真が複数でも描画機は`arrivalId`で丸ごと置換できます。到着前の写真変更は描画へ流さず、最初の到着イベントで現在値を渡します。保存Graph版が現行版と合わない、経路が途切れる場合は経路を空にし、旧GPS写真を新しい端末内経路へ混ぜません。画像、写真URL、PhotoMoment ID、MemorySession ID、元のGPS、参加者資格は含みません。映像へ正確な時刻やIDを表示しないでください。
 
 送信JSONはすべて`schemaVersion:1`、3種のversion、`type`を含めます。`renderer.primary.acquire`で主リースを要求し、`renderer.primary.granted`の`data.leaseId`を保存します。他接続には`renderer.primary.conflict`を返します。`arrival.replay.started`、`arrival.replay.completed`、`arrival.replay.failed`にはクライアント生成の一意な`eventId`（8～128文字）、`arrivalId`、`leaseId`を指定します。成功は`renderer.ack`、競合・失効は`renderer.rejected`です。同じeventId・同じ操作の再送は24時間同じ結果となり、異なる内容は拒否します。切断/30秒heartbeat欠落/リース期限切れは再生中を`skipped`に確定し、別端末による自動再生はしません。運営の署名済み明示retryのみが再投入できます。10秒間隔のping/pong（または`renderer.heartbeat`）と30秒応答期限を設け、50分でWSを終了します。Cloud Run設定は3600秒で、クライアント側は切断時に指数バックオフで**新しい資格を取得し**snapshotから再接続します。
 
-旧版で受け付けた最新の量子化済み位置は単一BackendのGoメモリにのみ保持し、PostgreSQLには保存しません。到着・再生イベントと主描画機leaseだけをDBに保存します。旧位置は新たに受け付けず、TTL切れ後は描画snapshotから消えます。複数Backend間で位置は共有されないため、**APIとWebSocketは同じ1インスタンス**へ接続し、Cloud Runの最大インスタンス数を1としてください。DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。写真地点の本人`/v2` APIは追加しましたが、描画WebSocketの写真地点・経路payloadは別途Frontend/展示との統合が必要です。
+旧版で受け付けた最新の量子化済み位置は単一BackendのGoメモリにのみ保持し、PostgreSQLには保存しません。到着・再生イベントと主描画機leaseだけをDBに保存します。旧位置は新たに受け付けず、TTL切れ後は描画snapshotから消えます。複数Backend間で位置は共有されないため、**APIとWebSocketは同じ1インスタンス**へ接続し、Cloud Runの最大インスタンス数を1としてください。DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。設計`docs/api.md`の`participant.arrived` JSON例には`sessionId`と`photoMomentId`が残っていますが、同資料の公開情報制限および`docs/privacy.md`の禁止に従い描画へ送信しません。設計例の修正、旧位置差分の廃止、Frontendでの描画統合は別途必要です。
 
 ## 旧クラウド写真の設定とライフサイクル
 

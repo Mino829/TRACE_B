@@ -37,9 +37,16 @@ type DisplayState struct {
 	Arrivals     []DisplayArrival     `json:"arrivals"`
 }
 type DisplayArrival struct {
-	ArrivalID    string       `json:"arrivalId"`
-	ReplayStatus string       `json:"replayStatus"`
-	DisplayAlias DisplayAlias `json:"displayAlias"`
+	ArrivalID             string                   `json:"arrivalId"`
+	ReplayStatus          string                   `json:"replayStatus"`
+	DisplayAlias          DisplayAlias             `json:"displayAlias"`
+	PathNodeIDs           []string                 `json:"pathNodeIds"`
+	PhotoCheckpoints      []DisplayPhotoCheckpoint `json:"photoCheckpoints"`
+	ReplayDurationSeconds int                      `json:"replayDurationSeconds"`
+}
+type DisplayPhotoCheckpoint struct {
+	CheckpointID string    `json:"checkpointId"`
+	CapturedAt   time.Time `json:"capturedAt"`
 }
 
 // AppendDisplayEvent MUST run inside the mutation's transaction for atomic fan-out.
@@ -74,25 +81,42 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 		if err := tx.q.QueryRowContext(ctx, `SELECT last_id FROM display_cursor WHERE singleton=TRUE FOR UPDATE`).Scan(&state.Cursor); err != nil {
 			return err
 		}
-		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,e.display_color,e.display_symbol FROM arrival_events a
+		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,e.display_color,e.display_symbol,
+ a.memory_session_id,m.photo_mode,COALESCE(m.campus_graph_version,'') FROM arrival_events a
  JOIN memory_sessions m ON m.id=a.memory_session_id JOIN experiences e ON e.memory_session_id=m.id
  WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$1 ORDER BY a.arrived_at,a.id`, now)
 		if err != nil {
 			return err
 		}
+		type arrivalRow struct {
+			arrival                      DisplayArrival
+			memoryID, photoMode, version string
+		}
+		var arrivals []arrivalRow
 		for rows.Next() {
-			var a DisplayArrival
-			err = rows.Scan(&a.ArrivalID, &a.ReplayStatus, &a.DisplayAlias.Color, &a.DisplayAlias.Symbol)
+			var a arrivalRow
+			err = rows.Scan(&a.arrival.ArrivalID, &a.arrival.ReplayStatus,
+				&a.arrival.DisplayAlias.Color, &a.arrival.DisplayAlias.Symbol, &a.memoryID, &a.photoMode, &a.version)
 			if err != nil {
 				break
 			}
-			state.Arrivals = append(state.Arrivals, a)
+			arrivals = append(arrivals, a)
 		}
 		if err == nil {
 			err = rows.Err()
 		}
 		rows.Close()
-		return err
+		if err != nil {
+			return err
+		}
+		for _, a := range arrivals {
+			projected, err := tx.projectDisplayArrival(ctx, a.arrival, a.memoryID, a.photoMode, a.version)
+			if err != nil {
+				return err
+			}
+			state.Arrivals = append(state.Arrivals, projected)
+		}
+		return nil
 	})
 	if err == nil {
 		for _, p := range s.DisplayPositions(now) {
@@ -103,6 +127,92 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 		})
 	}
 	return state, err
+}
+
+// The renderer receives only ordered checkpoint/time pairs and graph node IDs.
+// A missing or retired segment never becomes a partial or reinterpreted route.
+func (s *Store) projectDisplayArrival(ctx context.Context, a DisplayArrival, memoryID, photoMode, graphVersion string) (DisplayArrival, error) {
+	a.PathNodeIDs = []string{}
+	a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
+	a.ReplayDurationSeconds = 15
+	if photoMode != PhotoModeDevice || s.routes == nil || graphVersion != s.routes.CampusGraphVersion {
+		return a, nil
+	}
+	moments, err := s.PhotoMoments(ctx, memoryID)
+	if err != nil {
+		return a, err
+	}
+	for _, p := range moments {
+		if p.CampusGraphVersion != graphVersion {
+			a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
+			return a, nil
+		}
+		if _, ok := s.routes.CheckpointNode(p.CheckpointID); !ok {
+			a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
+			return a, nil
+		}
+		a.PhotoCheckpoints = append(a.PhotoCheckpoints, DisplayPhotoCheckpoint{CheckpointID: p.CheckpointID, CapturedAt: p.CapturedAt})
+	}
+	if len(moments) == 0 {
+		return a, nil
+	}
+	segments, err := s.MomentRouteSegments(ctx, memoryID)
+	if err != nil {
+		return a, err
+	}
+	// One segment per photo: adjacent photos, then the final photo to arrival.
+	if len(segments) != len(moments) {
+		return a, nil
+	}
+	for i, segment := range segments {
+		if segment.FromPhotoMomentID != moments[i].ID ||
+			segment.CoordinateVersion != s.routes.CoordinateVersion ||
+			segment.CampusGraphVersion != graphVersion ||
+			segment.ThreeDMapVersion != s.routes.ThreeDMapVersion ||
+			len(segment.PathNodeIDs) == 0 ||
+			(i < len(moments)-1 && (segment.ToPhotoMomentID == nil || *segment.ToPhotoMomentID != moments[i+1].ID)) ||
+			(i == len(moments)-1 && segment.ToPhotoMomentID != nil) {
+			a.PathNodeIDs = []string{}
+			return a, nil
+		}
+		if i > 0 {
+			if a.PathNodeIDs[len(a.PathNodeIDs)-1] != segment.PathNodeIDs[0] {
+				a.PathNodeIDs = []string{}
+				return a, nil
+			}
+			a.PathNodeIDs = append(a.PathNodeIDs, segment.PathNodeIDs[1:]...)
+		} else {
+			a.PathNodeIDs = append(a.PathNodeIDs, segment.PathNodeIDs...)
+		}
+	}
+	return a, nil
+}
+
+// Photo mutations after arrival replace the whole projection: point/time pairs
+// alone cannot identify one deleted photo when capture timestamps coincide.
+func (s *Store) appendDisplayPhotoChange(ctx context.Context, memoryID, kind string, now time.Time) error {
+	if !s.displayEnabled {
+		return nil
+	}
+	var a DisplayArrival
+	var photoMode, graphVersion string
+	err := s.q.QueryRowContext(ctx, `SELECT a.id,a.replay_status,e.display_color,e.display_symbol,m.photo_mode,COALESCE(m.campus_graph_version,'')
+ FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
+ JOIN experiences e ON e.memory_session_id=m.id
+ WHERE a.memory_session_id=$1 AND a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$2`,
+		memoryID, now).Scan(&a.ArrivalID, &a.ReplayStatus, &a.DisplayAlias.Color, &a.DisplayAlias.Symbol, &photoMode, &graphVersion)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	a, err = s.projectDisplayArrival(ctx, a, memoryID, photoMode, graphVersion)
+	if err != nil {
+		return err
+	}
+	_, err = s.AppendDisplayEvent(ctx, kind, a, now)
+	return err
 }
 
 var ErrDisplayResync = errors.New("display event cursor expired; resync required")
