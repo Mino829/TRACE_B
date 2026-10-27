@@ -122,15 +122,15 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 発行されるproofは`base64url(JSON).base64url(HMAC-SHA256(TRACE_ARRIVAL_PROOF_KEY, base64url(JSON)))`です。JSONには`checkpointId`、`venue`、`issuedAt`/`expiresAt`（Unix秒）、ランダム`nonce`を含み、有効期間は25秒です。参加端末は`POST /v1/memory-sessions/{memorySessionId}/arrival`へMemory Bearer、`Idempotency-Key`（ランダム値）、JSON `{"checkpointToken":"...","experienceLinkToken":"...","clientTime":"..."}`を送ります。`clientTime`は判定に使わずサーバー時刻を正とします。改変・他会場・期限切れ・未来発行は403、別トークンによる別セッションへの操作は認証で拒否します。投影QRは複数来場者が読むため同一proofを**別Memory間では共有可能**です。同一Memoryへの二重到着は1件のArrivalEventとなり、24時間の同一キー/同一内容の再送は期限切れQRでも元の結果を返します。同一キー/別内容は409、Memory削除と同時に到着・再送記録も消えます。
 
-到着済みMemorySessionへ別のキーと新しい有効なQRで再送した場合は新たな到着を作らず、期限切れで待機中ならDBの`timeout` skipと描画差分を確定し、現在の演出状態を返します。初回receiptと状態が異なる場合もあるため、最新状態は本人`GET /v1/experiences/{experienceId}`から取得します。本人閲覧・削除は演出skip後も維持します。
+到着済みMemorySessionへ別のキーと新しい有効なQRで再送した場合は新たな到着を作らず、現在の演出状態を返します。30秒待機による`timeout`は行いません。初回receiptと状態が異なる場合もあるため、最新状態は本人`GET /v1/experiences/{experienceId}`から取得します。同一キーの元応答再現は維持し、本人閲覧・削除は演出skip後も維持します。
 
 有効なExperienceLinkを持つ旧MemorySessionでは当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。位置書込みと`on_site`継続は廃止済みで、旧Liveでも明示的な停止・本人削除はできます。新規MemorySessionはLiveとのlinkなしで写真0枚でも到着できます。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。
 
-到着は写真機能無効でも有効で、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOの待機上限は10件（`playing`は含まない）。満杯でも到着自体を記録して演出だけ`skipped`（`queue_full`）とし、到着から30秒以内に再生を開始できない候補は`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`も未再生の演出だけをスキップします。
+到着は写真機能無効でも有効で、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ開始を遅らせ、後から来た到着が追い越さないようにします。永続FIFOの安全上限は有効なMemorySessionの待機50件（`playing`は含まない）。通常待機には再生開始期限を設けず、30秒を過ぎても順番を待ちます。51件目の新規到着は`503 ARRIVAL_QUEUE_FULL`と`Retry-After: 5`を返し、到着・再送記録・Push停止・旧Liveの到着更新を一切確定しません。空きができた後は同じキーと内容で再試行できますが、初回到着には受信時点で有効なQRが必要です。QRが期限切れなら読み直して新しい内容とキーで送ります。MemorySessionの期限切れ・削除時は待機と描画対象から除外し、無期限に個人データを保持しません。本人`POST .../arrival/skip`は未再生の演出だけをスキップします。
 
-運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）で再生可能な到着IDとready写真**件数**だけを返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。`POST /v1/operator/arrivals/{arrivalId}/retry`は描画機障害によるskipに限り、到着から30秒以内・待機枠に余裕がある場合だけ同じ運営署名で明示的に再キュー投入します。再投入で元の到着期限は延長しません。本人GETにキュー順は出しません。演出の状態変更は主描画機leaseを確認したWSSだけが行い、運営候補照会では`playing`へ移りません。
+運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）でFIFOの再生候補IDとready写真**件数**を返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。既存の明示`retry`は描画機障害によるskipに限り、MemorySessionが有効で待機枠がある場合に再投入します。通常待機の30秒期限は再試行にも適用しません。本人GETにキュー順は出しません。主描画機は通常の開始要求を自動送信し、Backendが先頭の有効な到着であること、pending写真待機条件、他の再生がないことを検証して`playing`を確定します。後続の先行開始・重複再生は`renderer.rejected`です。終了画面4秒の維持とQRの表示制御はFrontendの責務で、Backendの到着状態やタイマーは追加しません。
 
-`012_arrival_queue_bounds.sql`は旧キューの期限を到着から30秒へ短縮し、期限切れ・新上限からあふれた到着の演出をskipして同じDBトランザクションで描画差分も保存します。到着・本人用データは削除しません。既存の受付停止・旧API revision停止・バックアップ・`010`〜`012`の明示migration・実行ユーザーへの権限再適用後に切り替えてください。旧Live/位置APIの移行方針は冒頭のBackend #26を参照してください。
+`013_arrival_fifo_queue.sql`で`replay_deadline`と関連制約・indexを撤去し、`playing`が全体で最大1件となる部分一意indexを追加します。既存の複数`playing`は自動修復せずmigrationを拒否するため、切替前に運営操作で整理してください。**受付停止→既存の待機・再生を処理/明示skipしてキューを空にする→旧API/清掃revisionを停止→バックアップ→明示migration→実行権限再適用→新revisionのready確認**の順に切り替えます。`012`は変更しない履歴であり、未適用環境ではその10件/30秒skipが`013`より先に実行されます。既存待機を残したまま更新しないでください。既にskipされた演出は`013`でも復活させません。schema非互換のため旧バイナリへ直接ロールバックしないでください。旧Live/位置APIの移行方針は冒頭のBackend #26を参照してください。
 
 ## 描画WebSocket（既定無効）
 

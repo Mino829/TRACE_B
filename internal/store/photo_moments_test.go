@@ -172,8 +172,8 @@ func TestPhotoMomentQuotaArrivalAndExpiry(t *testing.T) {
 		t.Fatalf("quota did not recover while sequence stayed stable: %+v %v", p, err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until,replay_deadline)
- VALUES ('device-arrived',$1,'qr','cp-b','queued',$2,$2,$3)`, id, now.Add(time.Minute), now.Add(2*time.Minute)); err != nil {
+ (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until)
+ VALUES ('device-arrived',$1,'qr','cp-b','queued',$2,$2)`, id, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Store.RefreshMomentRoutes(t.Context(), id, now); err != nil {

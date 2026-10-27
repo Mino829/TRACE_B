@@ -229,7 +229,9 @@ func (s *Store) RefreshDisplay(ctx context.Context, now time.Time) error {
 	if err := s.Transaction(ctx, "display:lease", func(tx *Store) error { return tx.expireDisplayLease(ctx, now) }); err != nil {
 		return err
 	}
-	return s.ExpireArrivals(ctx, now)
+	return s.Transaction(ctx, "display:expired-memories", func(tx *Store) error {
+		return tx.removeExpiredMemoryDisplay(ctx, now)
+	})
 }
 
 // Lease is fenced by an unpredictable ID and holder connection ID, in SQL.
@@ -338,6 +340,9 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		previous, next := "queued", "playing"
 		switch action {
 		case "arrival.replay.started":
+			if err := tx.lockTransaction(ctx, "arrival:queue"); err != nil {
+				return err
+			}
 		case "arrival.replay.completed":
 			previous, next = "playing", "completed"
 		case "arrival.replay.failed":
@@ -350,7 +355,14 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
  replay_finished_at=CASE WHEN $2<>'playing' THEN $4 ELSE replay_finished_at END,
  skip_reason=CASE WHEN $2='skipped' THEN 'renderer_failure' ELSE skip_reason END
  WHERE id=$1 AND replay_status=$5 AND (renderer_lease_id IS NULL OR renderer_lease_id=$3)
- AND ($2<>'playing' OR (replay_deadline>$4 AND (photo_wait_until<=$4 OR NOT EXISTS
+ AND ($2<>'playing' OR (
+ EXISTS (SELECT 1 FROM memory_sessions m WHERE m.id=arrival_events.memory_session_id
+ AND m.deleting=FALSE AND m.expires_at>$4)
+ AND NOT EXISTS (SELECT 1 FROM arrival_events playing WHERE playing.replay_status='playing')
+ AND id=(SELECT head.id FROM arrival_events head JOIN memory_sessions m ON m.id=head.memory_session_id
+ WHERE head.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$4
+ ORDER BY head.arrived_at,head.id LIMIT 1)
+ AND (photo_wait_until<=$4 OR NOT EXISTS
  (SELECT 1 FROM photos p WHERE p.memory_session_id=arrival_events.memory_session_id AND p.status='pending'))))`
 		result, err := tx.q.ExecContext(ctx, query, arrivalID, next, lease, now, previous)
 		if err != nil {

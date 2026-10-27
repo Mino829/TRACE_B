@@ -38,7 +38,7 @@ func TestArrivalBoundsMigrationPreservesArrivalAndDisplayState(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.Migrate(ctx); err != nil {
+	if err := store.migrate(ctx, migrations[:12]); err != nil {
 		t.Fatal(err)
 	}
 	var total, queued, timedOut, full, events int
@@ -74,7 +74,7 @@ func TestArrivalBoundsMigrationPreservesArrivalAndDisplayState(t *testing.T) {
 	if cursor != 5 || firstSkippedID != 2 {
 		t.Fatalf("render cursor continuity: cursor=%d first skip=%d", cursor, firstSkippedID)
 	}
-	if err := store.Migrate(ctx); err != nil {
+	if err := store.migrate(ctx, migrations[:12]); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM display_events").Scan(&events); err != nil || events != 5 {
