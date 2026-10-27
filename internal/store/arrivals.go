@@ -112,9 +112,6 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 					}
 					if n, _ := result.RowsAffected(); n == 1 {
 						a.LivePresencePhase = "arrived"
-						if err := tx.linkedDisplayPhase(ctx, memoryID, "participant.phase.changed", now); err != nil {
-							return err
-						}
 					}
 				}
 				if err := tx.EndPushForMemory(ctx, memoryID); err != nil {
@@ -151,12 +148,8 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 					return err
 				}
 				if tx.displayEnabled {
-					alias, err := tx.arrivalDisplayAlias(ctx, memoryID)
-					if err != nil {
-						return err
-					}
 					projected, err := tx.projectDisplayArrival(ctx, DisplayArrival{
-						ArrivalID: a.ID, ReplayStatus: a.Status, DisplayAlias: alias,
+						ArrivalID: a.ID, ReplayStatus: a.Status,
 					}, memoryID, photoMode, graphVersion)
 					if err != nil {
 						return err

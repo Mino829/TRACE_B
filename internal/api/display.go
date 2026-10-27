@@ -183,11 +183,6 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 	if err := sendDisplay(conn, s.frame(strconv.FormatInt(cursor, 10), "display.snapshot", state)); err != nil {
 		return
 	}
-	// Position deltas are per-connection and never replayed from PostgreSQL.
-	observed := make(map[string]store.DisplayParticipant, len(state.Participants))
-	for _, p := range state.Participants {
-		observed[p.LivePresenceID] = p
-	}
 	messages := make(chan displayMessage, 16)
 	readErr := make(chan error, 1)
 	conn.SetReadLimit(256 << 10)
@@ -255,10 +250,6 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 				if sendDisplay(conn, s.frame(strconv.FormatInt(cursor, 10), "display.snapshot", state)) != nil {
 					return
 				}
-				observed = make(map[string]store.DisplayParticipant, len(state.Participants))
-				for _, p := range state.Participants {
-					observed[p.LivePresenceID] = p
-				}
 				continue
 			}
 			if err != nil {
@@ -272,26 +263,6 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 				}
 				cursor = event.ID
 			}
-			positions := s.store.DisplayPositions(s.now().UTC())
-			for id, p := range positions {
-				if prior, found := observed[id]; !found || prior != p {
-					if sendDisplay(conn, s.frame(randomID("position"), "position.updated", p)) != nil {
-						return
-					}
-				}
-			}
-			for id, p := range observed {
-				if _, found := positions[id]; !found {
-					kind := "tracking.stopped"
-					if !s.now().UTC().Before(p.ExpiresAt) {
-						kind = "position.expired"
-					}
-					if sendDisplay(conn, s.frame(randomID("position"), kind, map[string]string{"livePresenceId": id})) != nil {
-						return
-					}
-				}
-			}
-			observed = positions
 		case msg := <-messages:
 			if time.Since(window) >= time.Second {
 				window = time.Now()

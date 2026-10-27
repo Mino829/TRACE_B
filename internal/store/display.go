@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"sort"
 	"time"
 )
 
@@ -17,29 +16,13 @@ type DisplayEvent struct {
 	OccurredAt time.Time       `json:"occurredAt"`
 	Data       json.RawMessage `json:"data"`
 }
-type DisplayParticipant struct {
-	LivePresenceID string       `json:"livePresenceId"`
-	X              float64      `json:"x"`
-	Z              float64      `json:"z"`
-	AccuracyM      float64      `json:"accuracyM"`
-	DisplayAlias   DisplayAlias `json:"displayAlias"`
-	PresencePhase  string       `json:"presencePhase"`
-	LastUpdatedAt  time.Time    `json:"lastUpdatedAt"`
-	ExpiresAt      time.Time    `json:"expiresAt"`
-}
-type DisplayAlias struct {
-	Color  string `json:"color"`
-	Symbol string `json:"symbol"`
-}
 type DisplayState struct {
-	Cursor       int64                `json:"cursor"`
-	Participants []DisplayParticipant `json:"participants"`
-	Arrivals     []DisplayArrival     `json:"arrivals"`
+	Cursor   int64            `json:"cursor"`
+	Arrivals []DisplayArrival `json:"arrivals"`
 }
 type DisplayArrival struct {
 	ArrivalID             string                   `json:"arrivalId"`
 	ReplayStatus          string                   `json:"replayStatus"`
-	DisplayAlias          DisplayAlias             `json:"displayAlias"`
 	PathNodeIDs           []string                 `json:"pathNodeIds"`
 	PhotoCheckpoints      []DisplayPhotoCheckpoint `json:"photoCheckpoints"`
 	ReplayDurationSeconds int                      `json:"replayDurationSeconds"`
@@ -73,17 +56,16 @@ func (s *Store) AppendDisplayEvent(ctx context.Context, kind string, data any, n
 	return id, err
 }
 
-// Durable arrival state and its cursor share a transaction cut. Positions are
-// volatile and are copied separately; a following poll catches any concurrent change.
+// Durable arrivals and their cursor share a transaction cut.
 func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayState, error) {
-	state := DisplayState{Participants: []DisplayParticipant{}, Arrivals: []DisplayArrival{}}
+	state := DisplayState{Arrivals: []DisplayArrival{}}
 	err := s.Transaction(ctx, "display:snapshot", func(tx *Store) error {
 		if err := tx.q.QueryRowContext(ctx, `SELECT last_id FROM display_cursor WHERE singleton=TRUE FOR UPDATE`).Scan(&state.Cursor); err != nil {
 			return err
 		}
-		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,e.display_color,e.display_symbol,
+		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,
  a.memory_session_id,m.photo_mode,COALESCE(m.campus_graph_version,'') FROM arrival_events a
- JOIN memory_sessions m ON m.id=a.memory_session_id JOIN experiences e ON e.memory_session_id=m.id
+ JOIN memory_sessions m ON m.id=a.memory_session_id
  WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$1 ORDER BY a.arrived_at,a.id`, now)
 		if err != nil {
 			return err
@@ -95,8 +77,7 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 		var arrivals []arrivalRow
 		for rows.Next() {
 			var a arrivalRow
-			err = rows.Scan(&a.arrival.ArrivalID, &a.arrival.ReplayStatus,
-				&a.arrival.DisplayAlias.Color, &a.arrival.DisplayAlias.Symbol, &a.memoryID, &a.photoMode, &a.version)
+			err = rows.Scan(&a.arrival.ArrivalID, &a.arrival.ReplayStatus, &a.memoryID, &a.photoMode, &a.version)
 			if err != nil {
 				break
 			}
@@ -118,14 +99,6 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 		}
 		return nil
 	})
-	if err == nil {
-		for _, p := range s.DisplayPositions(now) {
-			state.Participants = append(state.Participants, p)
-		}
-		sort.Slice(state.Participants, func(i, j int) bool {
-			return state.Participants[i].LivePresenceID < state.Participants[j].LivePresenceID
-		})
-	}
 	return state, err
 }
 
@@ -196,11 +169,10 @@ func (s *Store) appendDisplayPhotoChange(ctx context.Context, memoryID, kind str
 	}
 	var a DisplayArrival
 	var photoMode, graphVersion string
-	err := s.q.QueryRowContext(ctx, `SELECT a.id,a.replay_status,e.display_color,e.display_symbol,m.photo_mode,COALESCE(m.campus_graph_version,'')
+	err := s.q.QueryRowContext(ctx, `SELECT a.id,a.replay_status,m.photo_mode,COALESCE(m.campus_graph_version,'')
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
- JOIN experiences e ON e.memory_session_id=m.id
  WHERE a.memory_session_id=$1 AND a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$2`,
-		memoryID, now).Scan(&a.ArrivalID, &a.ReplayStatus, &a.DisplayAlias.Color, &a.DisplayAlias.Symbol, &photoMode, &graphVersion)
+		memoryID, now).Scan(&a.ArrivalID, &a.ReplayStatus, &photoMode, &graphVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -252,22 +224,7 @@ func (s *Store) DisplayEvents(ctx context.Context, cursor int64, limit int) ([]D
 	return events, nil
 }
 
-// DisplayPositions returns only the current quantized, display-scoped projection.
-// No coordinate or position event is written to PostgreSQL.
-func (s *Store) DisplayPositions(now time.Time) map[string]DisplayParticipant {
-	s.positions.mu.RLock()
-	defer s.positions.mu.RUnlock()
-	points := make(map[string]DisplayParticipant, len(s.positions.projected))
-	for _, p := range s.positions.projected {
-		if now.Before(p.ExpiresAt) {
-			points[p.LivePresenceID] = p
-		}
-	}
-	return points
-}
-
-// Arrival and lease state are durable. Position expiry is observed by WS polls
-// and a fresh snapshot never exposes an expired cached value.
+// Arrival and lease state are durable; a resync snapshot includes current replay state.
 func (s *Store) RefreshDisplay(ctx context.Context, now time.Time) error {
 	if err := s.Transaction(ctx, "display:lease", func(tx *Store) error { return tx.expireDisplayLease(ctx, now) }); err != nil {
 		return err
