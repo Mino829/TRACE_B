@@ -419,7 +419,7 @@ func TestDisplayDevicePhotoRouteArrivalSnapshotAndMutations(t *testing.T) {
 	nextDisplay(t, conn, "display.snapshot")
 	owner := createExperience(t, handler, cfg)
 	base := "/v2/memory-sessions/" + owner.Memory.SessionID + "/photos"
-	captured := time.Now().UTC()
+	captured := time.Now().UTC().Truncate(time.Microsecond)
 	create := func(clientID, checkpoint string) string {
 		t.Helper()
 		r := request(t, handler, "POST", base, devicePhotoBody(clientID, checkpoint, captured),
