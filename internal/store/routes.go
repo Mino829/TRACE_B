@@ -37,10 +37,14 @@ type RouteSegment struct {
 }
 
 func (s *Store) RouteSegments(ctx context.Context, memoryID string) ([]RouteSegment, error) {
-	rows, err := s.q.QueryContext(ctx, `SELECT id,from_photo_moment_id,to_photo_moment_id,coordinate_version,campus_graph_version,
+	return s.routeSegments(ctx, memoryID, `SELECT id,from_photo_moment_id,to_photo_moment_id,coordinate_version,campus_graph_version,
  three_d_map_version,algorithm_version,confidence,path,path_node_ids,length_m FROM route_segments WHERE memory_session_id=$1
  ORDER BY (SELECT captured_at FROM photos WHERE id=from_photo_moment_id),
- (SELECT sequence_no FROM photos WHERE id=from_photo_moment_id)`, memoryID)
+ (SELECT sequence_no FROM photos WHERE id=from_photo_moment_id)`)
+}
+
+func (s *Store) routeSegments(ctx context.Context, memoryID, query string) ([]RouteSegment, error) {
+	rows, err := s.q.QueryContext(ctx, query, memoryID)
 	if err != nil {
 		return nil, err
 	}

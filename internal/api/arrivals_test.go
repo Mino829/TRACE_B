@@ -200,7 +200,7 @@ func TestArrivalStopsPushAtomicallyForLiveAndMemoryOnly(t *testing.T) {
 				}
 			}
 			sub := store.PushSubscription{MemorySessionID: memoryID, EndpointEncrypted: []byte("encrypted-endpoint"),
-				KeysEncrypted: []byte("encrypted-keys"), IntervalMinutes: 15}
+				KeysEncrypted: []byte("encrypted-keys"), IntervalMinutes: 30}
 			if _, err := f.Store.PutPush(t.Context(), sub, time.Now().UTC()); err != nil {
 				t.Fatal(err)
 			}

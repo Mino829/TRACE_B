@@ -110,6 +110,44 @@ func TestCheckpointRouteVersionMigrationAfterApplied008(t *testing.T) {
 	}
 }
 
+func TestDeviceMetadataMigrationPreservesLegacySessions(t *testing.T) {
+	store, db := migrationTestStore(t)
+	ctx := t.Context()
+	steps := migrationSteps(t)
+	if err := store.migrate(ctx, steps[:9]); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	_, err := db.ExecContext(ctx, `INSERT INTO memory_sessions
+ (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after,campus_graph_version)
+ VALUES ('old-memory','v1','ja','secret',$1,$2,$3,'g1')`, now, now.Add(time.Hour), now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	memory, err := store.MemorySession(ctx, "old-memory")
+	if err != nil || memory.PhotoMode != "legacy" {
+		t.Fatalf("old session lost legacy mode: %+v %v", memory, err)
+	}
+	_, err = store.CreatePhoto(ctx, Photo{ID: "old-photo", MemorySessionID: memory.ID, ClientPhotoID: "old-client",
+		RequestHash: "request", CapturedAt: now, UploadExpiresAt: now.Add(time.Minute),
+		MIMEType: "image/jpeg", SHA256: "digest", SizeBytes: 128, Width: 8, Height: 8,
+		StageKey: "stage-old", ObjectKey: "object-old"}, now)
+	if err != nil {
+		t.Fatal("legacy upload interrupted by migration:", err)
+	}
+	for _, table := range []string{"photo_moments", "photo_moment_fences", "moment_route_segments"} {
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
+ WHERE table_schema=current_schema() AND table_name=$1 AND column_name IN
+ ('latitude','longitude','accuracy_m','mime_type','sha256','size_bytes','width','height','object_key','stage_key','image_url')`, table).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("%s has forbidden image/location columns: %d %v", table, count, err)
+		}
+	}
+}
+
 func TestMigrationIncrementalAndReadiness(t *testing.T) {
 	store, db := migrationTestStore(t)
 	ctx := t.Context()

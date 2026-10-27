@@ -78,7 +78,8 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			}
 			var expires time.Time
 			var deleting bool
-			err = tx.q.QueryRowContext(ctx, `SELECT expires_at,deleting FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &deleting)
+			var photoMode string
+			err = tx.q.QueryRowContext(ctx, `SELECT expires_at,deleting,photo_mode FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &deleting, &photoMode)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -139,10 +140,14 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				if err != nil {
 					return err
 				}
-				// The arrival is durable; its checkpoint may now extend the route
-				// from the session's newest photo. Photos absent or unresolvable
-				// simply produce no additional segment.
-				if err := tx.reconcileRoutes(ctx, memoryID); err != nil {
+				// The route extension uses the storage contract pinned at
+				// registration; old uploaded assets remain independent.
+				if photoMode == PhotoModeDevice {
+					err = tx.reconcileMomentRoutes(ctx, memoryID)
+				} else {
+					err = tx.reconcileRoutes(ctx, memoryID)
+				}
+				if err != nil {
 					return err
 				}
 				alias, err := tx.arrivalDisplayAlias(ctx, memoryID)
@@ -259,6 +264,7 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
 	}
 	rows, err := s.q.QueryContext(ctx, `SELECT a.id,
  (SELECT COUNT(*) FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='ready')
+ + (SELECT COUNT(*) FROM photo_moments p WHERE p.memory_session_id=a.memory_session_id)
  FROM arrival_events a WHERE a.replay_status='queued' AND a.replay_deadline>$1
  AND (a.photo_wait_until<=$1 OR NOT EXISTS (
  SELECT 1 FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='pending'))

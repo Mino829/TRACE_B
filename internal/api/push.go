@@ -21,7 +21,7 @@ type patchPushRequest struct {
 	Status          *string `json:"status"`
 }
 
-func validInterval(n int) bool { return n == 15 || n == 30 }
+func validInterval(n int) bool { return n == 30 }
 
 func (s *Server) pushAvailable(w http.ResponseWriter, r *http.Request) bool {
 	if s.cfg.PushEnabled && s.push != nil {

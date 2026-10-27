@@ -49,6 +49,7 @@ func TestPushAPIRequiresConsentAndNeverExposesCredentials(t *testing.T) {
 	for _, invalid := range []string{
 		fmt.Sprintf(`{"consent":false,"subscription":{"endpoint":%q,"keys":{"p256dh":%q,"auth":%q}},"intervalMinutes":30}`, endpoint, public, auth),
 		fmt.Sprintf(`{"consent":true,"subscription":{"endpoint":%q,"keys":{"p256dh":%q,"auth":%q}},"intervalMinutes":20}`, endpoint, public, auth),
+		fmt.Sprintf(`{"consent":true,"subscription":{"endpoint":%q,"keys":{"p256dh":%q,"auth":%q}},"intervalMinutes":15}`, endpoint, public, auth),
 		fmt.Sprintf(`{"consent":true,"subscription":{"endpoint":"https://127.0.0.1/internal","keys":{"p256dh":%q,"auth":%q}},"intervalMinutes":30}`, public, auth),
 	} {
 		if r := request(t, h, http.MethodPut, path, invalid, headers); r.Code != 400 {
@@ -76,6 +77,9 @@ func TestPushAPIRequiresConsentAndNeverExposesCredentials(t *testing.T) {
 	wrong := append([]byte{}, ciphertext...)
 	if _, err := sender.Open("other-memory", wrong); err == nil {
 		t.Fatal("ciphertext not session bound")
+	}
+	if r := request(t, h, http.MethodPatch, path, `{"intervalMinutes":15}`, headers); r.Code != http.StatusBadRequest {
+		t.Fatalf("retired 15-minute interval accepted: %d %s", r.Code, r.Body.String())
 	}
 	r = request(t, h, http.MethodPatch, path, `{"status":"paused"}`, headers)
 	if r.Code != 200 {

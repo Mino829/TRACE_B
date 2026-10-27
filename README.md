@@ -1,6 +1,6 @@
 # TRACE Backend — PostgreSQL / Google Cloud MVP
 
-匿名参加セッションと非公開写真を扱うGo APIです。GPS受付廃止の移行中で、旧LivePresence・旧写真の本人操作と期限削除だけを維持します。DBはPostgreSQL 17、公開環境はGoogle Cloud Run＋Cloud SQL for PostgreSQLを想定しています。SQLiteドライバとローカルDBファイルへの保存は廃止しました。
+匿名参加セッション、新規の端末内写真メタデータ、旧セッションの非公開クラウド写真を扱うGo APIです。旧LivePresence・旧写真の本人操作と期限削除を維持します。DBはPostgreSQL 17、公開環境はGoogle Cloud Run＋Cloud SQL for PostgreSQLを想定しています。
 
 ## GPS受付廃止の移行（Backend #26）
 
@@ -13,13 +13,23 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 
 `TRACE_REGISTRATION_OPEN=false`が既定です。参加受付を再開する前に、設計Issue #23のGPSなし要件・Backend #25の自己申告写真地点契約・設計Issue #9の同意文と保持期間を承認し、**旧版とは別の**Memory同意版と承認済み文面を設定してください。既定の同意文と版は未承認の開発用草案であり、公開してはいけません。Frontendの新規受付も承認待ちです。
 
-新規作成はMemorySessionのみ可能です。`enableLivePresence:true`は`409 LIVE_PRESENCE_DISABLED`、既存LiveSessionの`POST .../position`は本人認証後に`410 POSITION_DISABLED`、`POST .../on-site`の`continue:true`は`410 ON_SITE_DISABLED`を返します。旧Liveの`continue:false`・`/stop`・状態確認・個別削除・両トークンでの体験削除は引き続き本人の`deleteAfter`まで有効です。写真登録のGPS `location`は`400 PHOTO_LOCATION_DISABLED`で拒否し、新しい写真は参加者が撮影時に選んだCampusGraph上のチェックポイントID（`checkpointId`）を必須で受け取る。GPS列は送らず、不正・欠落・既知だが同梱Graphに存在しないIDは`400 INVALID_CHECKPOINT`を返す。保存時に本人memoryの各`moments`へ`checkpointId`を返し、旧GPS写真はnullを返す。到着QRはMemoryのみ・写真0枚でも使え、停止と期限清掃も継続します。
+新規作成はMemorySessionのみ可能です。`enableLivePresence:true`は`409 LIVE_PRESENCE_DISABLED`、既存LiveSessionの`POST .../position`は本人認証後に`410 POSITION_DISABLED`、`POST .../on-site`の`continue:true`は`410 ON_SITE_DISABLED`を返します。旧Liveの停止・状態確認・本人削除は`deleteAfter`まで有効です。旧`/v1`の写真登録はGPS `location`を`400 PHOTO_LOCATION_DISABLED`で拒否してきましたが、端末内写真へ切替後は旧写真の登録自体を停止し、新`/v2`だけが自己申告の`checkpointId`を受け付けます。到着QRはMemoryのみ・写真0枚でも使えます。
 
 新規MemorySessionには受付時のCampusGraph版を固定し、作成レスポンスの`memorySession.campusGraphVersion`で返します。写真登録時に現行版と一致しなければ`409 STATE_CONFLICT`で拒否します。旧Sessionには版がないため新しいチェックポイント写真を追加できませんが、既存写真の閲覧・削除は継続します。写真の保存版が現行Graphと違う場合、同じチェックポイントIDが残っていても新しい座標へ読み替えず、その区間を解決不能として扱います。
 
-旧GPS写真と旧LiveSessionは前倒し消去しません。既存写真の本人閲覧・削除、本人資格情報による状態確認と削除の冪等性記録、期限清掃を保持し、写真位置列・旧描画イベントの読み取り契約は旧データの期限が切れるまで残します。旧位置の最新表示は新たな更新なしでTTL内に失効します。既存データに新同意版を上書きしません。GPSを含む旧写真登録の再送は受付停止し、既に登録済みの写真のURL再発行・完了と本人削除は維持します。旧Memory同意版`2026-memory-01`を設定したままでは起動を拒否するため、**旧revisionを停止した移行窓で**新同意版と審査済み文面を設定します。旧版へのロールバックはGPS書込みを復活させるため行わず、問題があれば受付を閉じて修正版で復旧します。Cloud Runの旧revisionを止め、新旧revisionの並走を避けてから切り替えてください。DB migrationは不要ですが、既存の環境変数の更新とstagingでの確認が必要です。
+旧GPS写真と旧LiveSessionは前倒し消去しません。旧写真の本人閲覧・削除、期限清掃、旧位置のTTLを維持します。端末内写真へ切り替えると、旧写真の新規登録・署名付きPUTの新規発行と再発行・completeは停止します。切替前に発行されたPUT URLはすぐには失効しないため、起動時に旧pendingを消去キューへ入れ、ストレージのゼロバイトfenceと期限後の再消去を完了させます。旧ready写真は各`deleteAfter`まで読めます。旧revisionを止めてからmigration・新revisionへ切り替え、旧版へロールバックして画像書込みを再開しないでください。
 
-`/v1/public/config`の旧位置送信間隔・TTL・写真GPS保持時間は互換性のため残すだけで、新しいGPS受付を意味しません。`livePresenceEnabled:false`が新規Live受付状態です。旧写真のGPS由来ルートは閲覧・削除のため維持します。新規写真は`checkpoint-dijkstra-1`でチェックポイント間の最短経路を作り、本人memoryの`segments`に`pathNodeIds`と表示用の`path`を返します。旧GPS区間は`photo-edges-dijkstra-1`を維持します。設計/同意審査とstaging結合検証が済むまで一般公開しないでください。
+旧`/v1/public/config`の位置関連項目は互換性のため維持し、新モードでは写真アップロード設定を返しません。旧写真のGPS由来ルートは閲覧・削除のため維持し、新メタデータの経路は本人`/v2/.../memory`で`pathNodeIds`とGraph版を返します。設計/同意審査とstaging結合検証が済むまで一般公開しないでください。
+
+## 端末内写真への移行（Backend写真メタデータ）
+
+`TRACE_PHOTO_METADATA_ENABLED=false`が既定です。有効化すると**新規**MemorySessionは`photo_mode=device`になり、`GET/POST /v2/memory-sessions/{memorySessionId}/photos`、`DELETE /v2/.../photos/{photoMomentId}`、`GET /v2/.../memory`を本人Bearerで使用します。POSTは`Idempotency-Key`と`clientPhotoId`、固定Graphの`checkpointId`、`capturedAt`だけを受け付けます。画像、ハッシュ、サイズ、位置、URLなどの追加フィールドを拒否し、画像バイトをDB・GCSへ保存しません。本人画面は端末IndexedDBの画像を`clientPhotoId`で照合します。Backendは端末内画像の保存・削除や消失を検証・復旧できません。
+
+同じID/同じ内容の再送は同じ記録、別内容は409です。12枚を上限とし、撮影時刻順のチェックポイント経路を作ります。削除はメタデータ・地点・経路を同一トランザクションで消し、削除済み`clientPhotoId`だけのfenceをMemorySessionの`deleteAfter`まで維持するためオフライン再送は404です。0/1枚の到着も維持します。従来のセッションは`photo_mode=legacy`のまま、GCS設定を保持したときだけ旧`/v1`の写真一覧・本人memory画像閲覧・個別削除を期限まで提供します。新モード中は旧`/v1`の登録・upload-url・completeを503で拒否します。
+
+新モードと`TRACE_PHOTO_ENABLED=true`（旧アップロード）は併用できません。旧画像・署名付きURLのfenceが残る間は、旧アップロードを無効にしても`TRACE_PHOTO_BUCKET`と`TRACE_PHOTO_SIGNER_EMAIL`をAPI・清掃ジョブ双方に残します。画像が存在するのにGCSへアクセスできない状態では起動を拒否します。`TRACE_REGISTRATION_OPEN=true`には新モードと、**既定の草案とは別に**設定した同意版・本文が必要です。設定値が存在するだけでは大学・運営の承認を証明できません。設計PR #25の確定、同意・保持期間の承認、Frontend/Worker・展示の統合試験までは受付を閉じたままにします。
+
+`010_device_photo_moments.sql`と`011_push_thirty_minutes.sql`は明示的に適用し、`deploy/gcp/runtime-grants.sql`を再適用します。後者は旧15分通知の次回予定を15分延ばして30分へ移行します。旧revisionを止め、受付停止・バックアップ・旧画像の残数とfence・migration・権限を確認してから新APIと清掃ジョブを起動してください。切替後は旧URLが全て期限切れとなり、fenceの再消去が完了するまでGCS設定を外せません。
 
 ## 実装範囲
 
@@ -30,10 +40,10 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 - 個別削除と両トークンによる体験単位削除。後者はLive側から順に個別に確定し、部分成功を24時間の記録と同じキーで再試行
 - DBロックとトランザクションで各削除・冪等性記録を一括確定
 - CORS応答（許可Originへのプリフライトでは一括削除用`X-Trace-Live-Token`も許可）、16KB JSON上限、ヘルスチェック、JSONログ
-- CloudflareサイトWorker向けの共有シークレット検証（設定時、`/v1/*`のみ）
+- CloudflareサイトWorker向けの共有シークレット検証（設定時、`/v1/*`と`/v2/*`）
 - 明示的なDBマイグレーションと期限削除コマンド
-- 任意有効化する非公開写真API：メタデータ登録、署名付きPUT、検証完了、本人ストーリー、写真・セッション・期限削除
-- 任意同意後のWeb Push撮影リマインダー（既定で無効）：購読情報の暗号化、15/30分、停止・期限消去
+- 新規端末写真のメタデータ・経路を返す本人`/v2` API。旧`/v1`のクラウド写真は期限内の閲覧・削除のみ継続
+- 任意同意後のWeb Push撮影リマインダー（既定で無効）：購読情報の暗号化、30分間隔、停止・期限消去
 - 既定無効の投影QR到着受付、運営専用署名発行、永続演出キュー、本人向け再生状態
 - 既定無効の描画WSS：短期専用資格、snapshot→PostgreSQL連番差分、単一主描画機lease、再生開始・完了・失敗と期限切れ・切断skip
 
@@ -52,11 +62,14 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | POST | /v1/memory-sessions/{memorySessionId}/arrival/skip |
 | DELETE | /v1/memory-sessions/{memorySessionId} |
 | DELETE | /v1/live-presence-sessions/{liveSessionId} |
-| GET / POST | /v1/memory-sessions/{memorySessionId}/photos |
-| POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/upload-url |
-| POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete |
+| GET / POST | /v1/memory-sessions/{memorySessionId}/photos（新モードではPOST停止） |
+| POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/upload-url（新モードでは停止） |
+| POST | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId}/complete（新モードでは停止） |
 | DELETE | /v1/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
 | GET | /v1/memory-sessions/{memorySessionId}/memory |
+| GET / POST | /v2/memory-sessions/{memorySessionId}/photos |
+| DELETE | /v2/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
+| GET | /v2/memory-sessions/{memorySessionId}/memory |
 | PUT / PATCH / DELETE | /v1/memory-sessions/{memorySessionId}/push-subscription |
 | POST | /v1/operator/arrival-proofs |
 | GET | /v1/operator/arrivals |
@@ -65,8 +78,8 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | POST | /v1/operator/arrivals/{arrivalId}/retry |
 | GET (WSS) | /v1/display/ws |
 
-到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定しますが、新規写真は`checkpointId`で自己申告したチェックポイントを地点とする。写真ピン・フォトスポット描画イベントと画像/経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
-写真機能は既定で無効です。承認済みの非公開ストレージ設定と明示的な有効化が必要で、実装・ローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
+到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定し、端末内写真は`checkpointId`から別のメタデータ経路を作ります。写真ピン・フォトスポット描画イベントと経路を伴う到着演出素材、およびその他の運営APIはまだ統合されていません。
+新規写真メタデータは既定で無効です。旧写真ストレージは既存データが消えるまで必要であり、コードのローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
 
@@ -82,7 +95,7 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | 描画token発行 | 有効な発行署名の要求を全体で1回/秒・burst 10 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
-超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。旧位置送信の制限枠は拒否要求による負荷対策として残します。写真の一覧・URL再発行・complete・本人memoryは操作枠を共有し、Pushの購読・変更・解除はMemory tokenごとに10回/分（burst 10）の独立枠です。運営用到着APIと描画token発行はそれぞれ有効な署名の要求を全体で1回/秒・burst 10に制限します。描画WSは1接続あたり10メッセージ/秒、各256KiBで制限します。
+超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。新`/v2`の写真POSTは6回/分、本人GET/DELETEは一般のセッション操作枠30回/分を使います。Pushの購読・変更・解除は別の10回/分枠です。描画WSは1接続あたり10メッセージ/秒、各256KiBで制限します。
 許可Originには`Retry-After`をCORSで公開します。一括削除はMemoryのBearer tokenと`X-Trace-Live-Token`の両方の操作枠を同時に確認・消費し、片側が超過していれば削除を開始せず、もう片側の枠も消費しません。位置送信と操作のトークン別枠は分離されていますが、IP別・全体の追加上限は共通です。
 IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`（WorkerがCloudflareの`CF-Connecting-IP`から設定）、それ以外は接続元`RemoteAddr`を使用します。`X-Forwarded-For`を信用しません。中継IPしか取得できない場合は参加作成・公開設定のIP制限が中継単位になり得るため、公開前に疎通を確認してください。
 転送IPは単一のIPv4/IPv6だけを受け付けます。複数の同名ヘッダー、カンマ区切り、IPv6 zone付きなどは接続元IPへフォールバックします。
@@ -90,12 +103,12 @@ IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`�
 
 ## 任意の撮影リマインダー
 
-`TRACE_PUSH_ENABLED=false`が既定です。承認済みの通知文面・別途のブラウザ通知許可・stagingでの実Push確認後だけ有効化してください。MemorySession作成・写真撮影・位置共有には通知が不要です。通知を無効化した場合、新規PUT/PATCHは`503 PUSH_UNAVAILABLE`、DELETEは本人認証後に購読を消去します。無効化して起動すると残存購読を全消去し、外部送信は開始しません。公開設定`notification`は`enabled`、`defaultIntervalMinutes:30`、`allowedIntervalsMinutes:[15,30]`、`exactDeliveryGuaranteed:false`と、有効化時のみ`vapidPublicKey`を返します。
+`TRACE_PUSH_ENABLED=false`が既定です。承認済みの通知文面・別途のブラウザ通知許可・stagingでの実Push確認後だけ有効化してください。MemorySession作成・写真撮影・位置共有には通知が不要です。通知を無効化した場合、新規PUT/PATCHは`503 PUSH_UNAVAILABLE`、DELETEは本人認証後に購読を消去します。無効化して起動すると残存購読を全消去し、外部送信は開始しません。公開設定`notification`は`enabled`、`defaultIntervalMinutes:30`、`allowedIntervalsMinutes:[30]`、`exactDeliveryGuaranteed:false`と、有効化時のみ`vapidPublicKey`を返します。
 
 `TRACE_PUSH_VAPID_PUBLIC_KEY`は非圧縮P-256公開鍵（65 byteのbase64url）、`TRACE_PUSH_VAPID_PRIVATE_KEY`は対応する32 byteの秘密scalar、`TRACE_PUSH_VAPID_SUBJECT`は有効な運営先の`mailto:`、`TRACE_PUSH_ENCRYPTION_KEY`は**VAPIDとは別の**ランダムな32 byte AES-GCM鍵（base64url）です。鍵はSecret ManagerからAPIとworkerへ同一の値を渡し、ソース・通常ログ・運営画面・描画へ出さないでください。古い暗号化鍵を失うと既存購読は復号できません。鍵を変更する場合は購読を一旦消去し、端末に再同意・再購読を求めてください。`005_push_subscriptions.sql`の適用後、`deploy/gcp/runtime-grants.sql`を再適用してからAPIを入れ替えます。
 Cloud Runの`deploy/gcp/runtime.env.yaml`には公開鍵と`mailto:`だけを記載し、秘密鍵と暗号化鍵は置かないでください。`deploy/gcp/deploy.sh serve`には別々のSecret Manager参照`GCP_PUSH_VAPID_PRIVATE_SECRET`と`GCP_PUSH_ENCRYPTION_SECRET`を渡すと、APIと清掃ジョブの両方へ秘密環境変数として配布します。実行サービスアカウントのSecret Accessor権限を両secretに限定してください。常駐ディスパッチャはCloud Runの`--min=1 --no-cpu-throttling`に依存します。スケール・revision並存時の重複と配信時刻、外部プロバイダへの実到達性はstagingで確認してください。
 
-Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscription`へ`{"consent":true,"subscription":{"endpoint":"https://...","keys":{"p256dh":"base64url","auth":"base64url"}},"intervalMinutes":30}`を送ります。許可・説明後の参加者操作だけで`consent:true`を送信してください。endpointはHTTPSのFirefox/Chrome/Windows/Apple push serviceのみを受け付け、外部URLを無条件にフェッチしません。`PATCH`は`{"intervalMinutes":15}`または`{"status":"paused"}` / `{"status":"active"}`を受け付け、`DELETE`（空body）は204で未送信予定と鍵を消去します。PUT/PATCHは`status`、`intervalMinutes`、`nextSendAt`、`expiresAt`だけを返し、endpointや鍵は返しません。paused中の`nextSendAt`はnull、再開・間隔変更で時刻を再計算します。
+Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscription`へ`{"consent":true,"subscription":{"endpoint":"https://...","keys":{"p256dh":"base64url","auth":"base64url"}},"intervalMinutes":30}`を送ります。許可・説明後の参加者操作だけで`consent:true`を送信してください。endpointは許可したHTTPS Push serviceだけを受け付け、外部URLを無条件にフェッチしません。`PATCH`は`{"intervalMinutes":30}`または`{"status":"paused"}` / `{"status":"active"}`を受け付け、`DELETE`（空body）は204で未送信予定と鍵を消去します。PUT/PATCHは`status`、`intervalMinutes`、`nextSendAt`、`expiresAt`だけを返し、endpointや鍵は返しません。
 
 10秒ごとに最大50件を抽出し、DB内のMemoryロックと状態再確認のもと、5秒以内にプロバイダへ送信します。送信時刻は厳密には保証しません。payloadは固定の一般文面と相対URL`/photo`だけで、位置・写真・セッションID・参加記号を含みません。正常2xxでは次回を間隔後へ、404/410では鍵を削除、その他の失敗は1分後に再試行します。Web Pushに配信のexactly-once保証はなく、プロバイダ受理後DB commit失敗時には重複し得ます。写真の初回`ready`時は同じトランザクションで次回を延期します。Memory削除準備・Memory/Live削除・Live停止・到着確定・期限清掃は購読も削除します。到着時は同じMemory Storeトランザクション内で`push_stopped=true`を確定し、再購読を禁止します。単純解除は再購読可能です。
 
@@ -123,9 +136,9 @@ WS接続直後の`display.snapshot`は`data.cursor`、量子化済み最新位�
 
 送信JSONはすべて`schemaVersion:1`、3種のversion、`type`を含めます。`renderer.primary.acquire`で主リースを要求し、`renderer.primary.granted`の`data.leaseId`を保存します。他接続には`renderer.primary.conflict`を返します。`arrival.replay.started`、`arrival.replay.completed`、`arrival.replay.failed`にはクライアント生成の一意な`eventId`（8～128文字）、`arrivalId`、`leaseId`を指定します。成功は`renderer.ack`、競合・失効は`renderer.rejected`です。同じeventId・同じ操作の再送は24時間同じ結果となり、異なる内容は拒否します。切断/30秒heartbeat欠落/リース期限切れは再生中を`skipped`に確定し、別端末による自動再生はしません。運営の署名済み明示retryのみが再投入できます。10秒間隔のping/pong（または`renderer.heartbeat`）と30秒応答期限を設け、50分でWSを終了します。Cloud Run設定は3600秒で、クライアント側は切断時に指数バックオフで**新しい資格を取得し**snapshotから再接続します。
 
-旧版で受け付けた最新の量子化済み位置は単一BackendのGoメモリにのみ保持し、PostgreSQLには保存しません。到着・再生イベントと主描画機leaseだけをDBに保存します。旧位置は新たに受け付けず、TTL切れ後は描画snapshotから消えます。複数Backend間で位置は共有されないため、**APIとWebSocketは同じ1インスタンス**へ接続し、Cloud Runの最大インスタンス数を1としてください。旧revisionと並存させるとGPS書込みが復活するため、受付停止・旧revision停止後に切り替えます。DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。新しい写真地点と描画契約は設計Issue #23・Backend #25待ちです。
+旧版で受け付けた最新の量子化済み位置は単一BackendのGoメモリにのみ保持し、PostgreSQLには保存しません。到着・再生イベントと主描画機leaseだけをDBに保存します。旧位置は新たに受け付けず、TTL切れ後は描画snapshotから消えます。複数Backend間で位置は共有されないため、**APIとWebSocketは同じ1インスタンス**へ接続し、Cloud Runの最大インスタンス数を1としてください。DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。写真地点の本人`/v2` APIは追加しましたが、描画WebSocketの写真地点・経路payloadは別途Frontend/展示との統合が必要です。
 
-## 非公開写真の設定とライフサイクル
+## 旧クラウド写真の設定とライフサイクル
 
 - `TRACE_PHOTO_ENABLED=false`が既定です。`true`にするには`TRACE_PHOTO_BUCKET`と`TRACE_PHOTO_SIGNER_EMAIL`の両方が必要です。
 - 保存先設定があれば、新規写真を無効にしても既存写真の本人閲覧・削除と清掃は継続します。写真・アップロード枠が残る間に保存先設定を外すと、起動・清掃コマンドは拒否します。
@@ -208,7 +221,7 @@ go run ./cmd/server cleanup
 ```
 
 `internal/store/migrations/001_initial.sql`は変更せず、追加分は`002_名前.sql`以降を欠番・重複のない連番で作成します。`migrate`は所有者ユーザーで埋め込みSQLを番号順に単一トランザクションで適用し、`schema_migrations`へ各版を記録します。再実行は適用済み版を飛ばし、並行実行はDBロックで直列化します。失敗時はその実行分をロールバックします。SQLにはトランザクション制御文や`CREATE INDEX CONCURRENTLY`などトランザクション外でのみ使える操作を含めないでください。
-APIと清掃ジョブは起動時、APIは`/health/ready`と各`/v1/`リクエスト、定期清掃は実行前に、埋め込まれたmigrationの最終版とDBの連続した適用履歴が一致することを確認します。DBが古い・新しい・履歴に欠番がある場合は受付・清掃を行いません。既存の旧バイナリは新版の検査を持たないため、非互換migrationの前に停止・置換が必要です。APIユーザーにはスキーマ変更権限を付けず、新規テーブルの必要権限を`deploy/gcp/runtime-grants.sql`へ明示的に追加してから配信します。[stagingでの手順](docs/staging-cicd.md#6-運用と復旧)を参照してください。
+APIと清掃ジョブは起動時、APIは`/health/ready`と各`/v1/`・`/v2/`リクエスト、定期清掃は実行前に、埋め込まれたmigrationの最終版とDBの連続した適用履歴が一致することを確認します。DBが古い・新しい・履歴に欠番がある場合は受付・清掃を行いません。既存の旧バイナリは新版の検査を持たないため、非互換migrationの前に停止・置換が必要です。APIユーザーにはスキーマ変更権限を付けず、新規テーブルの必要権限を`deploy/gcp/runtime-grants.sql`へ明示的に追加してから配信します。[stagingでの手順](docs/staging-cicd.md#6-運用と復旧)を参照してください。
 
 APIは起動時と稼働中30秒ごとにDBの期限データを清掃し、表示位置は稼働中毎秒プロセスメモリから消去します。期限切れ位置は清掃前でも読み出せません。別途5分ごとのDB清掃ジョブはAPIプロセスの位置メモリを消去できません。Cloud RunのAPIは最大1インスタンス・CPU常時割当とし、スケールアウト・再起動・新旧revision並存で直近の表示位置が失われたり分岐したりするため、追跡中の切替を避けます。
 

@@ -17,6 +17,9 @@ type PushSubscription struct {
 }
 
 func (s *Store) PutPush(ctx context.Context, p PushSubscription, now time.Time) (PushSubscription, error) {
+	if p.IntervalMinutes != 30 {
+		return PushSubscription{}, ErrConflict
+	}
 	err := s.Transaction(ctx, p.MemorySessionID, func(tx *Store) error {
 		expires, err := tx.pushEligible(ctx, p.MemorySessionID, now)
 		if err != nil {
@@ -59,6 +62,9 @@ func (s *Store) pushEligible(ctx context.Context, id string, now time.Time) (tim
 }
 
 func (s *Store) PatchPush(ctx context.Context, id string, interval *int, status *string, now time.Time) (PushSubscription, error) {
+	if interval != nil && *interval != 30 {
+		return PushSubscription{}, ErrConflict
+	}
 	var p PushSubscription
 	err := s.Transaction(ctx, id, func(tx *Store) error {
 		if _, err := tx.pushEligible(ctx, id, now); err != nil {

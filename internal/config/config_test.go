@@ -11,7 +11,7 @@ func baseEnv(t *testing.T) {
 	for _, k := range []string{"PORT", "TRACE_ADDRESS", "TRACE_DATABASE_PATH", "DB_HOST", "DB_USER", "DB_NAME", "DB_PASSWORD", "TRACE_DB_MAX_CONNECTIONS", "TRACE_MIN_LATITUDE", "TRACE_LIVE_POSITION_TTL", "TRACE_SESSION_TTL", "TRACE_MEMORY_SESSION_TTL", "TRACE_LIVE_SESSION_TTL", "TRACE_DATA_RETENTION", "TRACE_EDGE_SHARED_SECRET", "TRACE_REGISTRATION_OPEN", "TRACE_MEMORY_CONSENT_VERSION", "TRACE_CONSENT_BODY"} {
 		t.Setenv(k, "")
 	}
-	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
+	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_METADATA_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
 		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY",
 		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID",
 		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_ISSUER_KEY", "TRACE_DISPLAY_TOKEN_KEY"} {
@@ -122,6 +122,29 @@ func TestPhotoStorageCannotBeEnabledWithoutCompletePrivateConfiguration(t *testi
 	t.Setenv("TRACE_PHOTO_SIGNER_EMAIL", "")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("incomplete storage configuration accepted")
+	}
+}
+
+func TestDevicePhotosKeepIntakeClosedUntilConsentIsConfigured(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("TRACE_PHOTO_METADATA_ENABLED", "true")
+	cfg, err := FromEnv()
+	if err != nil || !cfg.PhotoMetadataEnabled || cfg.RegistrationOpen || cfg.PhotoBucket != "" {
+		t.Fatalf("device metadata should require no image storage and default closed: %+v, %v", cfg, err)
+	}
+	t.Setenv("TRACE_REGISTRATION_OPEN", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("unreviewed default consent opened registration")
+	}
+	t.Setenv("TRACE_MEMORY_CONSENT_VERSION", "reviewed-device-photo-version")
+	t.Setenv("TRACE_CONSENT_BODY", "Device-only photos with server-side metadata.")
+	cfg, err = FromEnv()
+	if err != nil || !cfg.RegistrationOpen {
+		t.Fatalf("explicitly configured device consent must permit intake after review: %v", err)
+	}
+	t.Setenv("TRACE_PHOTO_ENABLED", "true")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("device mode reopened server image uploads")
 	}
 }
 

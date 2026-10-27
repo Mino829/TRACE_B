@@ -7,7 +7,7 @@
 
 ## 認証境界
 
-サイトWorkerは許可した`/api/backend/*`だけをGoの`/v1/*`などへ転送し、`X-Trace-Edge-Secret`を追加する。Goは`TRACE_EDGE_SHARED_SECRET`が設定されている場合、すべての`/v1/*`リクエストで一致を要求する。値が未設定なら既存のAPI動作を維持するため、**公開用Cloud RunではSecret Managerから設定することが必須**。32バイト未満の値では起動を拒否する。
+サイトWorkerは許可した`/api/backend/*`だけをGoの`/v1/*`や新`/v2/*`へ転送し、`X-Trace-Edge-Secret`を追加する。Goは`TRACE_EDGE_SHARED_SECRET`が設定されている場合、両版のすべてのAPIで一致を要求する。値が未設定なら既存のAPI動作を維持するため、**公開用Cloud RunではSecret Managerから設定することが必須**。32バイト未満の値では起動を拒否する。Worker側で`/v2`を許可・転送する改修はこのBackend PRに含まれず、Frontend側の接続まで一般公開できない。
 
 これはWorkerとGoの間のアクセス制限であり、参加者のBearer token、CORS、受付停止、レート制限の代わりにはならない。WorkerはCloudflareが付与した`CF-Connecting-IP`の有効なIPだけを`X-Trace-Client-IP`としてGoへ送り、ブラウザからの`X-Forwarded-For`や同名ヘッダーは破棄する。Goは共有シークレット一致時だけ単一のIPv4/IPv6を制限単位に使い、欠落・不正・複数の同名ヘッダー・IPv6 zone付きなら接続元IPへ戻す。シークレットを設定しない直接到達モードでは転送ヘッダーを一切信用しない。`/health/live`と`/health/ready`はこのヘッダーを要求しない。Workerのsecretをブラウザへ渡さず、Goもヘッダー値をログへ出さない。
 
@@ -19,10 +19,10 @@
 
 1. stagingとproductionのCloud Run、Cloud SQL、Secret Manager、Worker、ドメイン、データを分離する。
 2. Web側の`TRACE_BACKEND_URL`とGo側のsecretを設定し、Worker経由は成功、Goへの直接リクエストは403になることを確認する。
-3. `TRACE_REGISTRATION_OPEN=false`で起動し、GPSなしのMemory同意版・同意文、連絡先、保存期間を設計Issue #23/#9で承認する。写真地点の契約はBackend #25で決める。コードの初期座標は旧GPS用のサンプル値である。
-4. 匿名の参加作成と旧位置APIの拒否要求には[用途別の制限](../README.md#公開apiのレート制限)を実装済み。公開前にWorkerからのクライアントIP転送、共有NATでの通常参加、429と`Retry-After`、異常な超過、再起動時のカウンター消失をstagingで監視・検証する。単一プロセス内の集計なのでAPI最大1インスタンスを維持し、revision並存を避ける。
-5. CloudflareサイトからMemoryのみの参加、写真GPS拒否、旧Live位置受付の拒否、旧セッションの停止・削除、写真0枚での到着を実機と検証DBで通す。承認済みの写真地点・運営API・描画WebSocketは別途試験する。
-6. 期限削除ジョブ、DB接続上限、障害時の受付停止、旧GPS受付を復活させない修正版への復旧手順を確認する。
+3. `TRACE_REGISTRATION_OPEN=false`で起動し、写真の端末内保存とサーバーメタデータ、旧写真の各`deleteAfter`までの閲覧を含むMemory同意版・文面、連絡先、保存期間を設計Issue #23/#9で承認する。既定の旧クラウド写真草案を再利用しない。
+4. 新旧revisionを停止・切替する間に旧写真の署名PUTを止め、旧pendingのfenceとready写真の期限内閲覧、`010`/`011` migration・runtime権限をstagingで確認する。旧バイナリへ戻して旧アップロードを再開しない。
+5. Frontend Workerから`/v2`の本人GET/POST/DELETE、旧`/v1`の本人閲覧・削除を実機で確認する。Goの直接リクエストは403とし、旧Live停止・位置受付拒否、写真0枚の到着も確認する。Web AppのIndexedDB保存/消去・画像消失表示はBackendで保証できずFrontend側の責務。
+6. 期限削除ジョブ、DB接続上限、共有NATと429、障害時の受付停止、旧GPS/旧画像受付を復活させない修正版への復旧手順を確認する。
 
 Cloud RunのWebSocketにはリクエスト時間の上限がある。描画用APIを追加するときは、会場クライアントの再接続と状態再同期を検証する。
 

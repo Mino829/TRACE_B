@@ -61,6 +61,7 @@ type NewExperience struct {
 	MemoryTokenHash, LiveTokenHash, LinkTokenHash        string
 	MemoryConsent, LiveConsent, ConsentLanguage          string
 	DisplayColor, DisplaySymbol, CampusGraphVersion      string
+	PhotoMode                                            string
 	CreatedAt, MemoryExpiresAt, MemoryDeleteAfter        time.Time
 	LiveExpiresAt, LiveDeleteAfter                       time.Time
 	LivePresence                                         bool
@@ -192,8 +193,8 @@ func (s *Store) CreateExperience(ctx context.Context, v NewExperience) error {
 			graphVersion = v.CampusGraphVersion
 		}
 		_, err := tx.q.ExecContext(ctx, `INSERT INTO memory_sessions
-  (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after,campus_graph_version)
-  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, v.MemorySessionID, v.MemoryConsent, v.ConsentLanguage, v.MemoryTokenHash, v.CreatedAt, v.MemoryExpiresAt, v.MemoryDeleteAfter, graphVersion)
+  (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after,campus_graph_version,photo_mode)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, v.MemorySessionID, v.MemoryConsent, v.ConsentLanguage, v.MemoryTokenHash, v.CreatedAt, v.MemoryExpiresAt, v.MemoryDeleteAfter, graphVersion, photoMode(v.PhotoMode))
 		if err != nil {
 			return err
 		}
