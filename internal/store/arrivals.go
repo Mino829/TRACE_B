@@ -170,12 +170,20 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			} else if err != nil {
 				return err
 			} else {
+				if a.Status == "queued" && !now.Before(a.ReplayDeadline) {
+					if err := tx.ExpireArrivals(ctx, now); err != nil {
+						return err
+					}
+					// A renderer may have started before the deadline while
+					// expiration waited for its row lock. Return the persisted state.
+					a, err = tx.arrivalForMemory(ctx, memoryID)
+					if err != nil {
+						return err
+					}
+				}
 				a.LivePresencePhase, err = tx.linkedPhase(ctx, memoryID)
 				if err != nil {
 					return err
-				}
-				if a.Status == "queued" && !now.Before(a.ReplayDeadline) {
-					a.Status = "skipped"
 				}
 			}
 			body, err = json.Marshal(struct {

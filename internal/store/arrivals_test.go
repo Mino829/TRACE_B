@@ -121,3 +121,51 @@ func TestRendererRetryKeepsArrivalDeadline(t *testing.T) {
 		t.Fatalf("retry at deadline: %v", err)
 	}
 }
+
+func TestArrivalAfterDeadlineWithNewReceiptPersistsTimeout(t *testing.T) {
+	f := testdb.Open(t)
+	f.Store.EnableDisplay()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	v := fixtureExperience(t, f, now)
+	first, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash,
+		"arrival-once", "booth", "receipt-first", "request", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash,
+		"arrival-duplicate", "booth", "receipt-second", "request", now.Add(30*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		ArrivalID string `json:"arrivalId"`
+		Status    string `json:"status"`
+	}
+	if err := json.Unmarshal(second, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.ArrivalID != "arrival-once" || reply.Status != "skipped" {
+		t.Fatalf("expired arrival reply: %#v", reply)
+	}
+	var status, reason string
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT replay_status,COALESCE(skip_reason,'')
+ FROM arrival_events WHERE id='arrival-once'`).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != "skipped" || reason != "timeout" {
+		t.Fatalf("expired arrival was not durably skipped: %s/%s", status, reason)
+	}
+	repeated, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash,
+		"arrival-duplicate", "booth", "receipt-first", "request", now.Add(31*time.Second))
+	if err != nil || string(repeated) != string(first) {
+		t.Fatalf("original idempotency receipt changed: %s (%v)", repeated, err)
+	}
+	var events int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM display_events
+ WHERE kind='arrival.replay.skipped' AND data->>'arrivalId'='arrival-once' AND data->>'reason'='timeout'`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("duplicate or missing timeout display event: %d", events)
+	}
+}

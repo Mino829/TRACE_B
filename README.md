@@ -122,6 +122,8 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 発行されるproofは`base64url(JSON).base64url(HMAC-SHA256(TRACE_ARRIVAL_PROOF_KEY, base64url(JSON)))`です。JSONには`checkpointId`、`venue`、`issuedAt`/`expiresAt`（Unix秒）、ランダム`nonce`を含み、有効期間は25秒です。参加端末は`POST /v1/memory-sessions/{memorySessionId}/arrival`へMemory Bearer、`Idempotency-Key`（ランダム値）、JSON `{"checkpointToken":"...","experienceLinkToken":"...","clientTime":"..."}`を送ります。`clientTime`は判定に使わずサーバー時刻を正とします。改変・他会場・期限切れ・未来発行は403、別トークンによる別セッションへの操作は認証で拒否します。投影QRは複数来場者が読むため同一proofを**別Memory間では共有可能**です。同一Memoryへの二重到着は1件のArrivalEventとなり、24時間の同一キー/同一内容の再送は期限切れQRでも元の結果を返します。同一キー/別内容は409、Memory削除と同時に到着・再送記録も消えます。
 
+到着済みMemorySessionへ別のキーと新しい有効なQRで再送した場合は新たな到着を作らず、期限切れで待機中ならDBの`timeout` skipと描画差分を確定し、現在の演出状態を返します。初回receiptと状態が異なる場合もあるため、最新状態は本人`GET /v1/experiences/{experienceId}`から取得します。本人閲覧・削除は演出skip後も維持します。
+
 有効なExperienceLinkを持つ旧MemorySessionでは当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。位置書込みと`on_site`継続は廃止済みで、旧Liveでも明示的な停止・本人削除はできます。新規MemorySessionはLiveとのlinkなしで写真0枚でも到着できます。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。
 
 到着は写真機能無効でも有効で、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ候補抽出を遅らせ、未完了は候補から除きます。永続FIFOの待機上限は10件（`playing`は含まない）。満杯でも到着自体を記録して演出だけ`skipped`（`queue_full`）とし、到着から30秒以内に再生を開始できない候補は`skipped`（`timeout`）へ遷移します。本人`POST .../arrival/skip`も未再生の演出だけをスキップします。
