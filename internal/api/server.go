@@ -21,17 +21,19 @@ import (
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/push"
 	"github.com/Mino829/trace_Backend/internal/store"
+	"google.golang.org/api/idtoken"
 )
 
 const maxJSONBody = 16 << 10
 
 type Server struct {
-	cfg     config.Config
-	store   *store.Store
-	limiter *rateLimiter
-	now     func() time.Time
-	photos  *photo.Service
-	push    *push.Service
+	cfg                   config.Config
+	store                 *store.Store
+	limiter               *rateLimiter
+	now                   func() time.Time
+	photos                *photo.Service
+	push                  *push.Service
+	validateGoogleIDToken func(context.Context, string, string) (*idtoken.Payload, error)
 }
 
 type apiError struct {
@@ -43,7 +45,7 @@ type apiError struct {
 func (e *apiError) Error() string { return e.Code }
 
 func New(cfg config.Config, db *store.Store, photos *photo.Service, sender ...*push.Service) http.Handler {
-	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter(), photos: photos}
+	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter(), photos: photos, validateGoogleIDToken: idtoken.Validate}
 	if len(sender) != 0 {
 		server.push = sender[0]
 	}
@@ -92,12 +94,20 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", requestID)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		if (strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/v2/")) && s.cfg.EdgeSharedSecret != "" &&
+		// These two routes authenticate the display browser directly; never
+		// distribute the participant Worker secret to a browser.
+		directDisplay := r.URL.Path == "/v1/operator/display-tokens" || r.URL.Path == "/v1/display/ws"
+		if !directDisplay && (strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/v2/")) && s.cfg.EdgeSharedSecret != "" &&
 			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Trace-Edge-Secret")), []byte(s.cfg.EdgeSharedSecret)) != 1 {
 			s.writeError(w, requestID, &apiError{Code: "EDGE_ACCESS_DENIED", Message: "access denied", Status: http.StatusForbidden})
 			return
 		}
-		if origin := r.Header.Get("Origin"); origin != "" && s.originAllowed(origin) {
+		origin := r.Header.Get("Origin")
+		allowedOrigin := s.originAllowed(origin)
+		if directDisplay {
+			allowedOrigin = s.displayOriginAllowed(origin) && len(r.Header.Values("Origin")) == 1
+		}
+		if origin != "" && allowedOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Trace-Live-Token")
@@ -105,7 +115,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 		}
 		if r.Method == http.MethodOptions {
-			if origin := r.Header.Get("Origin"); origin != "" && !s.originAllowed(origin) {
+			if (origin != "" || directDisplay) && !allowedOrigin {
 				s.writeError(w, requestID, &apiError{Code: "ORIGIN_NOT_ALLOWED", Message: "origin is not allowed", Status: http.StatusForbidden})
 				return
 			}

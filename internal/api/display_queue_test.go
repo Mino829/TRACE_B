@@ -71,7 +71,7 @@ func TestDisplayWebSocketWaitsAndReplaysInOrder(t *testing.T) {
 	cfg := displayConfig()
 	h := api.New(cfg, f.Store, nil)
 	server := displayServer(t, h)
-	token := displayToken(t, h, cfg)
+	token := displayToken(t, cfg)
 	conn, response, err := dialDisplay(t, server.URL, token, cfg)
 	if err != nil {
 		t.Fatalf("dial: %v %v", err, response)

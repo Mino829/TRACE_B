@@ -25,7 +25,9 @@ import (
 func displayConfig() config.Config {
 	cfg := arrivalConfig()
 	cfg.DisplayEnabled = true
-	cfg.DisplayIssuerKey = "display-issuer-key-not-arrival-issuer-123456"
+	cfg.DisplayGoogleClientID = "display-test.apps.googleusercontent.com"
+	cfg.DisplayOperatorEmails = []string{"operator@example.test"}
+	cfg.DisplayAllowedOrigins = []string{"https://display.example.test"}
 	cfg.DisplayTokenKey = "display-token-signing-key-separate-987654"
 	return cfg
 }
@@ -54,32 +56,41 @@ func displayServer(t *testing.T, handler http.Handler) *httptest.Server {
 	return server
 }
 
-func displayToken(t *testing.T, h http.Handler, cfg config.Config) string {
+// WS lifecycle tests sign their own credential; Google issuance and claim
+// validation have independent cryptographic tests.
+func displayToken(t *testing.T, cfg config.Config) string {
 	t.Helper()
-	path := "/v1/operator/display-tokens"
-	ts := fmt.Sprint(time.Now().Unix())
-	r := request(t, h, "POST", path, "", map[string]string{"X-Trace-Display-Issuer-Timestamp": ts, "X-Trace-Display-Issuer-Signature": signMessage(cfg.DisplayIssuerKey, "POST\n"+path+"\n"+ts)})
-	if r.Code != 200 {
-		t.Fatalf("display token: %d %s", r.Code, r.Body.String())
+	now := time.Now()
+	payload, err := json.Marshal(map[string]any{"purpose": "display.ws", "issuedAt": now.Unix(),
+		"expiresAt": now.Add(2 * time.Minute).Unix(), "origin": cfg.DisplayAllowedOrigins[0],
+		"nonce": base64.RawURLEncoding.EncodeToString([]byte("sixteen-byte-nonce"))})
+	if err != nil {
+		t.Fatal(err)
 	}
-	var body struct {
-		Token string `json:"displayToken"`
-	}
-	if err := json.Unmarshal(r.Body.Bytes(), &body); err != nil || body.Token == "" {
-		t.Fatalf("display token response: %v", err)
-	}
-	return body.Token
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	return encoded + "." + signMessage(cfg.DisplayTokenKey, encoded)
 }
 func dialDisplay(t *testing.T, url, token string, cfg config.Config) (*websocket.Conn, *http.Response, error) {
 	t.Helper()
 	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+token)
-	headers.Set("X-Trace-Schema-Version", "1")
-	headers.Set("X-Trace-Coordinate-Version", cfg.CoordinateVersion)
-	headers.Set("X-Trace-Campus-Graph-Version", cfg.CampusGraphVersion)
-	headers.Set("X-Trace-Three-D-Map-Version", cfg.ThreeDMapVersion)
+	headers.Set("Origin", cfg.DisplayAllowedOrigins[0])
 	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(url, "http")+"/v1/display/ws", headers)
+	if err == nil {
+		err = conn.WriteJSON(map[string]any{"schemaVersion": 1, "type": "renderer.authenticate", "displayToken": token,
+			"coordinateVersion": cfg.CoordinateVersion, "campusGraphVersion": cfg.CampusGraphVersion, "threeDMapVersion": cfg.ThreeDMapVersion})
+	}
 	return conn, response, err
+}
+
+func expectDisplayClose(t *testing.T, conn *websocket.Conn, code int) {
+	t.Helper()
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(7 * time.Second))
+	kind, _, err := conn.ReadMessage()
+	var closed *websocket.CloseError
+	if !errors.As(err, &closed) || closed.Code != code {
+		t.Fatalf("expected close %d before any state, got kind=%d err=%v", code, kind, err)
+	}
 }
 
 type displayFrameTest struct {
@@ -127,7 +138,7 @@ func TestDisplayDoesNotPublishLegacyPositionsButKeepsArrival(t *testing.T) {
 	cfg := displayConfig()
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
-	token := displayToken(t, handler, cfg)
+	token := displayToken(t, cfg)
 	conn, response, err := dialDisplay(t, server.URL, token, cfg)
 	if err != nil {
 		t.Fatalf("dial: %v status=%v", err, response)
@@ -186,12 +197,12 @@ func TestDisplayDoesNotPublishLegacyPositionsButKeepsArrival(t *testing.T) {
 	assertDisplaySafe(t, nextDisplay(t, standby, "participant.arrived"), created)
 }
 
-func TestDisplayNativeGapResynchronizesWithSnapshot(t *testing.T) {
+func TestDisplayBrowserGapResynchronizesWithSnapshot(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := displayConfig()
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
-	conn, response, err := dialDisplay(t, server.URL, displayToken(t, handler, cfg), cfg)
+	conn, response, err := dialDisplay(t, server.URL, displayToken(t, cfg), cfg)
 	if err != nil {
 		t.Fatalf("dial: %v %v", err, response)
 	}
@@ -226,47 +237,41 @@ func TestDisplayNativeGapResynchronizesWithSnapshot(t *testing.T) {
 	}
 }
 
-func TestDisplayNativeWebsocketLeaseReplayAndVersionRejection(t *testing.T) {
+func TestDisplayBrowserWebsocketLeaseReplayAndVersionRejection(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := displayConfig()
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
-	token := displayToken(t, handler, cfg)
+	token := displayToken(t, cfg)
 	secondDB, err := store.Open(t.Context(), f.URL, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { secondDB.Close() })
 	standbyServer := displayServer(t, api.New(cfg, secondDB, nil))
-	for _, invalid := range []string{"participant-token", cfg.ArrivalIssuerKey, cfg.DisplayIssuerKey} {
+	for _, invalid := range []string{"participant-token", cfg.ArrivalIssuerKey, cfg.DisplayTokenKey} {
 		conn, response, err := dialDisplay(t, server.URL, invalid, cfg)
-		if conn != nil {
-			conn.Close()
+		if err != nil {
+			t.Fatalf("browser handshake: %v %v", err, response)
 		}
-		if err == nil || response == nil || response.StatusCode != 401 {
-			t.Fatalf("credential boundary: %v %v", err, response)
-		}
+		expectDisplayClose(t, conn, 4401)
 	}
 	expiredPayload, _ := json.Marshal(map[string]any{"purpose": "display.ws", "issuedAt": time.Now().Add(-3 * time.Minute).Unix(),
-		"expiresAt": time.Now().Add(-time.Minute).Unix(), "nonce": base64.RawURLEncoding.EncodeToString([]byte("sixteen-byte-nonce"))})
+		"expiresAt": time.Now().Add(-time.Minute).Unix(), "origin": cfg.DisplayAllowedOrigins[0], "nonce": base64.RawURLEncoding.EncodeToString([]byte("sixteen-byte-nonce"))})
 	encoded := base64.RawURLEncoding.EncodeToString(expiredPayload)
 	expired := encoded + "." + signMessage(cfg.DisplayTokenKey, encoded)
 	rejected, rejection, expiredErr := dialDisplay(t, server.URL, expired, cfg)
-	if rejected != nil {
-		rejected.Close()
+	if expiredErr != nil {
+		t.Fatalf("browser handshake: %v %v", expiredErr, rejection)
 	}
-	if expiredErr == nil || rejection == nil || rejection.StatusCode != 401 {
-		t.Fatalf("expired display token accepted: %v %v", expiredErr, rejection)
-	}
+	expectDisplayClose(t, rejected, 4401)
 	wrong := cfg
 	wrong.ThreeDMapVersion = "incompatible"
 	conn, response, err := dialDisplay(t, server.URL, token, wrong)
-	if conn != nil {
-		conn.Close()
+	if err != nil {
+		t.Fatalf("browser handshake: %v %v", err, response)
 	}
-	if err == nil || response == nil || response.StatusCode != 409 {
-		t.Fatalf("version not rejected: %v %v", err, response)
-	}
+	expectDisplayClose(t, conn, 4409)
 	primary, response, err := dialDisplay(t, server.URL, token, cfg)
 	if err != nil {
 		t.Fatalf("dial primary: %v %v", err, response)
@@ -330,7 +335,7 @@ func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T)
 	cfg := displayConfig()
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
-	conn, response, err := dialDisplay(t, server.URL, displayToken(t, handler, cfg), cfg)
+	conn, response, err := dialDisplay(t, server.URL, displayToken(t, cfg), cfg)
 	if err != nil {
 		t.Fatalf("dial: %v %v", err, response)
 	}
@@ -372,7 +377,7 @@ func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T)
 	if retried.Code != 200 {
 		t.Fatalf("operator retry: %d %s", retried.Code, retried.Body.String())
 	}
-	successor, response, err := dialDisplay(t, server.URL, displayToken(t, handler, cfg), cfg)
+	successor, response, err := dialDisplay(t, server.URL, displayToken(t, cfg), cfg)
 	if err != nil {
 		t.Fatalf("successor dial: %v %v", err, response)
 	}
@@ -410,7 +415,7 @@ func TestDisplayDevicePhotoRouteArrivalSnapshotAndMutations(t *testing.T) {
 	cfg.ArrivalCheckpointID = "cp-b"
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
-	token := displayToken(t, handler, cfg)
+	token := displayToken(t, cfg)
 	conn, response, err := dialDisplay(t, server.URL, token, cfg)
 	if err != nil {
 		t.Fatalf("dial: %v status=%v", err, response)
@@ -551,4 +556,94 @@ func TestDisplayDevicePhotoRouteArrivalSnapshotAndMutations(t *testing.T) {
 	}
 	defer reconnected.Close()
 	verify(nextDisplay(t, reconnected, "display.snapshot"), []string{}, []string{}, first, second, third, fourth)
+}
+
+func TestDisplayBrowserOriginAndEdgeSeparation(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := displayConfig()
+	cfg.EdgeSharedSecret = "participant-worker-secret-not-for-displays"
+	cfg.AllowedOrigins = []string{"https://participant.example.test"}
+	h := api.New(cfg, f.Store, nil)
+	server := displayServer(t, h)
+	for _, path := range []string{"/v1/public/config", "/v1/operator/arrival-proofs", "/v2/memory-sessions/memory-test/photos"} {
+		r := request(t, h, "GET", path, "", nil)
+		if r.Code != http.StatusForbidden || !strings.Contains(r.Body.String(), "EDGE_ACCESS_DENIED") {
+			t.Fatalf("edge protection lost for %s: %d %s", path, r.Code, r.Body.String())
+		}
+	}
+	if r := request(t, h, "GET", "/v1/public/config", "", map[string]string{"X-Trace-Edge-Secret": cfg.EdgeSharedSecret}); r.Code != http.StatusOK {
+		t.Fatalf("participant Worker access: %d %s", r.Code, r.Body.String())
+	}
+	origin := cfg.DisplayAllowedOrigins[0]
+	preflight := request(t, h, "OPTIONS", "/v1/operator/display-tokens", "", map[string]string{
+		"Origin": origin, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization",
+	})
+	if preflight.Code != http.StatusNoContent || preflight.Header().Get("Access-Control-Allow-Origin") != origin {
+		t.Fatalf("display preflight requires Worker secret: %d %+v", preflight.Code, preflight.Header())
+	}
+	for _, rejectedOrigin := range []string{"", cfg.AllowedOrigins[0]} {
+		r := request(t, h, "OPTIONS", "/v1/operator/display-tokens", "", map[string]string{"Origin": rejectedOrigin})
+		if r.Code != http.StatusForbidden || r.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("display preflight accepted origin %q: %d", rejectedOrigin, r.Code)
+		}
+	}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/display/ws"
+	for _, candidate := range []struct{ origin, query string }{{"", ""}, {cfg.AllowedOrigins[0], ""}, {origin, "?token=not-allowed"}, {origin, "?"}} {
+		conn, response, err := websocket.DefaultDialer.Dial(wsURL+candidate.query, http.Header{"Origin": []string{candidate.origin}})
+		if conn != nil {
+			conn.Close()
+		}
+		if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+			t.Fatalf("invalid browser handshake accepted: %+v %v %v", candidate, response, err)
+		}
+	}
+	conn, response, err := dialDisplay(t, server.URL, displayToken(t, cfg), cfg)
+	if err != nil {
+		t.Fatalf("direct display incorrectly requires Worker secret: %v %v", err, response)
+	}
+	defer conn.Close()
+	nextDisplay(t, conn, "display.snapshot")
+}
+
+func TestDisplayBrowserAuthenticatesBeforeSendingState(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := displayConfig()
+	cfg.DisplayAllowedOrigins = append(cfg.DisplayAllowedOrigins, "https://standby.example.test")
+	h := api.New(cfg, f.Store, nil)
+	server := displayServer(t, h)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/display/ws"
+	t.Run("silent browser receives only authentication close", func(t *testing.T) {
+		conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{cfg.DisplayAllowedOrigins[0]}})
+		if err != nil {
+			t.Fatalf("browser handshake: %v %v", err, response)
+		}
+		expectDisplayClose(t, conn, 4401)
+	})
+	t.Run("lease command cannot bypass authentication", func(t *testing.T) {
+		conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{cfg.DisplayAllowedOrigins[0]}})
+		if err != nil {
+			t.Fatalf("browser handshake: %v %v", err, response)
+		}
+		displayInput(t, conn, cfg, "renderer.primary.acquire", "", "", "")
+		expectDisplayClose(t, conn, 4401)
+	})
+	t.Run("credential is bound to its issuing origin", func(t *testing.T) {
+		standby := cfg
+		standby.DisplayAllowedOrigins = []string{cfg.DisplayAllowedOrigins[1]}
+		conn, response, err := dialDisplay(t, server.URL, displayToken(t, cfg), standby)
+		if err != nil {
+			t.Fatalf("browser handshake: %v %v", err, response)
+		}
+		expectDisplayClose(t, conn, 4401)
+	})
+	t.Run("oversized authentication does not reach snapshot", func(t *testing.T) {
+		conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": []string{cfg.DisplayAllowedOrigins[0]}})
+		if err != nil {
+			t.Fatalf("browser handshake: %v %v", err, response)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", (16<<10)+1))); err != nil {
+			t.Fatal(err)
+		}
+		expectDisplayClose(t, conn, websocket.CloseMessageTooBig)
+	})
 }
