@@ -175,6 +175,13 @@ func (s *Store) lockTransaction(ctx context.Context, key string) error {
 }
 func (s *Store) CreateExperience(ctx context.Context, v NewExperience) error {
 	return s.Transaction(ctx, "", func(tx *Store) error {
+		var closed bool
+		if err := tx.q.QueryRowContext(ctx, `SELECT closed_at IS NOT NULL FROM registration_control WHERE singleton=TRUE FOR SHARE`).Scan(&closed); err != nil {
+			return err
+		}
+		if closed {
+			return ErrRegistrationClosed
+		}
 		var graphVersion any
 		if v.CampusGraphVersion != "" {
 			graphVersion = v.CampusGraphVersion
@@ -386,7 +393,10 @@ func (s *Store) SetOnSite(ctx context.Context, id, consent string, continuing bo
 	})
 }
 func (s *Store) DeleteMemory(ctx context.Context, id string) error {
-	return s.Transaction(ctx, id, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, id); err != nil {
+			return err
+		}
 		var pending bool
 		err := tx.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM photos WHERE memory_session_id=$1)
  FROM memory_sessions WHERE id=$1 FOR UPDATE`, id).Scan(&pending)

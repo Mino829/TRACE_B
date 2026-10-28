@@ -19,6 +19,7 @@ type DisplayEvent struct {
 type DisplayState struct {
 	Cursor   int64            `json:"cursor"`
 	Arrivals []DisplayArrival `json:"arrivals"`
+	Fallback FallbackState    `json:"fallback"`
 }
 type DisplayArrival struct {
 	ArrivalID             string                   `json:"arrivalId"`
@@ -61,6 +62,11 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 	state := DisplayState{Arrivals: []DisplayArrival{}}
 	err := s.Transaction(ctx, "display:snapshot", func(tx *Store) error {
 		if err := tx.q.QueryRowContext(ctx, `SELECT last_id FROM display_cursor WHERE singleton=TRUE FOR UPDATE`).Scan(&state.Cursor); err != nil {
+			return err
+		}
+		var err error
+		state.Fallback, err = tx.ReadFallback(ctx)
+		if err != nil {
 			return err
 		}
 		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,
@@ -226,10 +232,13 @@ func (s *Store) DisplayEvents(ctx context.Context, cursor int64, limit int) ([]D
 
 // Arrival and lease state are durable; a resync snapshot includes current replay state.
 func (s *Store) RefreshDisplay(ctx context.Context, now time.Time) error {
-	if err := s.Transaction(ctx, "display:lease", func(tx *Store) error { return tx.expireDisplayLease(ctx, now) }); err != nil {
-		return err
-	}
-	return s.Transaction(ctx, "display:expired-memories", func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
+		if err := tx.expireDisplayLease(ctx, now); err != nil {
+			return err
+		}
 		return tx.removeExpiredMemoryDisplay(ctx, now)
 	})
 }
@@ -238,6 +247,9 @@ func (s *Store) RefreshDisplay(ctx context.Context, now time.Time) error {
 func (s *Store) AcquireDisplayLease(ctx context.Context, holder, lease string, now time.Time) (bool, error) {
 	acquired := false
 	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
 		if err := tx.expireDisplayLease(ctx, now); err != nil {
 			return err
 		}
@@ -260,6 +272,9 @@ func (s *Store) RenewDisplayLease(ctx context.Context, holder, lease string, now
 }
 func (s *Store) ReleaseDisplayLease(ctx context.Context, holder, lease string, now time.Time) error {
 	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
 		var old string
 		err := tx.q.QueryRowContext(ctx, `SELECT lease_id FROM display_primary_lease WHERE singleton=TRUE AND holder_id=$1 AND lease_id=$2 FOR UPDATE`, holder, lease).Scan(&old)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -312,17 +327,27 @@ func (s *Store) clearDisplayLease(ctx context.Context, lease string, now time.Ti
 		}
 	}
 	_, err = s.q.ExecContext(ctx, `UPDATE display_primary_lease SET holder_id=NULL,lease_id=NULL,expires_at=NULL WHERE singleton=TRUE`)
+	if err != nil {
+		return err
+	}
+	_, err = s.advanceFallback(ctx, now)
 	return err
 }
 
 func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arrivalID, action string, now time.Time) (string, error) {
 	var status string
+	var rejected bool
 	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		fallback, err := tx.advanceFallback(ctx, now)
+		if err != nil {
+			return err
+		}
 		var savedLease, savedAction, savedArrival string
-		err := tx.q.QueryRowContext(ctx, `SELECT lease_id,kind,arrival_id,result FROM display_renderer_receipts WHERE event_id=$1`, eventID).Scan(&savedLease, &savedAction, &savedArrival, &status)
+		err = tx.q.QueryRowContext(ctx, `SELECT lease_id,kind,arrival_id,result FROM display_renderer_receipts WHERE event_id=$1`, eventID).Scan(&savedLease, &savedAction, &savedArrival, &status)
 		if err == nil {
 			if savedLease != lease || savedAction != action || savedArrival != arrivalID {
-				return ErrConflict
+				rejected = true
+				return nil
 			}
 			return nil
 		}
@@ -332,7 +357,8 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		var current string
 		err = tx.q.QueryRowContext(ctx, `SELECT lease_id FROM display_primary_lease WHERE singleton=TRUE AND holder_id=$1 AND lease_id=$2 AND expires_at>$3 FOR UPDATE`, holder, lease, now).Scan(&current)
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrConflict
+			rejected = true
+			return nil
 		}
 		if err != nil {
 			return err
@@ -340,6 +366,10 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		previous, next := "queued", "playing"
 		switch action {
 		case "arrival.replay.started":
+			if fallback.Mode != "normal" {
+				rejected = true
+				return nil
+			}
 			if err := tx.lockTransaction(ctx, "arrival:queue"); err != nil {
 				return err
 			}
@@ -348,7 +378,8 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		case "arrival.replay.failed":
 			previous, next = "playing", "skipped"
 		default:
-			return ErrConflict
+			rejected = true
+			return nil
 		}
 		query := `UPDATE arrival_events SET replay_status=$2,renderer_lease_id=$3,
  replay_started_at=CASE WHEN $2='playing' THEN $4 ELSE replay_started_at END,
@@ -370,7 +401,8 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		}
 		n, _ := result.RowsAffected()
 		if n != 1 {
-			return ErrConflict
+			rejected = true
+			return nil
 		}
 		status = next
 		_, err = tx.AppendDisplayEvent(ctx, action, map[string]string{"arrivalId": arrivalID, "replayStatus": next}, now)
@@ -378,7 +410,19 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 			return err
 		}
 		_, err = tx.q.ExecContext(ctx, `INSERT INTO display_renderer_receipts(event_id,lease_id,kind,arrival_id,result,created_at) VALUES ($1,$2,$3,$4,$5,$6)`, eventID, lease, action, arrivalID, status, now)
-		return err
+		if err != nil {
+			return err
+		}
+		if fallback.Mode == "pending" {
+			_, err = tx.advanceFallback(ctx, now)
+			return err
+		}
+		return nil
 	})
+	// A rejected late renderer message must not roll back a due timeout.
+	// SQL/event/receipt failures still roll the complete transaction back.
+	if err == nil && rejected {
+		return "", ErrConflict
+	}
 	return status, err
 }

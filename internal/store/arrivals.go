@@ -227,6 +227,7 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
  + (SELECT COUNT(*) FROM photo_moments p WHERE p.memory_session_id=a.memory_session_id)
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
  WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$1
+ AND (SELECT mode='normal' FROM display_fallback_control WHERE singleton=TRUE)
  AND (a.photo_wait_until<=$1 OR NOT EXISTS (
  SELECT 1 FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='pending'))
  AND NOT EXISTS (
@@ -251,7 +252,10 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
 }
 
 func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error {
-	return s.Transaction(ctx, "arrival:skip:"+id, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
 		result, err := tx.q.ExecContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason='operator',replay_finished_at=$2
  WHERE id=$1 AND replay_status IN ('queued','playing')`, id, now)
 		if err != nil {
@@ -277,6 +281,9 @@ func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error
 				return ErrConflict
 			}
 			outcome = "already_skipped"
+		}
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
 		}
 		_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_operator_audit
  (operator_id,action,target_id_short,result,created_at) VALUES ('arrival_issuer','arrival.skip',$1,$2,$3)`,

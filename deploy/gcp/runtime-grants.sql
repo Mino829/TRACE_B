@@ -11,4 +11,5 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   arrival_events, arrival_receipts, arrival_operator_audit,
   display_events, display_cursor, display_primary_lease, display_renderer_receipts TO trace_app;
 GRANT SELECT ON schema_migrations TO trace_app;
+GRANT SELECT, UPDATE ON registration_control, notification_control, display_fallback_control TO trace_app;
 -- No table ownership, schema CREATE, or migration-table write permissions for the API.

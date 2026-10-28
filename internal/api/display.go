@@ -113,6 +113,8 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 	if !s.authenticateDisplay(conn, r.Header.Get("Origin")) {
 		return
 	}
+	s.displayConnections.Add(1)
+	defer s.displayConnections.Add(-1)
 	// No HTTP request deadline after upgrade. Read/write and total connection
 	// lifetimes below bound the hijacked connection independently.
 	ctx, cancel := context.WithTimeout(r.Context(), displayConnectionLifetime)
@@ -216,6 +218,17 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				cursor = event.ID
+				if event.Type == "system.fallback.changed" {
+					state, err = s.store.DisplaySnapshot(ctx, s.now().UTC())
+					if err != nil {
+						return
+					}
+					cursor = state.Cursor
+					if sendDisplay(conn, s.frame(strconv.FormatInt(cursor, 10), "display.snapshot", state)) != nil {
+						return
+					}
+					break
+				}
 			}
 		case msg := <-messages:
 			if time.Since(window) >= time.Second {

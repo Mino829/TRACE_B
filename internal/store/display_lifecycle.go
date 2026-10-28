@@ -8,6 +8,10 @@ import (
 )
 
 func (s *Store) removeMemoryDisplay(ctx context.Context, memoryID string, now time.Time) error {
+	// Callers take display:lease before per-memory locks.
+	if _, err := s.advanceFallback(ctx, now); err != nil {
+		return err
+	}
 	var arrivalID, status string
 	err := s.q.QueryRowContext(ctx, `SELECT id,replay_status FROM arrival_events WHERE memory_session_id=$1 FOR UPDATE`, memoryID).Scan(&arrivalID, &status)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -26,7 +30,8 @@ func (s *Store) removeMemoryDisplay(ctx context.Context, memoryID string, now ti
 			return err
 		}
 	}
-	return nil
+	_, err = s.advanceFallback(ctx, now)
+	return err
 }
 
 func (s *Store) removeExpiredMemoryDisplay(ctx context.Context, now time.Time) error {

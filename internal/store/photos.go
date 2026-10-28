@@ -323,7 +323,10 @@ func (s *Store) QueuePhotoDeletion(ctx context.Context, memoryID, photoID, targe
 }
 
 func (s *Store) QueueMemoryPhotoDeletion(ctx context.Context, memoryID string) error {
-	return s.Transaction(ctx, memoryID, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, memoryID); err != nil {
+			return err
+		}
 		if err := tx.deleteSession(ctx, "UPDATE memory_sessions SET deleting=TRUE WHERE id=$1", memoryID); err != nil {
 			return err
 		}
