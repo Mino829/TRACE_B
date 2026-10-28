@@ -575,6 +575,9 @@ func (s *Server) saveIdempotency(r *http.Request, scope string, requestBody []by
 
 func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, store.ErrArrivalQueueFull):
+		w.Header().Set("Retry-After", "5")
+		s.writeError(w, requestID(r), &apiError{Code: "ARRIVAL_QUEUE_FULL", Message: "arrival queue is full; retry after space becomes available", Status: http.StatusServiceUnavailable})
 	case errors.Is(err, store.ErrNotFound):
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_FOUND", Message: "resource was not found", Status: http.StatusNotFound})
 	case errors.Is(err, store.ErrConflict):

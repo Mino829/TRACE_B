@@ -245,7 +245,7 @@ func (s *Store) ExperienceByMemoryToken(ctx context.Context, id, token string, n
 	arrival, err := s.arrivalForMemory(ctx, v.MemorySessionID)
 	if err == nil {
 		v.ReplayStatus = arrival.Status
-		if arrival.Status == "queued" && !now.Before(arrival.ReplayDeadline) {
+		if arrival.Status == "queued" && !now.Before(v.MemoryExpiresAt) {
 			v.ReplayStatus = "skipped"
 		}
 	} else if !errors.Is(err, ErrNotFound) {
@@ -523,11 +523,6 @@ func (s *Store) SaveIdempotency(ctx context.Context, scope, key, requestHash str
 func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	s.PurgePositions(now)
 	if err := s.RefreshDisplay(ctx, now); err != nil {
-		return err
-	}
-	if err := s.Transaction(ctx, "display:expired-memories", func(tx *Store) error {
-		return tx.removeExpiredMemoryDisplay(ctx, now)
-	}); err != nil {
 		return err
 	}
 	return s.Transaction(ctx, "trace:cleanup", func(tx *Store) error {
