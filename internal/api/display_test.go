@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -113,14 +115,14 @@ func displayInput(t *testing.T, conn *websocket.Conn, cfg config.Config, kind, e
 func assertDisplaySafe(t *testing.T, frame displayFrameTest, experience createdExperience) {
 	t.Helper()
 	raw := string(frame.Data)
-	for _, forbidden := range []string{"latitude", "longitude", "uploadUrl", "imageUrl", "photoBytes", experience.Memory.ParticipantToken, experience.Live.ParticipantToken, experience.Live.SessionID, experience.Memory.SessionID} {
+	for _, forbidden := range []string{"latitude", "longitude", "uploadUrl", "imageUrl", "photoBytes", "displayAlias", experience.Memory.ParticipantToken, experience.Live.ParticipantToken, experience.Live.SessionID, experience.Memory.SessionID} {
 		if forbidden != "" && strings.Contains(raw, forbidden) {
 			t.Fatalf("unsafe display payload (%s): %s", forbidden, raw)
 		}
 	}
 }
 
-func TestDisplayNativeWebsocketSnapshotFanoutDeletionAndReconnect(t *testing.T) {
+func TestDisplayDoesNotPublishLegacyPositionsButKeepsArrival(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := displayConfig()
 	handler := api.New(cfg, f.Store, nil)
@@ -131,13 +133,10 @@ func TestDisplayNativeWebsocketSnapshotFanoutDeletionAndReconnect(t *testing.T) 
 		t.Fatalf("dial: %v status=%v", err, response)
 	}
 	defer conn.Close()
-	snapshot := nextDisplay(t, conn, "display.snapshot")
-	if snapshot.EventID == "" || snapshot.SchemaVersion != 1 || snapshot.CoordinateVersion != cfg.CoordinateVersion {
-		t.Fatalf("versioned snapshot missing: %+v", snapshot)
-	}
+	nextDisplay(t, conn, "display.snapshot")
 	created := seedLegacyExperience(t, f.Store, cfg)
-	body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, time.Now().UTC().Format(time.RFC3339Nano))
 	path := "/v1/live-presence-sessions/" + created.Live.SessionID
+	body := fmt.Sprintf(`{"point":{"latitude":35.0001,"longitude":135.0001,"accuracyM":8,"recordedAt":%q}}`, time.Now().UTC().Format(time.RFC3339Nano))
 	if got := request(t, handler, "POST", path+"/position", body, map[string]string{"Authorization": "Bearer " + created.Live.ParticipantToken}); got.Code != http.StatusGone || !strings.Contains(got.Body.String(), `"code":"POSITION_DISABLED"`) {
 		t.Fatalf("position retirement: %d %s", got.Code, got.Body.String())
 	}
@@ -147,92 +146,44 @@ func TestDisplayNativeWebsocketSnapshotFanoutDeletionAndReconnect(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	updated := nextDisplay(t, conn, "position.updated")
-	assertDisplaySafe(t, updated, created)
-	var position struct {
-		LivePresenceID string  `json:"livePresenceId"`
-		X              float64 `json:"x"`
-		Z              float64 `json:"z"`
-	}
-	if err := json.Unmarshal(updated.Data, &position); err != nil || position.LivePresenceID == "" || position.LivePresenceID == created.Live.SessionID {
-		t.Fatalf("display-scoped position: %v %+v", err, position)
-	}
-	var saved int
-	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM display_events WHERE kind LIKE 'position.%'`).Scan(&saved); err != nil || saved != 0 {
-		t.Fatalf("position history written to PostgreSQL: count=%d error=%v", saved, err)
-	}
-	var table *string
-	if err := f.SQL.QueryRowContext(t.Context(), `SELECT to_regclass('display_positions')::text`).Scan(&table); err != nil || table != nil {
-		t.Fatalf("position table exists: %v %v", table, err)
+	if _, position, err := f.Store.LiveSession(t.Context(), created.Live.SessionID); err != nil || position == nil || position.X != 10 {
+		t.Fatalf("legacy owner position was lost: %+v %v", position, err)
 	}
 	standby, response, err := dialDisplay(t, server.URL, token, cfg)
 	if err != nil {
 		t.Fatalf("standby dial: %v %v", err, response)
 	}
 	defer standby.Close()
-	snapshot = nextDisplay(t, standby, "display.snapshot")
+	snapshot := nextDisplay(t, standby, "display.snapshot")
 	assertDisplaySafe(t, snapshot, created)
-	if !strings.Contains(string(snapshot.Data), position.LivePresenceID) {
-		t.Fatalf("resync missing current position: %s", snapshot.Data)
-	}
-	if got := request(t, handler, "DELETE", path, "", map[string]string{"Authorization": "Bearer " + created.Live.ParticipantToken, "Idempotency-Key": "display-delete"}); got.Code != 204 {
-		t.Fatalf("delete: %d %s", got.Code, got.Body.String())
-	}
-	removed := nextDisplay(t, conn, "tracking.stopped")
-	if !strings.Contains(string(removed.Data), position.LivePresenceID) {
-		t.Fatalf("delete tombstone wrong: %s", removed.Data)
-	}
-	if removed.EventID == updated.EventID {
-		t.Fatal("event IDs reused")
-	}
-	conn.Close()
-	standby.Close()
-	restored, response, err := dialDisplay(t, server.URL, token, cfg)
-	if err != nil {
-		t.Fatalf("reconnect: %v %v", err, response)
-	}
-	defer restored.Close()
-	snapshot = nextDisplay(t, restored, "display.snapshot")
-	if strings.Contains(string(snapshot.Data), position.LivePresenceID) {
-		t.Fatalf("deleted position returned on reconnect: %s", snapshot.Data)
-	}
-}
-
-func TestDisplayNativeWebsocketTTLRemovalAndFreshSnapshot(t *testing.T) {
-	f := testdb.Open(t)
-	cfg := displayConfig()
-	handler := api.New(cfg, f.Store, nil)
-	server := displayServer(t, handler)
-	conn, response, err := dialDisplay(t, server.URL, displayToken(t, handler, cfg), cfg)
-	if err != nil {
-		t.Fatalf("dial: %v %v", err, response)
-	}
-	defer conn.Close()
-	nextDisplay(t, conn, "display.snapshot")
-	created := seedLegacyExperience(t, f.Store, cfg)
-	now := time.Now().UTC()
-	if err := f.Store.SavePosition(t.Context(), created.Live.SessionID, store.Position{
-		X: 12, Z: 15, AccuracyM: 8, RecordedAt: now, ReceivedAt: now, ExpiresAt: now.Add(2 * time.Second),
-	}); err != nil {
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(snapshot.Data, &data); err != nil {
 		t.Fatal(err)
 	}
-	updated := nextDisplay(t, conn, "position.updated")
-	removed := nextDisplay(t, conn, "position.expired")
-	var point struct {
-		LivePresenceID string `json:"livePresenceId"`
+	if _, present := data["participants"]; present {
+		t.Fatalf("old positions published in snapshot: %s", snapshot.Data)
 	}
-	if err := json.Unmarshal(updated.Data, &point); err != nil || point.LivePresenceID == "" || !strings.Contains(string(removed.Data), point.LivePresenceID) {
-		t.Fatalf("expiry tombstone: %v %s", err, removed.Data)
+	if err := f.Store.StopLive(t.Context(), created.Live.SessionID, "participant", time.Now().UTC()); err != nil {
+		t.Fatal(err)
 	}
-	replacement, response, err := dialDisplay(t, server.URL, displayToken(t, handler, cfg), cfg)
-	if err != nil {
-		t.Fatalf("fresh snapshot: %v %v", err, response)
+	if _, position, err := f.Store.LiveSession(t.Context(), created.Live.SessionID); err != nil || position != nil {
+		t.Fatalf("legacy stop did not erase position: %+v %v", position, err)
 	}
-	defer replacement.Close()
-	snapshot := nextDisplay(t, replacement, "display.snapshot")
-	if strings.Contains(string(snapshot.Data), point.LivePresenceID) {
-		t.Fatalf("expired position restored: %s", snapshot.Data)
+	_ = conn.SetReadDeadline(time.Now().Add(750 * time.Millisecond))
+	var leaked displayFrameTest
+	if err := conn.ReadJSON(&leaked); err == nil {
+		t.Fatalf("old position/phase event published: %+v", leaked)
+	} else {
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("unexpected display read failure: %v", err)
+		}
 	}
+	proof := projectedProof(t, handler, cfg)
+	if arrived := arriveRequest(t, handler, created, proof, "legacy-display-arrival"); arrived.code != http.StatusOK {
+		t.Fatalf("legacy memory arrival: %d %s", arrived.code, arrived.body)
+	}
+	assertDisplaySafe(t, nextDisplay(t, standby, "participant.arrived"), created)
 }
 
 func TestDisplayNativeGapResynchronizesWithSnapshot(t *testing.T) {
@@ -447,4 +398,157 @@ func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T)
 	if err := f.SQL.QueryRowContext(t.Context(), `SELECT skip_reason FROM arrival_events WHERE id=$1`, arrival.ID).Scan(&reason); err != nil || reason != "renderer_failure" {
 		t.Fatalf("renderer failure reason: %s %v", reason, err)
 	}
+}
+
+// Equal checkpoint timestamps cannot identify a deleted photo on their own;
+// display changes must carry the complete, current route without private IDs.
+func TestDisplayDevicePhotoRouteArrivalSnapshotAndMutations(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := displayConfig()
+	cfg.PhotoMetadataEnabled = true
+	photoGraphFixture(t, f, &cfg)
+	cfg.ArrivalCheckpointID = "cp-b"
+	handler := api.New(cfg, f.Store, nil)
+	server := displayServer(t, handler)
+	token := displayToken(t, handler, cfg)
+	conn, response, err := dialDisplay(t, server.URL, token, cfg)
+	if err != nil {
+		t.Fatalf("dial: %v status=%v", err, response)
+	}
+	defer conn.Close()
+	nextDisplay(t, conn, "display.snapshot")
+	owner := createExperience(t, handler, cfg)
+	base := "/v2/memory-sessions/" + owner.Memory.SessionID + "/photos"
+	captured := time.Now().UTC().Truncate(time.Microsecond)
+	create := func(clientID, checkpoint string) string {
+		t.Helper()
+		r := request(t, handler, "POST", base, devicePhotoBody(clientID, checkpoint, captured),
+			map[string]string{"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": clientID})
+		if r.Code != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", clientID, r.Code, r.Body.String())
+		}
+		var p struct {
+			ID string `json:"photoMomentId"`
+		}
+		if err := json.Unmarshal(r.Body.Bytes(), &p); err != nil || p.ID == "" {
+			t.Fatalf("photo ID: %+v %v", p, err)
+		}
+		return p.ID
+	}
+	first := create("display-first", "cp-a")
+	second := create("display-second", "cp-b")
+	proof := projectedProof(t, handler, cfg)
+	arrival := arriveRequest(t, handler, owner, proof, "display-device-arrival")
+	if arrival.code != http.StatusOK {
+		t.Fatalf("arrival: %d %s", arrival.code, arrival.body)
+	}
+	verify := func(frame displayFrameTest, wantPath, wantPoints []string, privateIDs ...string) {
+		t.Helper()
+		assertDisplaySafe(t, frame, owner)
+		for _, id := range privateIDs {
+			if strings.Contains(string(frame.Data), id) {
+				t.Fatalf("private photo ID in display: %s", frame.Data)
+			}
+		}
+		var data struct {
+			PathNodeIDs      []string `json:"pathNodeIds"`
+			PhotoCheckpoints []struct {
+				CheckpointID string    `json:"checkpointId"`
+				CapturedAt   time.Time `json:"capturedAt"`
+			} `json:"photoCheckpoints"`
+			Arrivals []struct {
+				PathNodeIDs      []string `json:"pathNodeIds"`
+				PhotoCheckpoints []struct {
+					CheckpointID string    `json:"checkpointId"`
+					CapturedAt   time.Time `json:"capturedAt"`
+				} `json:"photoCheckpoints"`
+			} `json:"arrivals"`
+		}
+		if err := json.Unmarshal(frame.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		points := data.PhotoCheckpoints
+		if frame.Type == "display.snapshot" {
+			if len(data.Arrivals) != 1 {
+				t.Fatalf("snapshot arrivals: %s", frame.Data)
+			}
+			data.PathNodeIDs = data.Arrivals[0].PathNodeIDs
+			points = data.Arrivals[0].PhotoCheckpoints
+		}
+		if fmt.Sprint(data.PathNodeIDs) != fmt.Sprint(wantPath) || len(points) != len(wantPoints) {
+			t.Fatalf("wrong projected route: %s; want path %v checkpoints %v", frame.Data, wantPath, wantPoints)
+		}
+		for i, p := range points {
+			if p.CheckpointID != wantPoints[i] || !p.CapturedAt.Equal(captured) {
+				t.Fatalf("wrong checkpoint %d: %+v", i, p)
+			}
+		}
+	}
+	route := []string{"cp-a", "mid", "cp-b"}
+	arrived := nextDisplay(t, conn, "participant.arrived")
+	verify(arrived, route, []string{"cp-a", "cp-b"}, first, second)
+	standby, response, err := dialDisplay(t, server.URL, token, cfg)
+	if err != nil {
+		t.Fatalf("reconnect: %v %v", err, response)
+	}
+	defer standby.Close()
+	verify(nextDisplay(t, standby, "display.snapshot"), route, []string{"cp-a", "cp-b"}, first, second)
+
+	if r := request(t, handler, "DELETE", base+"/"+first, "", map[string]string{
+		"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": "display-delete-photo",
+	}); r.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", r.Code, r.Body.String())
+	}
+	verify(nextDisplay(t, conn, "photo.moment.deleted"), []string{"cp-b"}, []string{"cp-b"}, first, second)
+	verify(nextDisplay(t, standby, "photo.moment.deleted"), []string{"cp-b"}, []string{"cp-b"}, first, second)
+	third := create("display-third", "cp-a")
+	verify(nextDisplay(t, conn, "photo.moment.created"), []string{"cp-b", "mid", "cp-a", "mid", "cp-b"},
+		[]string{"cp-b", "cp-a"}, first, second, third)
+	verify(nextDisplay(t, standby, "photo.moment.created"), []string{"cp-b", "mid", "cp-a", "mid", "cp-b"},
+		[]string{"cp-b", "cp-a"}, first, second, third)
+	if r := request(t, handler, "POST", base, devicePhotoBody("display-third", "cp-a", captured),
+		map[string]string{"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": "display-third"}); r.Code != http.StatusOK {
+		t.Fatalf("idempotent replay: %d %s", r.Code, r.Body.String())
+	}
+	var createdEvents int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM display_events WHERE kind='photo.moment.created'`).Scan(&createdEvents); err != nil || createdEvents != 1 {
+		t.Fatalf("duplicate photo event: %d %v", createdEvents, err)
+	}
+	fourth := create("display-fourth", "cp-a")
+	verify(nextDisplay(t, conn, "photo.moment.created"), []string{"cp-b", "mid", "cp-a", "mid", "cp-b"},
+		[]string{"cp-b", "cp-a", "cp-a"}, first, second, third, fourth)
+	if r := request(t, handler, "DELETE", base+"/"+third, "", map[string]string{
+		"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": "display-delete-duplicate",
+	}); r.Code != http.StatusNoContent {
+		t.Fatalf("delete duplicate: %d %s", r.Code, r.Body.String())
+	}
+	verify(nextDisplay(t, conn, "photo.moment.deleted"), []string{"cp-b", "mid", "cp-a", "mid", "cp-b"},
+		[]string{"cp-b", "cp-a"}, first, second, third, fourth)
+
+	// A segment pinned to another map version must not leak a partial route.
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE moment_route_segments SET three_d_map_version='retired'
+ WHERE memory_session_id=$1 AND to_photo_moment_id IS NULL`, owner.Memory.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	stale, response, err := dialDisplay(t, server.URL, token, cfg)
+	if err != nil {
+		t.Fatalf("reconnect with stale route: %v %v", err, response)
+	}
+	verify(nextDisplay(t, stale, "display.snapshot"), []string{}, []string{"cp-b", "cp-a"}, first, second, third, fourth)
+	stale.Close()
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE moment_route_segments SET three_d_map_version=$2
+ WHERE memory_session_id=$1 AND to_photo_moment_id IS NULL`, owner.Memory.SessionID, cfg.ThreeDMapVersion); err != nil {
+		t.Fatal(err)
+	}
+
+	// A retired graph must not reinterpret saved checkpoint IDs as current nodes.
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE memory_sessions SET campus_graph_version='retired' WHERE id=$1`, owner.Memory.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	reconnected, response, err := dialDisplay(t, server.URL, token, cfg)
+	if err != nil {
+		t.Fatalf("reconnect after graph retirement: %v %v", err, response)
+	}
+	defer reconnected.Close()
+	verify(nextDisplay(t, reconnected, "display.snapshot"), []string{}, []string{}, first, second, third, fourth)
 }

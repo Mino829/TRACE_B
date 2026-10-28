@@ -36,15 +36,12 @@ type Store struct {
 	displayEnabled bool
 }
 type positionCache struct {
-	mu        sync.RWMutex
-	latest    map[string]Position
-	projected map[string]DisplayParticipant
+	mu     sync.RWMutex
+	latest map[string]Position
 }
 type positionChange struct {
 	id        string
 	point     Position
-	display   DisplayParticipant
-	phase     string
 	operation positionOperation
 }
 type positionOperation byte
@@ -53,7 +50,6 @@ const (
 	noPositionChange positionOperation = iota
 	setPosition
 	removePosition
-	updatePositionPhase
 )
 
 type NewExperience struct {
@@ -111,7 +107,7 @@ func Open(ctx context.Context, dsn string, maxConnections int) (*Store, error) {
 		db.Close()
 		return nil, errors.New("PostgreSQL connection failed; check network and credentials")
 	}
-	return &Store{db: db, q: db, positions: &positionCache{latest: make(map[string]Position), projected: make(map[string]DisplayParticipant)}}, nil
+	return &Store{db: db, q: db, positions: &positionCache{latest: make(map[string]Position)}}, nil
 }
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Ping(ctx context.Context) error {
@@ -163,17 +159,8 @@ func (s *Store) Transaction(ctx context.Context, key string, fn func(*Store) err
 	switch work.pending.operation {
 	case setPosition:
 		s.positions.latest[work.pending.id] = work.pending.point
-		if s.displayEnabled {
-			s.positions.projected[work.pending.id] = work.pending.display
-		}
 	case removePosition:
 		delete(s.positions.latest, work.pending.id)
-		delete(s.positions.projected, work.pending.id)
-	case updatePositionPhase:
-		if display, ok := s.positions.projected[work.pending.id]; ok {
-			display.PresencePhase = work.pending.phase
-			s.positions.projected[work.pending.id] = display
-		}
 	}
 	return nil
 }
@@ -287,8 +274,7 @@ func (s *Store) authenticate(ctx context.Context, query, id, token string, now t
 	return nil
 }
 
-// EnableDisplay exposes the same short-lived in-memory positions to native renderers.
-// Arrivals and replay receipts remain durable; deployment must use one Backend instance.
+// EnableDisplay activates arrival events and replay receipts for the renderer.
 func (s *Store) EnableDisplay() { s.displayEnabled = true }
 
 func (s *Store) LiveSession(ctx context.Context, id string) (LiveSession, *Position, error) {
@@ -336,13 +322,8 @@ func (s *Store) SavePosition(ctx context.Context, id string, p Position) error {
 		if found && !p.RecordedAt.After(previous.RecordedAt) {
 			return ErrConflict
 		}
-		if tx.displayEnabled {
-			var displayID, color, symbol, phase string
-			if err := tx.q.QueryRowContext(ctx, `SELECT display_id::text,display_color,display_symbol,presence_phase FROM live_presence_sessions WHERE id=$1`, id).Scan(&displayID, &color, &symbol, &phase); err != nil {
-				return err
-			}
-			tx.pending.display = DisplayParticipant{LivePresenceID: displayID, X: p.X, Z: p.Z, AccuracyM: p.AccuracyM, DisplayAlias: DisplayAlias{Color: color, Symbol: symbol}, PresencePhase: phase, LastUpdatedAt: p.ReceivedAt, ExpiresAt: p.ExpiresAt}
-		}
+		// Older Live sessions retain owner-only access to their last position
+		// until stop or expiry; this cache never feeds a display projection.
 		if _, err := tx.q.ExecContext(ctx, "UPDATE live_presence_sessions SET last_seen_at=$1 WHERE id=$2", p.ReceivedAt, id); err != nil {
 			return err
 		}
@@ -401,7 +382,7 @@ func (s *Store) SetOnSite(ctx context.Context, id, consent string, continuing bo
 		if err != nil {
 			return err
 		}
-		return tx.displayPhase(ctx, id, "participant.on_site", now)
+		return nil
 	})
 }
 func (s *Store) DeleteMemory(ctx context.Context, id string) error {
@@ -513,14 +494,13 @@ func (s *Store) deleteSession(ctx context.Context, query string, args ...any) er
 	return nil
 }
 
-// PurgePositions physically erases expired display points from process memory.
+// PurgePositions physically erases expired legacy owner positions from process memory.
 func (s *Store) PurgePositions(now time.Time) {
 	s.positions.mu.Lock()
 	defer s.positions.mu.Unlock()
 	for id, p := range s.positions.latest {
 		if !now.Before(p.ExpiresAt) {
 			delete(s.positions.latest, id)
-			delete(s.positions.projected, id)
 		}
 	}
 }

@@ -107,6 +107,9 @@ func (s *Store) CreatePhotoMoment(ctx context.Context, p PhotoMoment, now time.T
 		if err := tx.reconcileMomentRoutes(ctx, p.MemorySessionID); err != nil {
 			return err
 		}
+		if err := tx.appendDisplayPhotoChange(ctx, p.MemorySessionID, "photo.moment.created", now); err != nil {
+			return err
+		}
 		result, created = p, true
 		return nil
 	})
@@ -160,7 +163,10 @@ func (s *Store) DeletePhotoMoment(ctx context.Context, memoryID, photoID string,
 		if _, err := tx.q.ExecContext(ctx, `DELETE FROM photo_moments WHERE memory_session_id=$1 AND id=$2`, memoryID, photoID); err != nil {
 			return err
 		}
-		return tx.reconcileMomentRoutes(ctx, memoryID)
+		if err := tx.reconcileMomentRoutes(ctx, memoryID); err != nil {
+			return err
+		}
+		return tx.appendDisplayPhotoChange(ctx, memoryID, "photo.moment.deleted", now)
 	})
 }
 

@@ -7,34 +7,6 @@ import (
 	"time"
 )
 
-func (s *Store) displayPhase(ctx context.Context, id, kind string, now time.Time) error {
-	var displayID, phase string
-	err := s.q.QueryRowContext(ctx, `SELECT display_id::text,presence_phase FROM live_presence_sessions WHERE id=$1`, id).Scan(&displayID, &phase)
-	if err != nil {
-		return err
-	}
-	if s.displayEnabled {
-		s.pending = positionChange{id: id, phase: phase, operation: updatePositionPhase}
-	}
-	_, err = s.AppendDisplayEvent(ctx, kind, map[string]string{"livePresenceId": displayID, "presencePhase": phase}, now)
-	return err
-}
-
-func (s *Store) linkedDisplayPhase(ctx context.Context, memoryID, kind string, now time.Time) error {
-	var id string
-	err := s.q.QueryRowContext(ctx, `SELECT live_session_id FROM experience_links WHERE memory_session_id=$1`, memoryID).Scan(&id)
-	if err != nil {
-		return err
-	}
-	return s.displayPhase(ctx, id, kind, now)
-}
-
-func (s *Store) arrivalDisplayAlias(ctx context.Context, memoryID string) (DisplayAlias, error) {
-	var alias DisplayAlias
-	err := s.q.QueryRowContext(ctx, `SELECT display_color,display_symbol FROM experiences WHERE memory_session_id=$1`, memoryID).Scan(&alias.Color, &alias.Symbol)
-	return alias, err
-}
-
 func (s *Store) removeMemoryDisplay(ctx context.Context, memoryID string, now time.Time) error {
 	var arrivalID, status string
 	err := s.q.QueryRowContext(ctx, `SELECT id,replay_status FROM arrival_events WHERE memory_session_id=$1 FOR UPDATE`, memoryID).Scan(&arrivalID, &status)

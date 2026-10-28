@@ -78,8 +78,8 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			}
 			var expires time.Time
 			var deleting bool
-			var photoMode string
-			err = tx.q.QueryRowContext(ctx, `SELECT expires_at,deleting,photo_mode FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &deleting, &photoMode)
+			var photoMode, graphVersion string
+			err = tx.q.QueryRowContext(ctx, `SELECT expires_at,deleting,photo_mode,COALESCE(campus_graph_version,'') FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &deleting, &photoMode, &graphVersion)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -112,9 +112,6 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 					}
 					if n, _ := result.RowsAffected(); n == 1 {
 						a.LivePresencePhase = "arrived"
-						if err := tx.linkedDisplayPhase(ctx, memoryID, "participant.phase.changed", now); err != nil {
-							return err
-						}
 					}
 				}
 				if err := tx.EndPushForMemory(ctx, memoryID); err != nil {
@@ -150,16 +147,16 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				if err != nil {
 					return err
 				}
-				alias, err := tx.arrivalDisplayAlias(ctx, memoryID)
-				if err != nil {
-					return err
-				}
-				_, err = tx.AppendDisplayEvent(ctx, "participant.arrived", map[string]any{
-					"arrivalId": a.ID, "replayStatus": a.Status,
-					"displayAlias": alias, "replayDurationSeconds": 15,
-				}, now)
-				if err != nil {
-					return err
+				if tx.displayEnabled {
+					projected, err := tx.projectDisplayArrival(ctx, DisplayArrival{
+						ArrivalID: a.ID, ReplayStatus: a.Status,
+					}, memoryID, photoMode, graphVersion)
+					if err != nil {
+						return err
+					}
+					if _, err := tx.AppendDisplayEvent(ctx, "participant.arrived", projected, now); err != nil {
+						return err
+					}
 				}
 				if a.Status == "queued" {
 					_, err = tx.AppendDisplayEvent(ctx, "arrival.replay.requested", map[string]string{"arrivalId": a.ID}, now)
