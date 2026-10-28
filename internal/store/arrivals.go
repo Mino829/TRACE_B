@@ -43,7 +43,7 @@ func (s *Store) ArrivalRouteExpected(ctx context.Context, memoryID string, lastC
 	if err != nil {
 		return false, err
 	}
-	_, ok := s.routes.CheckpointNode(checkpointID)
+	_, ok := s.routes.NodeIndex(checkpointID)
 	return ok && !lastCaptured.After(arrivedAt), nil
 }
 

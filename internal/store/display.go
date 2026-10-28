@@ -120,7 +120,7 @@ func (s *Store) projectDisplayArrival(ctx context.Context, a DisplayArrival, mem
 			a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
 			return a, nil
 		}
-		if _, ok := s.routes.CheckpointNode(p.CheckpointID); !ok {
+		if _, ok := s.routes.NodeIndex(p.CheckpointID); !ok {
 			a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
 			return a, nil
 		}

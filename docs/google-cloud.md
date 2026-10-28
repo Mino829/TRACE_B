@@ -154,6 +154,8 @@ gcloud run services proxy trace-backend --project="$GCP_PROJECT_ID" \
 
 受付を開いて試験するときは、設計Issue #23/#9のGPSなし参加と同意文の承認後、管理者が設定ファイルの`TRACE_REGISTRATION_OPEN`をtrueへ変更して再デプロイします。Backend #25の写真地点契約とFrontendの新規受付が未整合の間は受付を開きません。一般参加者へ公開する前に以下を完了してください。
 
+写真地点の`selectable`対応には追加migrationやGraph版の書換えはありません。同じ固定bundleで新API/清掃を配布し、旧revisionとの並走を避けます。承認済みstagingでは、`selectable:true`のwaypointの登録、選択不可checkpointの400、旧Graph版Sessionへの追加409、非選択の到着地点までの経路、到着後に届いた撮影済みメタデータと削除による描画差分を確認してください。旧判定で受理済みの写真は前倒し削除せず、本人操作と既存の期限清掃を維持します。このローカル実装・検証だけで実データ受付や一般公開の承認とは扱いません。
+
 - [実装済みレート制限](../README.md#公開apiのレート制限)の共有IP・全体負荷検証と429監視。CORSだけでは悪用防止にならない。
 - 正しい参加画面URL、旧版と異なる承認済みのMemory同意版・文面、保存期間と問い合わせ先。
 - 実機Memoryのみの参加→写真GPS拒否→旧Liveの位置送信拒否・本人停止・削除→期限削除。

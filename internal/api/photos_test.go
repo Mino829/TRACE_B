@@ -179,9 +179,9 @@ func photoGraphFixture(t *testing.T, f *testdb.Fixture, cfg *config.Config) {
 	t.Helper()
 	lonStep := 20 / (6378137 * math.Cos(35*math.Pi/180) * math.Pi / 180)
 	raw := fmt.Sprintf(`{"schemaVersion":1,"campusGraphVersion":"g1","coordinateVersion":"c1","threeDMapVersion":"m1","nodes":[`+
-		`{"id":"cp-a","lat":35,"lon":139,"local":{"east":0,"north":0},"gpsSnap":true,"role":"checkpoint"},`+
-		`{"id":"mid","lat":35,"lon":%.9f,"local":{"east":20,"north":0},"gpsSnap":true},`+
-		`{"id":"cp-b","lat":35,"lon":%.9f,"local":{"east":40,"north":0},"gpsSnap":true,"role":"checkpoint"}],`+
+		`{"id":"cp-a","lat":35,"lon":139,"local":{"east":0,"north":0},"gpsSnap":true,"role":"checkpoint","selectable":true},`+
+		`{"id":"mid","lat":35,"lon":%.9f,"local":{"east":20,"north":0},"gpsSnap":true,"role":"checkpoint","selectable":false},`+
+		`{"id":"cp-b","lat":35,"lon":%.9f,"local":{"east":40,"north":0},"gpsSnap":true,"role":"waypoint","selectable":true}],`+
 		`"edges":[{"id":"am","from":"cp-a","to":"mid","kind":"ground","lengthMetres":20,"passable":true},`+
 		`{"id":"mb","from":"mid","to":"cp-b","kind":"ground","lengthMetres":20,"passable":true}]}`, 139+lonStep, 139+2*lonStep)
 	g, err := route.Parse([]byte(raw))

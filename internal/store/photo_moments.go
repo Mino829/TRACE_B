@@ -74,7 +74,7 @@ func (s *Store) CreatePhotoMoment(ctx context.Context, p PhotoMoment, now time.T
 		if tx.routes == nil || m.CampusGraphVersion != tx.routes.CampusGraphVersion {
 			return ErrConflict
 		}
-		if _, ok := tx.routes.CheckpointNode(p.CheckpointID); !ok {
+		if _, ok := tx.routes.PhotoCheckpointNode(p.CheckpointID); !ok {
 			return ErrInvalidCheckpoint
 		}
 		var count int
@@ -211,10 +211,10 @@ func (s *Store) reconcileMomentRoutes(ctx context.Context, memoryID string) erro
 		if from.CampusGraphVersion != s.routes.CampusGraphVersion {
 			return nil
 		}
-		if _, ok := s.routes.CheckpointNode(from.CheckpointID); !ok {
+		if _, ok := s.routes.NodeIndex(from.CheckpointID); !ok {
 			return nil
 		}
-		if _, ok := s.routes.CheckpointNode(to.Checkpoint); !ok {
+		if _, ok := s.routes.NodeIndex(to.Checkpoint); !ok {
 			return nil
 		}
 		result := s.routes.Connect(&route.Endpoint{Checkpoint: from.CheckpointID, CapturedAt: from.CapturedAt}, &to)
