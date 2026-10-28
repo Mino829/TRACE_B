@@ -137,6 +137,8 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 `TRACE_DISPLAY_ENABLED=false`が既定です。有効化にはGoogle OAuthのWebクライアントID（`TRACE_DISPLAY_GOOGLE_CLIENT_ID`）、運営者のメールアドレス許可リスト（`TRACE_DISPLAY_OPERATOR_EMAILS`）、展示ページの専用Origin許可リスト（`TRACE_DISPLAY_ALLOWED_ORIGINS`）と、到着・Edgeから独立した32バイト以上の`TRACE_DISPLAY_TOKEN_KEY`が必要です。リストはカンマ区切り・完全一致で、wildcardは認めません。OriginはHTTPS、開発時のみ`http://localhost:<port>`/`http://127.0.0.1:<port>`を許可します。署名鍵はSecret Managerに置き、ブラウザやWorkerへ渡しません。座標/CampusGraph/3D Map版は埋め込みGraphと照合します。Google OAuthの許可JavaScript Originにも展示ページのOriginを登録してください。
 
+PR #37の接続コメントに合わせ、設定例の展示Originは`https://trace-log.async5855.workers.dev`です。実際の画面URLはその`/display`ですが、Backendの許可OriginとGoogle側の承認済みJavaScript生成元にはパスを含めません。依頼者から提供されたWebクライアントIDと許可メールは`.env.example`と`deploy/gcp/runtime.env.yaml.example`へ反映済みです。Frontendの`NEXT_PUBLIC_GOOGLE_CLIENT_ID`にはBackendの`TRACE_DISPLAY_GOOGLE_CLIENT_ID`と**同じ値**を設定し、`NEXT_PUBLIC_DISPLAY_API_URL`と併せてビルドし直してください。stagingへの設定適用と実Googleログインは未完了であり、設定例の更新だけでログイン可能になったとは扱いません。[OAuth設定手順](docs/google-cloud.md#pr-37の展示ブラウザ接続設定)を参照してください。
+
 展示ブラウザはGoogleログインで得たIDトークンを`Authorization: Bearer <Google ID token>`へ設定し、Backendへ直接、空bodyの`POST /v1/operator/display-tokens`を送ります。Googleの署名・audience・issuer・期限・発行時刻・sub・`email_verified`・存在する場合の`azp`を検証し、許可メールだけにOrigin束縛の2分有効な`displayToken`と`expiresAt`を返します。メールはGmail、またはGoogleが管理するWorkspace（署名済み`hd`あり）に限定します。任意の外部メールを登録しただけのGoogleアカウントは、Googleが現在のメール所有者を保証しないため拒否します（[Googleの検証指針](https://developers.google.com/identity/sign-in/web/backend-auth)）。旧HMAC発行とnative rendererの独自HTTPヘッダー接続は廃止しました。参加者資格・描画資格では発行できません。
 
 ブラウザは`new WebSocket("wss://<backend>/v1/display/ws")`で直接接続し、5秒以内に次の**最初のテキストメッセージ**を送ります。版は配備済みbundleと完全一致させます。資格をURL・query・subprotocol・ログ・写真・QRへ載せず、Google IDトークンと描画トークンはブラウザメモリ内だけで保持してください。
@@ -146,9 +148,9 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
   "schemaVersion": 1,
   "type": "renderer.authenticate",
   "displayToken": "<issued-display-token>",
-  "coordinateVersion": "campus-2026-01",
-  "campusGraphVersion": "graph-2026-01",
-  "threeDMapVersion": "map-2026-01"
+  "coordinateVersion": "toyosu-2026-08-28.1",
+  "campusGraphVersion": "toyosu-graph-2026-10-26.1.draft",
+  "threeDMapVersion": "toyosu-3dmap-2026-10-26"
 }
 ```
 
@@ -184,7 +186,9 @@ WebPはVP8Lの過大割り当てを修正した公式`x/image v0.47.0`を使い�
 経路生成は写真を撮影時刻順に並べ、隣接するready写真の対についてCampusGraph上で接続する。両端ともチェックポイント（または混合でGPSアンカー+チェックポイントノード解決）ならノード間/最短経路で区間を作成し、`algorithmVersion`を`checkpoint-dijkstra-1`とする。両端とも旧GPS由来なら従来のスナップ推定（`photo-edges-dijkstra-1`）を維持する。ノード解決不能（旧GPSの精度不足・経路不在など）は`confidence:low, path:[]`で記録し、撮影順は変更しない。到着イベント確定のトランザクション内で、セッションにready写真が残る場合のみ、最後の写真から到着チェックポイントへの区間を同じ方式で追加する（写真0枚の到着では区間を作らない、写真削除時も再計算で整合を保つ）。到着区間の`toPhotoMomentId`はnullになる。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
 写真が`ready`になると、撮影時刻順の隣り合う写真ごとに`RouteSegment`を同一DBトランザクションで作成します。個別削除要求では`deleting`になった写真をただちに除外して残る前後の写真間を再計算し、画像消去完了・失敗時にも整合させます。写真0枚・1枚なら区間は空のままで到着/終了を妨げません。既存写真を保持するDBへ移行したときは本人memory取得時に欠損区間を再計算します。
 
-CampusGraphは`internal/route/campus_graph.json`へ固定同梱します（TRACE_F main、2026-10-23取得、JSON記載版`toyosu-graph-2026-10-21.1.draft`）。Graph付属READMEの記述版`toyosu-graph-2026-10-18.2.draft`とは異なるため、JSON自身の版を正として使います。Graphの`coordinateVersion`=`toyosu-2026-08-28.1`、`threeDMapVersion`=`キャンパス全体.blend 2026-10-21`と公開設定の三つが一致しないと写真ストレージを用いるAPI/清掃ジョブの起動を拒否します。既定の`campus-2026-01`等を黙って上書きしません。承認済みの地図・表示機側にも同じ版を事前配布・ヘルス確認してから`TRACE_COORDINATE_VERSION`、`TRACE_CAMPUS_GRAPH_VERSION`、`TRACE_THREE_D_MAP_VERSION`と豊洲のジオフェンスを設定し、受け付け切替・ロールバックを行ってください。Graphの更新では固定JSON、互換版、試験点の測定を併せて更新します。
+CampusGraphは`internal/route/campus_graph.json`へ固定同梱します。正本は[TRACE_F #61のコミット`93ad81fc417d7cb327ba54749ae13cc86541a2b2`](https://github.com/Mino829/TRACE_F/blob/93ad81fc417d7cb327ba54749ae13cc86541a2b2/models/trace/campus_graph.json)で、JSON全体を取り込み、版名だけを書き換えていません。`coordinateVersion`=`toyosu-2026-08-28.1`、`campusGraphVersion`=`toyosu-graph-2026-10-26.1.draft`、`threeDMapVersion`=`toyosu-3dmap-2026-10-26`を描画機・設定例と一致させています。三つが設定と一致しない場合、描画/写真メタデータ/写真ストレージを用いるAPI・清掃ジョブの起動を拒否します。承認済みの地図・描画機・Backendを同じbundleで配布し、受付停止と旧revision停止の移行窓で切り替えてください。既存MemorySessionや写真の保存Graph版は書き換えず、旧版のSessionには新Graphの写真地点を追加できません。旧版の保存経路を新Graphの座標へ読み替えず、版不一致区間は従来どおり解決不能として本人閲覧・削除を維持します。このbundle更新自体に追加のDB migrationはありません。
+
+この取り込みは描画bundleの整合が対象です。Frontend Graphの`selectable`属性とBackend写真受付の`role=="checkpoint"`判定は別の契約であり、今回その判定は変更していません。新Graphには`selectable:true`のwaypointも含まれますが、現行の写真APIはそれをチェックポイントとして受理しません。`/log`の地点送信を接続する前に、この差を別途解消してください。
 
 アンカーはGraphのローカルENU（東=x、北=z）へ変換し、GPS精度円内の通行可能な`gpsSnap=true`両端を持つ辺だけへ投影します。`passable=false`、`restricted=true`、`closed=true`、時刻付き`closures`内、および`openingHours`（曜日0=日曜〜6=土曜、`open`/`close`は`HH:MM`・日本時間）の時間外辺は候補・探索の両方から除外します。現行Graphは`passable`のみを収録し、現場の一時通行止め・利用時間の運用入力は未提供です。運用データが正式に渡されるまでは実際の臨時閉鎖や時間外利用を防げないため公開運用に使用しないでください。階や屋内はGPSで確定できないため`gpsSnap=false`の辺へ吸着しません。
 
