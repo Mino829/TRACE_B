@@ -159,7 +159,7 @@ func (s *Store) CreatePhoto(ctx context.Context, p Photo, now time.Time) (Photo,
 			if m.CampusGraphVersion != tx.routes.CampusGraphVersion {
 				return ErrConflict
 			}
-			if _, ok := tx.routes.CheckpointNode(p.CheckpointID); !ok {
+			if _, ok := tx.routes.PhotoCheckpointNode(p.CheckpointID); !ok {
 				return ErrInvalidCheckpoint
 			}
 			p.CampusGraphVersion = tx.routes.CampusGraphVersion

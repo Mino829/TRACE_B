@@ -66,7 +66,7 @@ func TestDevicePhotoMetadataAuthValidationIdempotencyAndRoutes(t *testing.T) {
 			t.Fatalf("forbidden metadata %s: %+v", field, result)
 		}
 	}
-	for _, checkpoint := range []string{"", "not-a-checkpoint"} {
+	for _, checkpoint := range []string{"", "not-a-checkpoint", "mid"} {
 		if result := send("POST", base+"/photos", devicePhotoBody("bad", checkpoint, captured), ownerHeaders); result.status != 400 || !strings.Contains(result.body, `"INVALID_CHECKPOINT"`) {
 			t.Fatalf("invalid checkpoint %s: %+v", checkpoint, result)
 		}

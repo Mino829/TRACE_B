@@ -25,6 +25,8 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 
 `TRACE_PHOTO_METADATA_ENABLED=false`が既定です。有効化すると**新規**MemorySessionは`photo_mode=device`になり、`GET/POST /v2/memory-sessions/{memorySessionId}/photos`、`DELETE /v2/.../photos/{photoMomentId}`、`GET /v2/.../memory`を本人Bearerで使用します。POSTは`Idempotency-Key`と`clientPhotoId`、固定Graphの`checkpointId`、`capturedAt`だけを受け付けます。画像、ハッシュ、サイズ、位置、URLなどの追加フィールドを拒否し、画像バイトをDB・GCSへ保存しません。本人画面は端末IndexedDBの画像を`clientPhotoId`で照合します。Backendは端末内画像の保存・削除や消失を検証・復旧できません。
 
+新規写真の`checkpointId`は固定Graphに存在し、`selectable:true`であることを必須にします。`role`に依存しないため、選択可能なwaypointも登録できます。未選択・未知ID・`selectable:false`・属性欠落・nullは400 `INVALID_CHECKPOINT`です。SessionのGraph版が現行版と違う場合、新規追加は従来どおり409 `STATE_CONFLICT`で拒否します。Frontendのpayloadへ座標・role・selectable・Graph版を追加する必要はありません。
+
 同じID/同じ内容の再送は同じ記録、別内容は409です。12枚を上限とし、撮影時刻順のチェックポイント経路を作ります。削除はメタデータ・地点・経路を同一トランザクションで消し、削除済み`clientPhotoId`だけのfenceをMemorySessionの`deleteAfter`まで維持するためオフライン再送は404です。0/1枚の到着も維持します。従来のセッションは`photo_mode=legacy`のまま、GCS設定を保持したときだけ旧`/v1`の写真一覧・本人memory画像閲覧・個別削除を期限まで提供します。新モード中は旧`/v1`の登録・upload-url・completeを503で拒否します。
 
 新モードと`TRACE_PHOTO_ENABLED=true`（旧アップロード）は併用できません。旧画像・署名付きURLのfenceが残る間は、旧アップロードを無効にしても`TRACE_PHOTO_BUCKET`と`TRACE_PHOTO_SIGNER_EMAIL`をAPI・清掃ジョブ双方に残します。画像が存在するのにGCSへアクセスできない状態では起動を拒否します。`TRACE_REGISTRATION_OPEN=true`には新モードと、**既定の草案とは別に**設定した同意版・本文が必要です。設定値が存在するだけでは大学・運営の承認を証明できません。設計PR #25の確定、同意・保持期間の承認、Frontend/Worker・展示の統合試験までは受付を閉じたままにします。
@@ -188,7 +190,7 @@ WebPはVP8Lの過大割り当てを修正した公式`x/image v0.47.0`を使い�
 
 CampusGraphは`internal/route/campus_graph.json`へ固定同梱します。正本は[TRACE_F #61のコミット`93ad81fc417d7cb327ba54749ae13cc86541a2b2`](https://github.com/Mino829/TRACE_F/blob/93ad81fc417d7cb327ba54749ae13cc86541a2b2/models/trace/campus_graph.json)で、JSON全体を取り込み、版名だけを書き換えていません。`coordinateVersion`=`toyosu-2026-08-28.1`、`campusGraphVersion`=`toyosu-graph-2026-10-26.1.draft`、`threeDMapVersion`=`toyosu-3dmap-2026-10-26`を描画機・設定例と一致させています。三つが設定と一致しない場合、描画/写真メタデータ/写真ストレージを用いるAPI・清掃ジョブの起動を拒否します。承認済みの地図・描画機・Backendを同じbundleで配布し、受付停止と旧revision停止の移行窓で切り替えてください。既存MemorySessionや写真の保存Graph版は書き換えず、旧版のSessionには新Graphの写真地点を追加できません。旧版の保存経路を新Graphの座標へ読み替えず、版不一致区間は従来どおり解決不能として本人閲覧・削除を維持します。このbundle更新自体に追加のDB migrationはありません。
 
-この取り込みは描画bundleの整合が対象です。Frontend Graphの`selectable`属性とBackend写真受付の`role=="checkpoint"`判定は別の契約であり、今回その判定は変更していません。新Graphには`selectable:true`のwaypointも含まれますが、現行の写真APIはそれをチェックポイントとして受理しません。`/log`の地点送信を接続する前に、この差を別途解消してください。
+写真の新規受付には`PhotoCheckpointNode`で`selectable:true`を要求し、保存済み写真・経路・到着地点の解決には`NodeIndex`を使います。選択不可の内部ノードも経路途中や署名済み到着地点として使用でき、写真として新規登録できることは意味しません。以前の`role=="checkpoint"`判定で既に受理された写真は、保存Graph版が一致する限り本人の閲覧・同内容の再送・削除と経路/展示への投影を維持します。その地点に別の写真を追加する要求は新しい`selectable`判定で拒否し、削除済みIDの再送は404のまま復活させません。旧`CheckpointNode`は残さず、写真受付と内部ノード解決を分離しています。
 
 アンカーはGraphのローカルENU（東=x、北=z）へ変換し、GPS精度円内の通行可能な`gpsSnap=true`両端を持つ辺だけへ投影します。`passable=false`、`restricted=true`、`closed=true`、時刻付き`closures`内、および`openingHours`（曜日0=日曜〜6=土曜、`open`/`close`は`HH:MM`・日本時間）の時間外辺は候補・探索の両方から除外します。現行Graphは`passable`のみを収録し、現場の一時通行止め・利用時間の運用入力は未提供です。運用データが正式に渡されるまでは実際の臨時閉鎖や時間外利用を防げないため公開運用に使用しないでください。階や屋内はGPSで確定できないため`gpsSnap=false`の辺へ吸着しません。
 
