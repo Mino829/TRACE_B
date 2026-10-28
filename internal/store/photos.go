@@ -159,7 +159,7 @@ func (s *Store) CreatePhoto(ctx context.Context, p Photo, now time.Time) (Photo,
 			if m.CampusGraphVersion != tx.routes.CampusGraphVersion {
 				return ErrConflict
 			}
-			if _, ok := tx.routes.CheckpointNode(p.CheckpointID); !ok {
+			if _, ok := tx.routes.PhotoCheckpointNode(p.CheckpointID); !ok {
 				return ErrInvalidCheckpoint
 			}
 			p.CampusGraphVersion = tx.routes.CampusGraphVersion
@@ -323,7 +323,10 @@ func (s *Store) QueuePhotoDeletion(ctx context.Context, memoryID, photoID, targe
 }
 
 func (s *Store) QueueMemoryPhotoDeletion(ctx context.Context, memoryID string) error {
-	return s.Transaction(ctx, memoryID, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, memoryID); err != nil {
+			return err
+		}
 		if err := tx.deleteSession(ctx, "UPDATE memory_sessions SET deleting=TRUE WHERE id=$1", memoryID); err != nil {
 			return err
 		}

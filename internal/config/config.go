@@ -3,8 +3,11 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
+	"net/mail"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +28,9 @@ type Config struct {
 	ArrivalVenue               string
 	ArrivalCheckpointID        string
 	DisplayEnabled             bool
-	DisplayIssuerKey           string
+	DisplayGoogleClientID      string
+	DisplayOperatorEmails      []string
+	DisplayAllowedOrigins      []string
 	DisplayTokenKey            string
 	PhotoBucket                string
 	PhotoSignerEmail           string
@@ -133,14 +138,22 @@ func FromEnv() (Config, error) {
 	if cfg.DisplayEnabled, err = boolEnv("TRACE_DISPLAY_ENABLED", false); err != nil {
 		return Config{}, err
 	}
-	cfg.DisplayIssuerKey = os.Getenv("TRACE_DISPLAY_ISSUER_KEY")
+	cfg.DisplayGoogleClientID = os.Getenv("TRACE_DISPLAY_GOOGLE_CLIENT_ID")
+	if raw := os.Getenv("TRACE_DISPLAY_OPERATOR_EMAILS"); raw != "" {
+		for _, email := range strings.Split(raw, ",") {
+			cfg.DisplayOperatorEmails = append(cfg.DisplayOperatorEmails, strings.ToLower(strings.TrimSpace(email)))
+		}
+	}
+	if raw := os.Getenv("TRACE_DISPLAY_ALLOWED_ORIGINS"); raw != "" {
+		for _, origin := range strings.Split(raw, ",") {
+			cfg.DisplayAllowedOrigins = append(cfg.DisplayAllowedOrigins, strings.TrimSpace(origin))
+		}
+	}
 	cfg.DisplayTokenKey = os.Getenv("TRACE_DISPLAY_TOKEN_KEY")
-	if cfg.DisplayEnabled && (len(cfg.DisplayIssuerKey) < 32 || len(cfg.DisplayTokenKey) < 32 ||
-		cfg.DisplayIssuerKey == cfg.DisplayTokenKey || cfg.DisplayIssuerKey == cfg.ArrivalIssuerKey ||
-		cfg.DisplayIssuerKey == cfg.ArrivalProofKey || cfg.DisplayTokenKey == cfg.ArrivalIssuerKey ||
-		cfg.DisplayTokenKey == cfg.ArrivalProofKey || cfg.DisplayIssuerKey == cfg.EdgeSharedSecret ||
-		cfg.DisplayTokenKey == cfg.EdgeSharedSecret) {
-		return Config{}, fmt.Errorf("display requires independent 32-byte issuer and token signing keys")
+	if cfg.DisplayEnabled {
+		if err := cfg.ValidateDisplay(); err != nil {
+			return Config{}, err
+		}
 	}
 	if cfg.PhotoEnabled, err = boolEnv("TRACE_PHOTO_ENABLED", false); err != nil {
 		return Config{}, err
@@ -223,6 +236,67 @@ func FromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("session and retention durations must be positive")
 	}
 	return cfg, nil
+}
+
+var displayClientIDPattern = regexp.MustCompile(`^[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$`)
+var displayEmailLocalPattern = regexp.MustCompile("^[a-z0-9.!#$%&'+/=?^_`{|}~-]+$")
+var displayHostLabelPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$`)
+
+// ValidateDisplay checks the settings required to enable browser display access.
+func (cfg Config) ValidateDisplay() error {
+	if len(cfg.DisplayTokenKey) < 32 || cfg.DisplayTokenKey == cfg.ArrivalIssuerKey ||
+		cfg.DisplayTokenKey == cfg.ArrivalProofKey || cfg.DisplayTokenKey == cfg.EdgeSharedSecret {
+		return fmt.Errorf("display requires an independent 32-byte token signing key")
+	}
+	if !displayClientIDPattern.MatchString(cfg.DisplayGoogleClientID) {
+		return fmt.Errorf("display requires a Google OAuth Web client ID")
+	}
+	if len(cfg.DisplayOperatorEmails) == 0 || len(cfg.DisplayAllowedOrigins) == 0 {
+		return fmt.Errorf("display requires operator emails and allowed origins")
+	}
+	for _, email := range cfg.DisplayOperatorEmails {
+		address, err := mail.ParseAddress(email)
+		local, domain, ok := strings.Cut(email, "@")
+		if err != nil || address.Name != "" || address.Address != email || !ok ||
+			email != strings.ToLower(strings.TrimSpace(email)) || len(email) > 254 || len(local) > 64 ||
+			!displayEmailLocalPattern.MatchString(local) || strings.HasPrefix(local, ".") ||
+			strings.HasSuffix(local, ".") || strings.Contains(local, "..") ||
+			!strings.Contains(domain, ".") || !validDisplayHost(domain) {
+			return fmt.Errorf("display operator emails must be exact valid email addresses without wildcards")
+		}
+	}
+	for _, origin := range cfg.DisplayAllowedOrigins {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" ||
+			u.ForceQuery || u.Fragment != "" || strings.ContainsAny(origin, "*\\ \t\r\n?#") ||
+			u.Opaque != "" || strings.HasSuffix(u.Host, ":") ||
+			!validDisplayHost(u.Hostname()) ||
+			(u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1"))) {
+			return fmt.Errorf("display origins must be exact HTTPS origins or localhost/127.0.0.1 HTTP origins")
+		}
+		if port := u.Port(); port != "" {
+			value, err := strconv.Atoi(port)
+			if err != nil || value < 1 || value > 65535 {
+				return fmt.Errorf("display origin port must be between 1 and 65535")
+			}
+		}
+	}
+	return nil
+}
+
+func validDisplayHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) > 63 || !displayHostLabelPattern.MatchString(label) {
+			return false
+		}
+	}
+	return true
 }
 
 func Default() Config {

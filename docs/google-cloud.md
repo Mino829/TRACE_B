@@ -53,6 +53,12 @@ psqlの`\password trace_owner`と`\password trace_app`でパスワードを対�
 マイグレーションは所有者ユーザー、API・清掃ジョブはアプリユーザーで実行します。初回と以降のschema migration後には`trace_owner`として`deploy/gcp/runtime-grants.sql`を実行してください。新しいruntimeテーブルを追加した場合は、このファイルへ必要なテーブル権限を個別に追記し、`trace_app`でアクセスを確認してから新アプリを配信します。
 アプリユーザーにDDL権限がなくても、API・清掃・readinessは動作します。readinessはDBへの接続だけでなく、埋め込みmigrationと適用済み連番の一致も確認します（個別テーブルの権限試験は別途必要）。
 
+`014_registration_control.sql`は運営による新規参加停止を永続化します。環境設定で受付停止→旧API/清掃revision停止→バックアップ→明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順に更新し、実行ユーザーで公開設定と非公開`GET /v1/operator/status`を確認してください。`POST /v1/operator/registration/close`の署名・応答・監査は[Backend README](../README.md#新規参加受付の停止)を参照してください。停止は再起動で解除されず、既存参加者の写真・到着・削除や期限清掃は維持します。個人別運営権限・再開API・本番運営入口の承認はこの追加に含みません。
+
+`015_notification_control.sql`は運営による全撮影通知停止を永続化します。参加受付とPushを環境設定で無効化し、旧API/清掃revision停止→バックアップ→明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順に更新します。実行ユーザーでready・公開設定・非公開statusを確認してください。停止APIの認証・監査・送信中要求との順序付けは[全撮影通知の停止](../README.md#全撮影通知の停止)を参照してください。停止は全購読のendpoint・鍵・予定を削除し、再起動後も購読・送信を禁止します。既にproviderが受理した通知は取り消せません。通知再開APIと個人別運営権限は対象外です。
+
+`016_display_fallback.sql`は運営の通常/切替待ち/fallbackモードと30秒の固定期限を永続化します。受付・描画を無効化し、旧API/清掃revision停止→バックアップ→未適用の013〜016を番号順に明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順で更新してください。schema012からの更新では013の待機/再生整理も[READMEのFIFO移行手順](../README.md#投影qrによる到着既定無効)に従います。`trace_app`には制御行のSELECT/UPDATEだけを付与し、readyと非公開statusを確認します。対応するFrontendの合成表示とsnapshot全置換を結合し、再生中30秒期限・待機保持・明示復帰・再起動で解除されないことをstagingで確認するまで描画を公開しません。認証・API・イベントは[運営によるfallback切替と復帰](../README.md#運営によるfallback切替と復帰)を参照してください。
+
 ## 4. 設定とビルド
 
 リポジトリルートで次のテンプレートをコピーして値を埋めます。
@@ -111,7 +117,17 @@ bash deploy/gcp/deploy.sh serve
 
 `/health/ready`を起動確認、`/health/live`を死活確認に使用します。DB障害だけでAPIを再起動し続けないよう、livenessはDBへ問い合わせません。
 
-任意の描画WSは`TRACE_DISPLAY_ENABLED=false`のまま配備し、承認後に`007_display.sql`のmigration、`runtime-grants.sql`、安全なrenderer用の外向き専用HTTPS/WSS入口を用意します。鍵は参加者・到着運営・Edgeと独立した32バイト以上のSecret Manager版で、`settings.env`の`GCP_DISPLAY_ISSUER_SECRET`/`GCP_DISPLAY_TOKEN_SECRET`に**版名だけ**を指定し、APIにだけ注入します。実行サービスアカウントのAccessor権限を対象Secretに限定してください。`runtime.env.yaml`の`TRACE_DISPLAY_ENABLED=true`で有効化します。参加者Workerからの描画/運営経路転送は拒否し、署名付き資格の発行は運営の別入口から行います。
+任意の描画WSは`TRACE_DISPLAY_ENABLED=false`のまま配備し、承認後に最新migration、`runtime-grants.sql`、ブラウザから直接到達できる専用HTTPS/WSS入口を用意します。Google OAuth WebクライアントID、許可するGmail/Workspaceメール、展示ページOriginを`TRACE_DISPLAY_GOOGLE_CLIENT_ID`/`TRACE_DISPLAY_OPERATOR_EMAILS`/`TRACE_DISPLAY_ALLOWED_ORIGINS`へ設定します。Google OAuthの許可JavaScript Originにも同じ展示Originを登録してください。到着・Edgeとは独立した32バイト以上の署名鍵をSecret Managerに置き、`settings.env`の`GCP_DISPLAY_TOKEN_SECRET`に数値版参照だけを書いてAPIへ注入します。旧描画issuer鍵は不要です。実行サービスアカウントのAccessor権限は対象Secretだけに限定します。発行はGoogle IDトークン、WSは最初の`renderer.authenticate`で描画資格と版を検証します。仕様・失効の制約は[README](../README.md#描画websocket既定無効)を参照してください。該当2経路だけEdge secretを免除しますが、IAM保護を迂回するものではありません。実Googleログイン・許可外資格拒否・Frontend再接続・承認済み公開経路の検証後にのみ有効化を検討し、参加者Workerへ描画/運営経路や鍵を渡さないでください。
+
+### PR #37の展示ブラウザ接続設定
+
+以下は[PR #37のコメント](https://github.com/Mino829/TRACE_B/pull/37#issuecomment-6461440141)への配置手順です。依頼者からWebクライアントIDと運営メールの指定を受け、`.env.example`と`runtime.env.yaml.example`へ反映済みです。描画フラグは無効を維持しており、staging適用・Frontendビルドへの反映・実Googleログインを完了済みとは扱いません。
+
+1. 対象プロジェクトの[Google Auth Platform > Clients](https://console.cloud.google.com/auth/clients?project=trace-staging-507216)で、種類「ウェブアプリケーション」のOAuthクライアントを作成または既存クライアントを確認します。承認済みJavaScript生成元には`https://trace-log.async5855.workers.dev`を登録します。画面のパス`/display`は付けません。OAuth同意画面・対象ユーザー・必要なテストユーザーも運営方針に沿って設定します。
+2. [runtime.env.yaml.example](../deploy/gcp/runtime.env.yaml.example)の`TRACE_DISPLAY_GOOGLE_CLIENT_ID`をFrontend #49の`NEXT_PUBLIC_GOOGLE_CLIENT_ID`へ同じ値で渡し、`NEXT_PUBLIC_DISPLAY_API_URL`も設定してFrontendをビルドし直します。どちらかが未設定ならFrontendはテスト再生のままです。Google Identity ServicesのIDトークンcallback方式であり、クライアントsecretをBackendやFrontendへ渡す処理はありません。
+3. 明示的に許可したGmail/Workspaceメールだけを`TRACE_DISPLAY_OPERATOR_EMAILS`へカンマ区切りで設定します。GitHub名や例示メールから推定しません。`TRACE_DISPLAY_ALLOWED_ORIGINS`には手順1と同じOriginを設定します。現在の設定例と異なるURLへ展示を配置する場合はGoogleとBackendを同時に更新します。
+4. [runtime.env.yaml.example](../deploy/gcp/runtime.env.yaml.example)の3つの空間版をそのまま使用し、Backendの固定Graph・Frontend #61と同じbundleにします。到着・写真・再生中のデータを別Graphへ読み替えず、受付を閉じた移行窓で旧revisionを停止してから切り替えます。
+5. `TRACE_DISPLAY_ENABLED=false`のまま必要な設定・独立した署名secret・承認済みブラウザ到達経路を用意し、実行ユーザーでreadyと公開設定の`spatial`を確認します。承認後に描画を有効化し、実Googleログイン→描画token発行→初回snapshot→主lease→到着→started/completedのackを確認します。旧版の4409、許可外アカウントの401、許可外Originの403も確認します。実Googleログインと長時間再接続が未確認なら公開完了にしません。
 
 `deploy.sh serve`は描画有効/無効にかかわらずCloud Runリクエスト上限を3600秒へ設定します。WS本体は50分で終了、10秒ping/pong、30秒無応答切断。HTTP 10秒middleware期限はWS upgradeへ適用しません。Cloud Run timeout/instance replacement後はrendererが短期資格を再取得し、指数バックオフで新snapshotへ再接続します。上限の長い接続は請求とconcurrency枠を消費するため、現場60人規模の実負荷で検証してください。WebSocket経路をCloudflare Workerの参加者用proxyへ流さず、HTTPS upgrade透過・権限・秘密ヘッダー非記録を運営経路で確認してください。変更しても既存stagingへのデプロイを意味しません。
 
@@ -143,6 +159,8 @@ gcloud run services proxy trace-backend --project="$GCP_PROJECT_ID" \
 別ターミナルから`http://localhost:8085/health/ready`を確認します。参加者用トークンはAPIのAuthorizationヘッダーで使い、Google IAM認証と混同しないでください。両方を直送する場合、Cloud Run用IDトークンは`X-Serverless-Authorization`、参加者トークンは`Authorization`へ分離します。
 
 受付を開いて試験するときは、設計Issue #23/#9のGPSなし参加と同意文の承認後、管理者が設定ファイルの`TRACE_REGISTRATION_OPEN`をtrueへ変更して再デプロイします。Backend #25の写真地点契約とFrontendの新規受付が未整合の間は受付を開きません。一般参加者へ公開する前に以下を完了してください。
+
+写真地点の`selectable`対応には追加migrationやGraph版の書換えはありません。同じ固定bundleで新API/清掃を配布し、旧revisionとの並走を避けます。承認済みstagingでは、`selectable:true`のwaypointの登録、選択不可checkpointの400、旧Graph版Sessionへの追加409、非選択の到着地点までの経路、到着後に届いた撮影済みメタデータと削除による描画差分を確認してください。旧判定で受理済みの写真は前倒し削除せず、本人操作と既存の期限清掃を維持します。このローカル実装・検証だけで実データ受付や一般公開の承認とは扱いません。
 
 - [実装済みレート制限](../README.md#公開apiのレート制限)の共有IP・全体負荷検証と429監視。CORSだけでは悪用防止にならない。
 - 正しい参加画面URL、旧版と異なる承認済みのMemory同意版・文面、保存期間と問い合わせ先。

@@ -74,7 +74,7 @@ func (s *Store) CreatePhotoMoment(ctx context.Context, p PhotoMoment, now time.T
 		if tx.routes == nil || m.CampusGraphVersion != tx.routes.CampusGraphVersion {
 			return ErrConflict
 		}
-		if _, ok := tx.routes.CheckpointNode(p.CheckpointID); !ok {
+		if _, ok := tx.routes.PhotoCheckpointNode(p.CheckpointID); !ok {
 			return ErrInvalidCheckpoint
 		}
 		var count int
@@ -105,6 +105,9 @@ func (s *Store) CreatePhotoMoment(ctx context.Context, p PhotoMoment, now time.T
 			return err
 		}
 		if err := tx.reconcileMomentRoutes(ctx, p.MemorySessionID); err != nil {
+			return err
+		}
+		if err := tx.appendDisplayPhotoChange(ctx, p.MemorySessionID, "photo.moment.created", now); err != nil {
 			return err
 		}
 		result, created = p, true
@@ -160,7 +163,10 @@ func (s *Store) DeletePhotoMoment(ctx context.Context, memoryID, photoID string,
 		if _, err := tx.q.ExecContext(ctx, `DELETE FROM photo_moments WHERE memory_session_id=$1 AND id=$2`, memoryID, photoID); err != nil {
 			return err
 		}
-		return tx.reconcileMomentRoutes(ctx, memoryID)
+		if err := tx.reconcileMomentRoutes(ctx, memoryID); err != nil {
+			return err
+		}
+		return tx.appendDisplayPhotoChange(ctx, memoryID, "photo.moment.deleted", now)
 	})
 }
 
@@ -205,10 +211,10 @@ func (s *Store) reconcileMomentRoutes(ctx context.Context, memoryID string) erro
 		if from.CampusGraphVersion != s.routes.CampusGraphVersion {
 			return nil
 		}
-		if _, ok := s.routes.CheckpointNode(from.CheckpointID); !ok {
+		if _, ok := s.routes.NodeIndex(from.CheckpointID); !ok {
 			return nil
 		}
-		if _, ok := s.routes.CheckpointNode(to.Checkpoint); !ok {
+		if _, ok := s.routes.NodeIndex(to.Checkpoint); !ok {
 			return nil
 		}
 		result := s.routes.Connect(&route.Endpoint{Checkpoint: from.CheckpointID, CapturedAt: from.CapturedAt}, &to)

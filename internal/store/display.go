@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"sort"
 	"time"
 )
 
@@ -17,29 +16,21 @@ type DisplayEvent struct {
 	OccurredAt time.Time       `json:"occurredAt"`
 	Data       json.RawMessage `json:"data"`
 }
-type DisplayParticipant struct {
-	LivePresenceID string       `json:"livePresenceId"`
-	X              float64      `json:"x"`
-	Z              float64      `json:"z"`
-	AccuracyM      float64      `json:"accuracyM"`
-	DisplayAlias   DisplayAlias `json:"displayAlias"`
-	PresencePhase  string       `json:"presencePhase"`
-	LastUpdatedAt  time.Time    `json:"lastUpdatedAt"`
-	ExpiresAt      time.Time    `json:"expiresAt"`
-}
-type DisplayAlias struct {
-	Color  string `json:"color"`
-	Symbol string `json:"symbol"`
-}
 type DisplayState struct {
-	Cursor       int64                `json:"cursor"`
-	Participants []DisplayParticipant `json:"participants"`
-	Arrivals     []DisplayArrival     `json:"arrivals"`
+	Cursor   int64            `json:"cursor"`
+	Arrivals []DisplayArrival `json:"arrivals"`
+	Fallback FallbackState    `json:"fallback"`
 }
 type DisplayArrival struct {
-	ArrivalID    string       `json:"arrivalId"`
-	ReplayStatus string       `json:"replayStatus"`
-	DisplayAlias DisplayAlias `json:"displayAlias"`
+	ArrivalID             string                   `json:"arrivalId"`
+	ReplayStatus          string                   `json:"replayStatus"`
+	PathNodeIDs           []string                 `json:"pathNodeIds"`
+	PhotoCheckpoints      []DisplayPhotoCheckpoint `json:"photoCheckpoints"`
+	ReplayDurationSeconds int                      `json:"replayDurationSeconds"`
+}
+type DisplayPhotoCheckpoint struct {
+	CheckpointID string    `json:"checkpointId"`
+	CapturedAt   time.Time `json:"capturedAt"`
 }
 
 // AppendDisplayEvent MUST run inside the mutation's transaction for atomic fan-out.
@@ -66,43 +57,140 @@ func (s *Store) AppendDisplayEvent(ctx context.Context, kind string, data any, n
 	return id, err
 }
 
-// Durable arrival state and its cursor share a transaction cut. Positions are
-// volatile and are copied separately; a following poll catches any concurrent change.
+// Durable arrivals and their cursor share a transaction cut.
 func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayState, error) {
-	state := DisplayState{Participants: []DisplayParticipant{}, Arrivals: []DisplayArrival{}}
+	state := DisplayState{Arrivals: []DisplayArrival{}}
 	err := s.Transaction(ctx, "display:snapshot", func(tx *Store) error {
 		if err := tx.q.QueryRowContext(ctx, `SELECT last_id FROM display_cursor WHERE singleton=TRUE FOR UPDATE`).Scan(&state.Cursor); err != nil {
 			return err
 		}
-		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,e.display_color,e.display_symbol FROM arrival_events a
- JOIN memory_sessions m ON m.id=a.memory_session_id JOIN experiences e ON e.memory_session_id=m.id
+		var err error
+		state.Fallback, err = tx.ReadFallback(ctx)
+		if err != nil {
+			return err
+		}
+		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,
+ a.memory_session_id,m.photo_mode,COALESCE(m.campus_graph_version,'') FROM arrival_events a
+ JOIN memory_sessions m ON m.id=a.memory_session_id
  WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$1 ORDER BY a.arrived_at,a.id`, now)
 		if err != nil {
 			return err
 		}
+		type arrivalRow struct {
+			arrival                      DisplayArrival
+			memoryID, photoMode, version string
+		}
+		var arrivals []arrivalRow
 		for rows.Next() {
-			var a DisplayArrival
-			err = rows.Scan(&a.ArrivalID, &a.ReplayStatus, &a.DisplayAlias.Color, &a.DisplayAlias.Symbol)
+			var a arrivalRow
+			err = rows.Scan(&a.arrival.ArrivalID, &a.arrival.ReplayStatus, &a.memoryID, &a.photoMode, &a.version)
 			if err != nil {
 				break
 			}
-			state.Arrivals = append(state.Arrivals, a)
+			arrivals = append(arrivals, a)
 		}
 		if err == nil {
 			err = rows.Err()
 		}
 		rows.Close()
-		return err
-	})
-	if err == nil {
-		for _, p := range s.DisplayPositions(now) {
-			state.Participants = append(state.Participants, p)
+		if err != nil {
+			return err
 		}
-		sort.Slice(state.Participants, func(i, j int) bool {
-			return state.Participants[i].LivePresenceID < state.Participants[j].LivePresenceID
-		})
-	}
+		for _, a := range arrivals {
+			projected, err := tx.projectDisplayArrival(ctx, a.arrival, a.memoryID, a.photoMode, a.version)
+			if err != nil {
+				return err
+			}
+			state.Arrivals = append(state.Arrivals, projected)
+		}
+		return nil
+	})
 	return state, err
+}
+
+// The renderer receives only ordered checkpoint/time pairs and graph node IDs.
+// A missing or retired segment never becomes a partial or reinterpreted route.
+func (s *Store) projectDisplayArrival(ctx context.Context, a DisplayArrival, memoryID, photoMode, graphVersion string) (DisplayArrival, error) {
+	a.PathNodeIDs = []string{}
+	a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
+	a.ReplayDurationSeconds = 15
+	if photoMode != PhotoModeDevice || s.routes == nil || graphVersion != s.routes.CampusGraphVersion {
+		return a, nil
+	}
+	moments, err := s.PhotoMoments(ctx, memoryID)
+	if err != nil {
+		return a, err
+	}
+	for _, p := range moments {
+		if p.CampusGraphVersion != graphVersion {
+			a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
+			return a, nil
+		}
+		if _, ok := s.routes.NodeIndex(p.CheckpointID); !ok {
+			a.PhotoCheckpoints = []DisplayPhotoCheckpoint{}
+			return a, nil
+		}
+		a.PhotoCheckpoints = append(a.PhotoCheckpoints, DisplayPhotoCheckpoint{CheckpointID: p.CheckpointID, CapturedAt: p.CapturedAt})
+	}
+	if len(moments) == 0 {
+		return a, nil
+	}
+	segments, err := s.MomentRouteSegments(ctx, memoryID)
+	if err != nil {
+		return a, err
+	}
+	// One segment per photo: adjacent photos, then the final photo to arrival.
+	if len(segments) != len(moments) {
+		return a, nil
+	}
+	for i, segment := range segments {
+		if segment.FromPhotoMomentID != moments[i].ID ||
+			segment.CoordinateVersion != s.routes.CoordinateVersion ||
+			segment.CampusGraphVersion != graphVersion ||
+			segment.ThreeDMapVersion != s.routes.ThreeDMapVersion ||
+			len(segment.PathNodeIDs) == 0 ||
+			(i < len(moments)-1 && (segment.ToPhotoMomentID == nil || *segment.ToPhotoMomentID != moments[i+1].ID)) ||
+			(i == len(moments)-1 && segment.ToPhotoMomentID != nil) {
+			a.PathNodeIDs = []string{}
+			return a, nil
+		}
+		if i > 0 {
+			if a.PathNodeIDs[len(a.PathNodeIDs)-1] != segment.PathNodeIDs[0] {
+				a.PathNodeIDs = []string{}
+				return a, nil
+			}
+			a.PathNodeIDs = append(a.PathNodeIDs, segment.PathNodeIDs[1:]...)
+		} else {
+			a.PathNodeIDs = append(a.PathNodeIDs, segment.PathNodeIDs...)
+		}
+	}
+	return a, nil
+}
+
+// Photo mutations after arrival replace the whole projection: point/time pairs
+// alone cannot identify one deleted photo when capture timestamps coincide.
+func (s *Store) appendDisplayPhotoChange(ctx context.Context, memoryID, kind string, now time.Time) error {
+	if !s.displayEnabled {
+		return nil
+	}
+	var a DisplayArrival
+	var photoMode, graphVersion string
+	err := s.q.QueryRowContext(ctx, `SELECT a.id,a.replay_status,m.photo_mode,COALESCE(m.campus_graph_version,'')
+ FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
+ WHERE a.memory_session_id=$1 AND a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$2`,
+		memoryID, now).Scan(&a.ArrivalID, &a.ReplayStatus, &photoMode, &graphVersion)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	a, err = s.projectDisplayArrival(ctx, a, memoryID, photoMode, graphVersion)
+	if err != nil {
+		return err
+	}
+	_, err = s.AppendDisplayEvent(ctx, kind, a, now)
+	return err
 }
 
 var ErrDisplayResync = errors.New("display event cursor expired; resync required")
@@ -142,33 +230,26 @@ func (s *Store) DisplayEvents(ctx context.Context, cursor int64, limit int) ([]D
 	return events, nil
 }
 
-// DisplayPositions returns only the current quantized, display-scoped projection.
-// No coordinate or position event is written to PostgreSQL.
-func (s *Store) DisplayPositions(now time.Time) map[string]DisplayParticipant {
-	s.positions.mu.RLock()
-	defer s.positions.mu.RUnlock()
-	points := make(map[string]DisplayParticipant, len(s.positions.projected))
-	for _, p := range s.positions.projected {
-		if now.Before(p.ExpiresAt) {
-			points[p.LivePresenceID] = p
-		}
-	}
-	return points
-}
-
-// Arrival and lease state are durable. Position expiry is observed by WS polls
-// and a fresh snapshot never exposes an expired cached value.
+// Arrival and lease state are durable; a resync snapshot includes current replay state.
 func (s *Store) RefreshDisplay(ctx context.Context, now time.Time) error {
-	if err := s.Transaction(ctx, "display:lease", func(tx *Store) error { return tx.expireDisplayLease(ctx, now) }); err != nil {
-		return err
-	}
-	return s.ExpireArrivals(ctx, now)
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
+		if err := tx.expireDisplayLease(ctx, now); err != nil {
+			return err
+		}
+		return tx.removeExpiredMemoryDisplay(ctx, now)
+	})
 }
 
 // Lease is fenced by an unpredictable ID and holder connection ID, in SQL.
 func (s *Store) AcquireDisplayLease(ctx context.Context, holder, lease string, now time.Time) (bool, error) {
 	acquired := false
 	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
 		if err := tx.expireDisplayLease(ctx, now); err != nil {
 			return err
 		}
@@ -191,6 +272,9 @@ func (s *Store) RenewDisplayLease(ctx context.Context, holder, lease string, now
 }
 func (s *Store) ReleaseDisplayLease(ctx context.Context, holder, lease string, now time.Time) error {
 	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
 		var old string
 		err := tx.q.QueryRowContext(ctx, `SELECT lease_id FROM display_primary_lease WHERE singleton=TRUE AND holder_id=$1 AND lease_id=$2 FOR UPDATE`, holder, lease).Scan(&old)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -243,17 +327,27 @@ func (s *Store) clearDisplayLease(ctx context.Context, lease string, now time.Ti
 		}
 	}
 	_, err = s.q.ExecContext(ctx, `UPDATE display_primary_lease SET holder_id=NULL,lease_id=NULL,expires_at=NULL WHERE singleton=TRUE`)
+	if err != nil {
+		return err
+	}
+	_, err = s.advanceFallback(ctx, now)
 	return err
 }
 
 func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arrivalID, action string, now time.Time) (string, error) {
 	var status string
+	var rejected bool
 	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		fallback, err := tx.advanceFallback(ctx, now)
+		if err != nil {
+			return err
+		}
 		var savedLease, savedAction, savedArrival string
-		err := tx.q.QueryRowContext(ctx, `SELECT lease_id,kind,arrival_id,result FROM display_renderer_receipts WHERE event_id=$1`, eventID).Scan(&savedLease, &savedAction, &savedArrival, &status)
+		err = tx.q.QueryRowContext(ctx, `SELECT lease_id,kind,arrival_id,result FROM display_renderer_receipts WHERE event_id=$1`, eventID).Scan(&savedLease, &savedAction, &savedArrival, &status)
 		if err == nil {
 			if savedLease != lease || savedAction != action || savedArrival != arrivalID {
-				return ErrConflict
+				rejected = true
+				return nil
 			}
 			return nil
 		}
@@ -263,7 +357,8 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		var current string
 		err = tx.q.QueryRowContext(ctx, `SELECT lease_id FROM display_primary_lease WHERE singleton=TRUE AND holder_id=$1 AND lease_id=$2 AND expires_at>$3 FOR UPDATE`, holder, lease, now).Scan(&current)
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrConflict
+			rejected = true
+			return nil
 		}
 		if err != nil {
 			return err
@@ -271,19 +366,34 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		previous, next := "queued", "playing"
 		switch action {
 		case "arrival.replay.started":
+			if fallback.Mode != "normal" {
+				rejected = true
+				return nil
+			}
+			if err := tx.lockTransaction(ctx, "arrival:queue"); err != nil {
+				return err
+			}
 		case "arrival.replay.completed":
 			previous, next = "playing", "completed"
 		case "arrival.replay.failed":
 			previous, next = "playing", "skipped"
 		default:
-			return ErrConflict
+			rejected = true
+			return nil
 		}
 		query := `UPDATE arrival_events SET replay_status=$2,renderer_lease_id=$3,
  replay_started_at=CASE WHEN $2='playing' THEN $4 ELSE replay_started_at END,
  replay_finished_at=CASE WHEN $2<>'playing' THEN $4 ELSE replay_finished_at END,
  skip_reason=CASE WHEN $2='skipped' THEN 'renderer_failure' ELSE skip_reason END
  WHERE id=$1 AND replay_status=$5 AND (renderer_lease_id IS NULL OR renderer_lease_id=$3)
- AND ($2<>'playing' OR (replay_deadline>$4 AND (photo_wait_until<=$4 OR NOT EXISTS
+ AND ($2<>'playing' OR (
+ EXISTS (SELECT 1 FROM memory_sessions m WHERE m.id=arrival_events.memory_session_id
+ AND m.deleting=FALSE AND m.expires_at>$4)
+ AND NOT EXISTS (SELECT 1 FROM arrival_events playing WHERE playing.replay_status='playing')
+ AND id=(SELECT head.id FROM arrival_events head JOIN memory_sessions m ON m.id=head.memory_session_id
+ WHERE head.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$4
+ ORDER BY head.arrived_at,head.id LIMIT 1)
+ AND (photo_wait_until<=$4 OR NOT EXISTS
  (SELECT 1 FROM photos p WHERE p.memory_session_id=arrival_events.memory_session_id AND p.status='pending'))))`
 		result, err := tx.q.ExecContext(ctx, query, arrivalID, next, lease, now, previous)
 		if err != nil {
@@ -291,7 +401,8 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		}
 		n, _ := result.RowsAffected()
 		if n != 1 {
-			return ErrConflict
+			rejected = true
+			return nil
 		}
 		status = next
 		_, err = tx.AppendDisplayEvent(ctx, action, map[string]string{"arrivalId": arrivalID, "replayStatus": next}, now)
@@ -299,7 +410,19 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 			return err
 		}
 		_, err = tx.q.ExecContext(ctx, `INSERT INTO display_renderer_receipts(event_id,lease_id,kind,arrival_id,result,created_at) VALUES ($1,$2,$3,$4,$5,$6)`, eventID, lease, action, arrivalID, status, now)
-		return err
+		if err != nil {
+			return err
+		}
+		if fallback.Mode == "pending" {
+			_, err = tx.advanceFallback(ctx, now)
+			return err
+		}
+		return nil
 	})
+	// A rejected late renderer message must not roll back a due timeout.
+	// SQL/event/receipt failures still roll the complete transaction back.
+	if err == nil && rejected {
+		return "", ErrConflict
+	}
 	return status, err
 }

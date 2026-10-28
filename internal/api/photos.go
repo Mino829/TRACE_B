@@ -66,7 +66,7 @@ func (s *Server) photoError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, photo.ErrUploadIncomplete):
 		failure = &apiError{Code: "UPLOAD_INCOMPLETE", Message: "upload the image before completing it", Status: http.StatusConflict}
 	case errors.Is(err, store.ErrInvalidCheckpoint):
-		failure = &apiError{Code: "INVALID_CHECKPOINT", Message: "checkpointId is missing or not a known checkpoint", Status: http.StatusBadRequest}
+		failure = &apiError{Code: "INVALID_CHECKPOINT", Message: "checkpointId is missing or not a selectable photo location", Status: http.StatusBadRequest}
 	case errors.Is(err, store.ErrConflict):
 		failure = &apiError{Code: "STATE_CONFLICT", Message: "photo state or request content conflicts", Status: http.StatusConflict}
 	}

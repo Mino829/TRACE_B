@@ -25,7 +25,14 @@ func validInterval(n int) bool { return n == 30 }
 
 func (s *Server) pushAvailable(w http.ResponseWriter, r *http.Request) bool {
 	if s.cfg.PushEnabled && s.push != nil {
-		return true
+		stopped, err := s.store.PushStopped(r.Context())
+		if err != nil {
+			s.writeStoreError(w, r, err)
+			return false
+		}
+		if !stopped {
+			return true
+		}
 	}
 	s.writeError(w, requestID(r), &apiError{Code: "PUSH_UNAVAILABLE", Message: "notifications are unavailable", Status: http.StatusServiceUnavailable})
 	return false

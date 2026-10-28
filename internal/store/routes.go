@@ -82,7 +82,7 @@ func (s *Store) photoEndpoint(p *Photo) *route.Endpoint {
 		if p.CampusGraphVersion != s.routes.CampusGraphVersion {
 			return nil
 		}
-		if _, ok := s.routes.CheckpointNode(p.CheckpointID); !ok {
+		if _, ok := s.routes.NodeIndex(p.CheckpointID); !ok {
 			return nil
 		}
 		return &route.Endpoint{Checkpoint: p.CheckpointID, CapturedAt: p.CapturedAt}
@@ -188,7 +188,7 @@ func (s *Store) appendArrivalSegment(ctx context.Context, memoryID string, last 
 	if err != nil {
 		return err
 	}
-	if _, ok := s.routes.CheckpointNode(checkpointID); !ok {
+	if _, ok := s.routes.NodeIndex(checkpointID); !ok {
 		// An arrival from before the current graph, or with a checkpoint that
 		// was retired, keeps no arrival segment.
 		return nil
