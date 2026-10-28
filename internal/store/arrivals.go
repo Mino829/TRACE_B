@@ -9,15 +9,16 @@ import (
 )
 
 const (
-	ArrivalQueueLimit   = 10
-	ArrivalQueueTimeout = 30 * time.Second
-	ArrivalPhotoWait    = 15 * time.Second
+	ArrivalQueueLimit = 50
+	ArrivalPhotoWait  = 15 * time.Second
 )
 
+var ErrArrivalQueueFull = errors.New("arrival queue is full")
+
 type Arrival struct {
-	ID, Status, CheckpointID, SkipReason      string
-	ArrivedAt, PhotoWaitUntil, ReplayDeadline time.Time
-	LivePresencePhase                         string
+	ID, Status, CheckpointID, SkipReason string
+	ArrivedAt, PhotoWaitUntil            time.Time
+	LivePresencePhase                    string
 }
 
 type ReplayCandidate struct {
@@ -42,16 +43,16 @@ func (s *Store) ArrivalRouteExpected(ctx context.Context, memoryID string, lastC
 	if err != nil {
 		return false, err
 	}
-	_, ok := s.routes.CheckpointNode(checkpointID)
+	_, ok := s.routes.NodeIndex(checkpointID)
 	return ok && !lastCaptured.After(arrivedAt), nil
 }
 
 func (s *Store) arrivalForMemory(ctx context.Context, memoryID string) (Arrival, error) {
 	var a Arrival
 	var skip sql.NullString
-	err := s.q.QueryRowContext(ctx, `SELECT id,replay_status,checkpoint_id,skip_reason,arrived_at,photo_wait_until,replay_deadline
+	err := s.q.QueryRowContext(ctx, `SELECT id,replay_status,checkpoint_id,skip_reason,arrived_at,photo_wait_until
  FROM arrival_events WHERE memory_session_id=$1`, memoryID).Scan(&a.ID, &a.Status, &a.CheckpointID, &skip,
-		&a.ArrivedAt, &a.PhotoWaitUntil, &a.ReplayDeadline)
+		&a.ArrivedAt, &a.PhotoWaitUntil)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -78,8 +79,8 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			}
 			var expires time.Time
 			var deleting bool
-			var photoMode string
-			err = tx.q.QueryRowContext(ctx, `SELECT expires_at,deleting,photo_mode FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &deleting, &photoMode)
+			var photoMode, graphVersion string
+			err = tx.q.QueryRowContext(ctx, `SELECT expires_at,deleting,photo_mode,COALESCE(campus_graph_version,'') FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &deleting, &photoMode, &graphVersion)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -112,31 +113,25 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 					}
 					if n, _ := result.RowsAffected(); n == 1 {
 						a.LivePresencePhase = "arrived"
-						if err := tx.linkedDisplayPhase(ctx, memoryID, "participant.phase.changed", now); err != nil {
-							return err
-						}
 					}
 				}
 				if err := tx.EndPushForMemory(ctx, memoryID); err != nil {
 					return err
 				}
-				if err := tx.ExpireArrivals(ctx, now); err != nil {
+				var count int
+				if err := tx.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM arrival_events a
+ JOIN memory_sessions m ON m.id=a.memory_session_id
+ WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$1`, now).Scan(&count); err != nil {
 					return err
 				}
-				var count int
-				if err := tx.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM arrival_events WHERE replay_status='queued'`).Scan(&count); err != nil {
-					return err
+				if count >= ArrivalQueueLimit {
+					return ErrArrivalQueueFull
 				}
 				a.ID, a.Status, a.CheckpointID = arrivalID, "queued", checkpointID
-				a.ArrivedAt, a.PhotoWaitUntil, a.ReplayDeadline = now, now.Add(ArrivalPhotoWait), now.Add(ArrivalQueueTimeout)
-				var reason, finished any
-				if count >= ArrivalQueueLimit {
-					a.Status, a.SkipReason, reason, finished = "skipped", "queue_full", "queue_full", now
-				}
+				a.ArrivedAt, a.PhotoWaitUntil = now, now.Add(ArrivalPhotoWait)
 				_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until,replay_deadline,replay_finished_at)
- VALUES ($1,$2,'qr',$3,$4,$5,$6,$7,$8,$9)`, a.ID, memoryID, checkpointID, a.Status, reason, now,
-					a.PhotoWaitUntil, a.ReplayDeadline, finished)
+ (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until)
+ VALUES ($1,$2,'qr',$3,'queued',$4,$5)`, a.ID, memoryID, checkpointID, now, a.PhotoWaitUntil)
 				if err != nil {
 					return err
 				}
@@ -150,16 +145,16 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				if err != nil {
 					return err
 				}
-				alias, err := tx.arrivalDisplayAlias(ctx, memoryID)
-				if err != nil {
-					return err
-				}
-				_, err = tx.AppendDisplayEvent(ctx, "participant.arrived", map[string]any{
-					"arrivalId": a.ID, "replayStatus": a.Status,
-					"displayAlias": alias, "replayDurationSeconds": 15,
-				}, now)
-				if err != nil {
-					return err
+				if tx.displayEnabled {
+					projected, err := tx.projectDisplayArrival(ctx, DisplayArrival{
+						ArrivalID: a.ID, ReplayStatus: a.Status,
+					}, memoryID, photoMode, graphVersion)
+					if err != nil {
+						return err
+					}
+					if _, err := tx.AppendDisplayEvent(ctx, "participant.arrived", projected, now); err != nil {
+						return err
+					}
 				}
 				if a.Status == "queued" {
 					_, err = tx.AppendDisplayEvent(ctx, "arrival.replay.requested", map[string]string{"arrivalId": a.ID}, now)
@@ -170,17 +165,6 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			} else if err != nil {
 				return err
 			} else {
-				if a.Status == "queued" && !now.Before(a.ReplayDeadline) {
-					if err := tx.ExpireArrivals(ctx, now); err != nil {
-						return err
-					}
-					// A renderer may have started before the deadline while
-					// expiration waited for its row lock. Return the persisted state.
-					a, err = tx.arrivalForMemory(ctx, memoryID)
-					if err != nil {
-						return err
-					}
-				}
 				a.LivePresencePhase, err = tx.linkedPhase(ctx, memoryID)
 				if err != nil {
 					return err
@@ -231,51 +215,26 @@ func (s *Store) SaveArrivalReceipt(ctx context.Context, memoryID, key, requestHa
 	return err
 }
 
-func (s *Store) ExpireArrivals(ctx context.Context, now time.Time) error {
-	if !s.inTx {
-		return s.Transaction(ctx, "arrival:expire", func(tx *Store) error { return tx.ExpireArrivals(ctx, now) })
-	}
-	rows, err := s.q.QueryContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason='timeout',replay_finished_at=$1
- WHERE replay_status='queued' AND replay_deadline<=$1 RETURNING id`, now)
-	if err != nil {
-		return err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
-			break
-		}
-		ids = append(ids, id)
-	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		if _, err = s.AppendDisplayEvent(ctx, "arrival.replay.skipped", map[string]string{"arrivalId": id, "reason": "timeout"}, now); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// ReplayCandidates is a durable, bounded FIFO view for the future renderer
-// integration. Pending photos hold a candidate at most 15 seconds; 0 or 1 ready
-// photos are valid. No photo or route bytes are exposed by this interface.
+// ReplayCandidates returns a bounded FIFO view of active waiting arrivals.
+// Pending photos delay readiness by at most 15 seconds, not the arrival itself.
+// DisplayReplay independently fences order and prevents overlapping playback.
 func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCandidate, error) {
-	if err := s.ExpireArrivals(ctx, now); err != nil {
+	if err := s.RefreshDisplay(ctx, now); err != nil {
 		return nil, err
 	}
 	rows, err := s.q.QueryContext(ctx, `SELECT a.id,
  (SELECT COUNT(*) FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='ready')
  + (SELECT COUNT(*) FROM photo_moments p WHERE p.memory_session_id=a.memory_session_id)
- FROM arrival_events a WHERE a.replay_status='queued' AND a.replay_deadline>$1
+ FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
+ WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$1
+ AND (SELECT mode='normal' FROM display_fallback_control WHERE singleton=TRUE)
  AND (a.photo_wait_until<=$1 OR NOT EXISTS (
  SELECT 1 FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='pending'))
+ AND NOT EXISTS (
+ SELECT 1 FROM arrival_events earlier JOIN memory_sessions em ON em.id=earlier.memory_session_id
+ WHERE earlier.replay_status='queued' AND em.deleting=FALSE AND em.expires_at>$1
+ AND (earlier.arrived_at,earlier.id)<(a.arrived_at,a.id) AND earlier.photo_wait_until>$1
+ AND EXISTS (SELECT 1 FROM photos p WHERE p.memory_session_id=earlier.memory_session_id AND p.status='pending'))
  ORDER BY a.arrived_at,a.id LIMIT $2`, now, ArrivalQueueLimit)
 	if err != nil {
 		return nil, err
@@ -293,7 +252,10 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
 }
 
 func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error {
-	return s.Transaction(ctx, "arrival:skip:"+id, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
+		}
 		result, err := tx.q.ExecContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason='operator',replay_finished_at=$2
  WHERE id=$1 AND replay_status IN ('queued','playing')`, id, now)
 		if err != nil {
@@ -319,6 +281,9 @@ func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error
 				return ErrConflict
 			}
 			outcome = "already_skipped"
+		}
+		if _, err := tx.advanceFallback(ctx, now); err != nil {
+			return err
 		}
 		_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_operator_audit
  (operator_id,action,target_id_short,result,created_at) VALUES ('arrival_issuer','arrival.skip',$1,$2,$3)`,

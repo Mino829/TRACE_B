@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,60 +23,18 @@ type displayCredential struct {
 	IssuedAt  int64  `json:"issuedAt"`
 	ExpiresAt int64  `json:"expiresAt"`
 	Nonce     string `json:"nonce"`
+	Origin    string `json:"origin"`
 }
 
 func (s *Server) displayAvailable() bool {
 	cfg := s.cfg
-	return cfg.DisplayEnabled && len(cfg.DisplayIssuerKey) >= 32 && len(cfg.DisplayTokenKey) >= 32 &&
-		cfg.DisplayIssuerKey != cfg.DisplayTokenKey && cfg.DisplayIssuerKey != cfg.EdgeSharedSecret &&
-		cfg.DisplayTokenKey != cfg.EdgeSharedSecret && cfg.DisplayIssuerKey != cfg.ArrivalIssuerKey &&
-		cfg.DisplayIssuerKey != cfg.ArrivalProofKey && cfg.DisplayTokenKey != cfg.ArrivalIssuerKey &&
+	return cfg.DisplayEnabled && cfg.DisplayGoogleClientID != "" && len(cfg.DisplayOperatorEmails) > 0 &&
+		len(cfg.DisplayAllowedOrigins) > 0 && len(cfg.DisplayTokenKey) >= 32 &&
+		cfg.DisplayTokenKey != cfg.EdgeSharedSecret && cfg.DisplayTokenKey != cfg.ArrivalIssuerKey &&
 		cfg.DisplayTokenKey != cfg.ArrivalProofKey
 }
 
-// Only a private operator-controlled caller with the independent issuer key
-// may mint this short-lived credential. Neither key is sent to renderers.
-func (s *Server) issueDisplayToken(w http.ResponseWriter, r *http.Request) {
-	if !s.displayAvailable() {
-		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "display is disabled", Status: 503})
-		return
-	}
-	if r.Header.Get("Origin") != "" || r.Header.Get("Authorization") != "" || len(r.Header.Values("X-Trace-Display-Issuer-Timestamp")) != 1 || len(r.Header.Values("X-Trace-Display-Issuer-Signature")) != 1 {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
-		return
-	}
-	timestamp := r.Header.Get("X-Trace-Display-Issuer-Timestamp")
-	seconds, err := strconv.ParseInt(timestamp, 10, 64)
-	now := s.now().UTC()
-	if err != nil || seconds < now.Add(-15*time.Second).Unix() || seconds > now.Add(15*time.Second).Unix() {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
-		return
-	}
-	sig, err := base64.RawURLEncoding.DecodeString(r.Header.Get("X-Trace-Display-Issuer-Signature"))
-	if err != nil || subtle.ConstantTimeCompare(sig, mac(s.cfg.DisplayIssuerKey, "POST\n/v1/operator/display-tokens\n"+timestamp)) != 1 {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "display issuer credentials required", Status: 403})
-		return
-	}
-	if wait := s.limiter.allow(now, rateRule{key: "display-issuer/global", rate: 1, burst: 10},
-		rateRule{key: "api/global", rate: 100, burst: 100}); wait > 0 {
-		s.rateLimited(w, r, wait)
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1))
-	if err != nil || len(body) > 0 {
-		s.writeError(w, requestID(r), &apiError{Code: "INVALID_REQUEST", Message: "request body must be empty", Status: 400})
-		return
-	}
-	claim := displayCredential{Purpose: "display.ws", IssuedAt: now.Unix(), ExpiresAt: now.Add(displayCredentialLifetime).Unix(), Nonce: randomSecret()}
-	payload, err := json.Marshal(claim)
-	if err != nil {
-		s.writeError(w, requestID(r), internalError())
-		return
-	}
-	encoded := base64.RawURLEncoding.EncodeToString(payload)
-	s.writeJSON(w, 200, map[string]any{"displayToken": encoded + "." + base64.RawURLEncoding.EncodeToString(mac(s.cfg.DisplayTokenKey, encoded)), "expiresAt": time.Unix(claim.ExpiresAt, 0).UTC()})
-}
-func (s *Server) verifyDisplayToken(token string, now time.Time) bool {
+func (s *Server) verifyDisplayToken(token, origin string, now time.Time) bool {
 	if len(token) > 1024 {
 		return false
 	}
@@ -98,7 +55,9 @@ func (s *Server) verifyDisplayToken(token string, now time.Time) bool {
 		return false
 	}
 	nonce, err := base64.RawURLEncoding.DecodeString(claim.Nonce)
-	return err == nil && len(nonce) >= 16 && claim.Purpose == "display.ws" && claim.IssuedAt <= now.Unix() && claim.ExpiresAt > now.Unix() && claim.ExpiresAt > claim.IssuedAt && claim.ExpiresAt-claim.IssuedAt <= int64(displayCredentialLifetime.Seconds())
+	return err == nil && len(nonce) >= 16 && claim.Purpose == "display.ws" && claim.Origin == origin &&
+		claim.IssuedAt <= now.Unix() && claim.ExpiresAt > now.Unix() && claim.ExpiresAt > claim.IssuedAt &&
+		claim.ExpiresAt-claim.IssuedAt <= int64(displayCredentialLifetime.Seconds())
 }
 
 type displayMessage struct {
@@ -133,32 +92,29 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "display is disabled", Status: 503})
 		return
 	}
-	if r.Header.Get("Origin") != "" || r.URL.RawQuery != "" {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "native renderer connection required", Status: 403})
+	if len(r.Header.Values("Origin")) != 1 || !s.displayOriginAllowed(r.Header.Get("Origin")) ||
+		r.URL.RawQuery != "" || r.URL.ForceQuery || len(r.Header.Values("Authorization")) != 0 {
+		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "allowed display origin without URL credentials required", Status: 403})
 		return
 	}
-	if len(r.Header.Values("Authorization")) != 1 {
-		s.writeError(w, requestID(r), &apiError{Code: "UNAUTHORIZED", Message: "one display credential required", Status: 401})
+	if wait := s.limiter.allow(s.now(), rateRule{key: "display-connect/ip/" + s.clientIP(r), rate: 1, burst: 10},
+		rateRule{key: "display-connect/global", rate: 10, burst: 20},
+		rateRule{key: "api/global", rate: 100, burst: 100}); wait > 0 {
+		s.rateLimited(w, r, wait)
 		return
 	}
-	token, authErr := bearerToken(r)
-	if authErr != nil || !s.verifyDisplayToken(token, s.now().UTC()) {
-		s.writeError(w, requestID(r), &apiError{Code: "UNAUTHORIZED", Message: "valid display credential required", Status: 401})
-		return
-	}
-	if len(r.Header.Values("X-Trace-Schema-Version")) != 1 ||
-		len(r.Header.Values("X-Trace-Coordinate-Version")) != 1 ||
-		len(r.Header.Values("X-Trace-Campus-Graph-Version")) != 1 ||
-		len(r.Header.Values("X-Trace-Three-D-Map-Version")) != 1 ||
-		r.Header.Get("X-Trace-Schema-Version") != "1" || r.Header.Get("X-Trace-Coordinate-Version") != s.cfg.CoordinateVersion || r.Header.Get("X-Trace-Campus-Graph-Version") != s.cfg.CampusGraphVersion || r.Header.Get("X-Trace-Three-D-Map-Version") != s.cfg.ThreeDMapVersion {
-		s.writeError(w, requestID(r), &apiError{Code: "VERSION_MISMATCH", Message: "renderer bundle version mismatch", Status: 409})
-		return
-	}
-	conn, err := (&websocket.Upgrader{HandshakeTimeout: 5 * time.Second, CheckOrigin: func(r *http.Request) bool { return r.Header.Get("Origin") == "" }}).Upgrade(w, r, nil)
+	conn, err := (&websocket.Upgrader{HandshakeTimeout: 5 * time.Second, CheckOrigin: func(r *http.Request) bool {
+		return len(r.Header.Values("Origin")) == 1 && s.displayOriginAllowed(r.Header.Get("Origin"))
+	}}).Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
+	if !s.authenticateDisplay(conn, r.Header.Get("Origin")) {
+		return
+	}
+	s.displayConnections.Add(1)
+	defer s.displayConnections.Add(-1)
 	// No HTTP request deadline after upgrade. Read/write and total connection
 	// lifetimes below bound the hijacked connection independently.
 	ctx, cancel := context.WithTimeout(r.Context(), displayConnectionLifetime)
@@ -182,11 +138,6 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 	cursor := state.Cursor
 	if err := sendDisplay(conn, s.frame(strconv.FormatInt(cursor, 10), "display.snapshot", state)); err != nil {
 		return
-	}
-	// Position deltas are per-connection and never replayed from PostgreSQL.
-	observed := make(map[string]store.DisplayParticipant, len(state.Participants))
-	for _, p := range state.Participants {
-		observed[p.LivePresenceID] = p
 	}
 	messages := make(chan displayMessage, 16)
 	readErr := make(chan error, 1)
@@ -255,10 +206,6 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 				if sendDisplay(conn, s.frame(strconv.FormatInt(cursor, 10), "display.snapshot", state)) != nil {
 					return
 				}
-				observed = make(map[string]store.DisplayParticipant, len(state.Participants))
-				for _, p := range state.Participants {
-					observed[p.LivePresenceID] = p
-				}
 				continue
 			}
 			if err != nil {
@@ -271,27 +218,18 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				cursor = event.ID
-			}
-			positions := s.store.DisplayPositions(s.now().UTC())
-			for id, p := range positions {
-				if prior, found := observed[id]; !found || prior != p {
-					if sendDisplay(conn, s.frame(randomID("position"), "position.updated", p)) != nil {
+				if event.Type == "system.fallback.changed" {
+					state, err = s.store.DisplaySnapshot(ctx, s.now().UTC())
+					if err != nil {
 						return
 					}
-				}
-			}
-			for id, p := range observed {
-				if _, found := positions[id]; !found {
-					kind := "tracking.stopped"
-					if !s.now().UTC().Before(p.ExpiresAt) {
-						kind = "position.expired"
-					}
-					if sendDisplay(conn, s.frame(randomID("position"), kind, map[string]string{"livePresenceId": id})) != nil {
+					cursor = state.Cursor
+					if sendDisplay(conn, s.frame(strconv.FormatInt(cursor, 10), "display.snapshot", state)) != nil {
 						return
 					}
+					break
 				}
 			}
-			observed = positions
 		case msg := <-messages:
 			if time.Since(window) >= time.Second {
 				window = time.Now()
@@ -371,6 +309,37 @@ func (s *Server) displayWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// A browser cannot set Authorization or version headers in its WebSocket
+// handshake. Authenticate its first text frame before any state or lease access.
+func (s *Server) authenticateDisplay(conn *websocket.Conn, origin string) bool {
+	conn.SetReadLimit(maxJSONBody)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	kind, payload, err := conn.ReadMessage()
+	if err != nil {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4401, "display authentication required"), time.Now().Add(time.Second))
+		return false
+	}
+	var auth struct {
+		SchemaVersion      int    `json:"schemaVersion"`
+		Type               string `json:"type"`
+		DisplayToken       string `json:"displayToken"`
+		CoordinateVersion  string `json:"coordinateVersion"`
+		CampusGraphVersion string `json:"campusGraphVersion"`
+		ThreeDMapVersion   string `json:"threeDMapVersion"`
+	}
+	if kind != websocket.TextMessage || decodeBytes(payload, &auth) != nil || auth.Type != "renderer.authenticate" ||
+		!s.verifyDisplayToken(auth.DisplayToken, origin, s.now().UTC()) {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4401, "valid display credential required"), time.Now().Add(time.Second))
+		return false
+	}
+	if auth.SchemaVersion != 1 || auth.CoordinateVersion != s.cfg.CoordinateVersion ||
+		auth.CampusGraphVersion != s.cfg.CampusGraphVersion || auth.ThreeDMapVersion != s.cfg.ThreeDMapVersion {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4409, "renderer bundle version mismatch"), time.Now().Add(time.Second))
+		return false
+	}
+	return true
 }
 func sendDisplay(conn *websocket.Conn, frame displayFrame) error {
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))

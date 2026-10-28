@@ -166,39 +166,9 @@ func TestGenerationP95(t *testing.T) {
 	t.Logf("route generation p95 (%d samples, real graph): %s", len(timings), timings[94])
 }
 
-func TestEmbeddedGraphResolvesCheckpointsOnly(t *testing.T) {
-	g, err := Embedded()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var known, waypoint int
-	for _, n := range g.Nodes {
-		if index, ok := g.CheckpointNode(n.ID); ok {
-			if index < 0 || index >= len(g.Nodes) {
-				t.Fatalf("checkpoint %q resolved to a non-node", n.ID)
-			}
-			known++
-		} else if n.Role != "checkpoint" {
-			waypoint++
-		}
-	}
-	if known == 0 || waypoint == 0 {
-		t.Fatalf("graph lost checkpoint roles: %d checkpoints, %d others", known, waypoint)
-	}
-	if _, ok := g.CheckpointNode("definitely-missing"); ok {
-		t.Fatal("unknown checkpoint accepted")
-	}
-}
-
 func TestConnectResolvesCheckpointPairs(t *testing.T) {
-	g := smallGraph(t, func(g *Graph) {
-		g.Nodes[0].Role = "checkpoint"
-		g.Nodes[2].Role = "checkpoint"
-	})
+	g := smallGraph(t, nil)
 	a, c := "a", "c"
-	if _, ok := g.CheckpointNode(a); !ok {
-		t.Fatal("checkpoint role lost after parse")
-	}
 	now := time.Now()
 	result := g.Connect(&Endpoint{Checkpoint: "a", CapturedAt: now}, &Endpoint{Checkpoint: c, CapturedAt: now.Add(time.Minute)})
 	if result.Confidence != "high" || len(result.Path) != 3 || result.LengthM != 40 {
@@ -234,9 +204,7 @@ func TestConnectResolvesCheckpointPairs(t *testing.T) {
 }
 
 func TestConnectPreservesGPSMountJunction(t *testing.T) {
-	g := smallGraph(t, func(g *Graph) {
-		g.Nodes[3].Role = "checkpoint"
-	})
+	g := smallGraph(t, nil)
 	now := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
 	from := &Endpoint{Anchor: anchorOn(g, g.Edges[0], .5, 1, now), CapturedAt: now}
 	to := &Endpoint{Checkpoint: "d", CapturedAt: now.Add(time.Minute)}
@@ -251,7 +219,6 @@ func TestConnectPreservesGPSMountJunction(t *testing.T) {
 func TestConnectRejectsGPSMountClosedBetweenPhotos(t *testing.T) {
 	now := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
 	g := smallGraph(t, func(g *Graph) {
-		g.Nodes[1].Role = "checkpoint"
 		g.Edges[0].Closures = []closure{{Start: now.Add(20 * time.Second), End: now.Add(40 * time.Second)}}
 	})
 	from := &Endpoint{Anchor: anchorOn(g, g.Edges[0], .5, 1, now), CapturedAt: now}
@@ -259,5 +226,45 @@ func TestConnectRejectsGPSMountClosedBetweenPhotos(t *testing.T) {
 	got := g.Connect(from, to)
 	if got.Confidence != "low" || len(got.Path) != 0 {
 		t.Fatalf("closed GPS mount disclosed as a passable route: %+v", got)
+	}
+}
+
+func TestPhotoSelectionIsExplicitAndIndependentOfRouteEndpoints(t *testing.T) {
+	g := smallGraph(t, func(g *Graph) { g.Nodes[0].Selectable = true })
+	raw, err := json.Marshal(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	nodes := document["nodes"].([]any)
+	nodes[0].(map[string]any)["role"] = "waypoint"
+	nodes[1].(map[string]any)["role"] = "checkpoint"
+	nodes[2].(map[string]any)["role"] = "checkpoint"
+	delete(nodes[2].(map[string]any), "selectable")
+	nodes[3].(map[string]any)["selectable"] = nil
+	raw, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err = Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		id   string
+		want bool
+	}{{"a", true}, {"b", false}, {"c", false}, {"d", false}, {"", false}, {"missing", false}} {
+		if _, ok := g.PhotoCheckpointNode(tc.id); ok != tc.want {
+			t.Errorf("photo selection %q = %t, want %t", tc.id, ok, tc.want)
+		}
+	}
+	now := time.Now().UTC()
+	result := g.Connect(&Endpoint{Checkpoint: "a", CapturedAt: now}, &Endpoint{Checkpoint: "c", CapturedAt: now})
+	if result.LengthM != 40 || len(result.NodeIDs) != 3 || result.NodeIDs[0] != "a" ||
+		result.NodeIDs[1] != "b" || result.NodeIDs[2] != "c" {
+		t.Fatalf("selection policy restricted internal route endpoints: %+v", result)
 	}
 }

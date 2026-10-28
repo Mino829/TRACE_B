@@ -179,9 +179,9 @@ func photoGraphFixture(t *testing.T, f *testdb.Fixture, cfg *config.Config) {
 	t.Helper()
 	lonStep := 20 / (6378137 * math.Cos(35*math.Pi/180) * math.Pi / 180)
 	raw := fmt.Sprintf(`{"schemaVersion":1,"campusGraphVersion":"g1","coordinateVersion":"c1","threeDMapVersion":"m1","nodes":[`+
-		`{"id":"cp-a","lat":35,"lon":139,"local":{"east":0,"north":0},"gpsSnap":true,"role":"checkpoint"},`+
-		`{"id":"mid","lat":35,"lon":%.9f,"local":{"east":20,"north":0},"gpsSnap":true},`+
-		`{"id":"cp-b","lat":35,"lon":%.9f,"local":{"east":40,"north":0},"gpsSnap":true,"role":"checkpoint"}],`+
+		`{"id":"cp-a","lat":35,"lon":139,"local":{"east":0,"north":0},"gpsSnap":true,"role":"checkpoint","selectable":true},`+
+		`{"id":"mid","lat":35,"lon":%.9f,"local":{"east":20,"north":0},"gpsSnap":true,"role":"checkpoint","selectable":false},`+
+		`{"id":"cp-b","lat":35,"lon":%.9f,"local":{"east":40,"north":0},"gpsSnap":true,"role":"waypoint","selectable":true}],`+
 		`"edges":[{"id":"am","from":"cp-a","to":"mid","kind":"ground","lengthMetres":20,"passable":true},`+
 		`{"id":"mb","from":"mid","to":"cp-b","kind":"ground","lengthMetres":20,"passable":true}]}`, 139+lonStep, 139+2*lonStep)
 	g, err := route.Parse([]byte(raw))
@@ -719,8 +719,8 @@ func TestPhotoMemoryReturnsCheckpointAndArrivalSegment(t *testing.T) {
 	// One photo pair plus one arrival segment; drivers stay versioned.
 	var arrivedAt = time.Now().UTC()
 	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until,replay_deadline)
- VALUES ('arr',$1,'qr','cp-b','skipped','operator',$2,$2,$3)`, c.Memory.SessionID, arrivedAt, arrivedAt.Add(time.Minute)); err != nil {
+ (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
+ VALUES ('arr',$1,'qr','cp-b','skipped','operator',$2,$2)`, c.Memory.SessionID, arrivedAt); err != nil {
 		t.Fatal(err)
 	}
 	r = request(t, h, "GET", "/v1/memory-sessions/"+c.Memory.SessionID+"/memory", "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
@@ -768,8 +768,8 @@ func TestPhotoMemoryWithoutRoutableArrivalSegment(t *testing.T) {
 			readyPhoto(t, h, c, photoJPEG(t), "before-arrival")
 			arrivedAt := time.Now().UTC()
 			if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until,replay_deadline)
- VALUES ('arr',$1,'qr',$2,'skipped','operator',$3,$3,$4)`, c.Memory.SessionID, tc.arrivalCheckpoint, arrivedAt, arrivedAt.Add(time.Minute)); err != nil {
+ (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
+ VALUES ('arr',$1,'qr',$2,'skipped','operator',$3,$3)`, c.Memory.SessionID, tc.arrivalCheckpoint, arrivedAt); err != nil {
 				t.Fatal(err)
 			}
 			if tc.latePhoto {

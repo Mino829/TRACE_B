@@ -49,7 +49,7 @@ func TestPhotoMomentsRoutesReplayFenceAndSeparation(t *testing.T) {
 		t.Fatalf("legacy photo accepted in device mode: %v", err)
 	}
 	if _, _, err := f.Store.CreatePhotoMoment(t.Context(), momentInput("missing", id, "mid", now), now); !errors.Is(err, store.ErrInvalidCheckpoint) {
-		t.Fatalf("waypoint accepted as photo checkpoint: %v", err)
+		t.Fatalf("non-selectable node accepted as photo checkpoint: %v", err)
 	}
 	first, created, err := f.Store.CreatePhotoMoment(t.Context(), momentInput("first", id, "cp-a", now.Add(time.Minute)), now)
 	if err != nil || !created || first.SequenceNo != 1 || first.CampusGraphVersion != "g1" {
@@ -172,8 +172,8 @@ func TestPhotoMomentQuotaArrivalAndExpiry(t *testing.T) {
 		t.Fatalf("quota did not recover while sequence stayed stable: %+v %v", p, err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until,replay_deadline)
- VALUES ('device-arrived',$1,'qr','cp-b','queued',$2,$2,$3)`, id, now.Add(time.Minute), now.Add(2*time.Minute)); err != nil {
+ (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until)
+ VALUES ('device-arrived',$1,'qr','cp-b','queued',$2,$2)`, id, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Store.RefreshMomentRoutes(t.Context(), id, now); err != nil {
@@ -265,7 +265,7 @@ func TestDeviceArrivalReconcilesZeroAndOnePhoto(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	v := deviceExperience(t, f, now)
 	id := v.MemorySessionID
-	if _, err := f.Store.AcceptArrival(t.Context(), id, "", "arrival-1", "cp-b", "receipt-1", "hash-1", now.Add(time.Minute)); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), id, "", "arrival-1", "mid", "receipt-1", "hash-1", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := f.Store.MomentRouteSegments(t.Context(), id)
@@ -278,7 +278,8 @@ func TestDeviceArrivalReconcilesZeroAndOnePhoto(t *testing.T) {
 	}
 	segments, err = f.Store.MomentRouteSegments(t.Context(), id)
 	if err != nil || len(segments) != 1 || segments[0].FromPhotoMomentID != m.ID ||
-		segments[0].ToPhotoMomentID != nil || len(segments[0].PathNodeIDs) != 3 {
+		segments[0].ToPhotoMomentID != nil || len(segments[0].PathNodeIDs) != 2 ||
+		segments[0].PathNodeIDs[0] != "cp-a" || segments[0].PathNodeIDs[1] != "mid" {
 		t.Fatalf("one photo missing arrival route: %+v %v", segments, err)
 	}
 	if err := f.Store.DeletePhotoMoment(t.Context(), id, m.ID, now.Add(time.Minute)); err != nil {
@@ -324,5 +325,60 @@ func TestDeviceCutoverQueuesPendingButRetainsReadyLegacy(t *testing.T) {
 	}
 	if _, err := f.Store.Photo(t.Context(), v.MemorySessionID, ready.ID); err != nil {
 		t.Fatal("old ready asset no longer available:", err)
+	}
+}
+
+func TestPreviouslyAcceptedNonSelectableMomentRetainsReplayAndRoute(t *testing.T) {
+	f := testdb.Open(t)
+	checkpointFixture(t, f)
+	f.Store.EnableDisplay()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	id := deviceExperience(t, f, now).MemorySessionID
+	old := momentInput("previously-accepted", id, "mid", now)
+	digest := sha256.Sum256([]byte(old.ID))
+	// The previous application accepted role=="checkpoint" even when selectable
+	// was false. Preserve those accepted records, not permission for new input.
+	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO photo_moments
+ (id,id_hash,memory_session_id,client_photo_id,checkpoint_id,request_hash,campus_graph_version,captured_at,sequence_no)
+ VALUES ($1,$2,$3,$4,$5,$6,'g1',$7,1)`, old.ID, hex.EncodeToString(digest[:]), id,
+		old.ClientPhotoID, old.CheckpointID, old.RequestHash, old.CapturedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.Store.CreatePhotoMoment(t.Context(), momentInput("new-unselectable", id, "mid", now), now); !errors.Is(err, store.ErrInvalidCheckpoint) {
+		t.Fatalf("new photo bypassed selection: %v", err)
+	}
+	replayed, created, err := f.Store.CreatePhotoMoment(t.Context(), old, now)
+	if err != nil || created || replayed.ID != old.ID {
+		t.Fatalf("accepted photo replay changed: %+v %t %v", replayed, created, err)
+	}
+	second, _, err := f.Store.CreatePhotoMoment(t.Context(), momentInput("selected-waypoint", id, "cp-b", now.Add(time.Minute)), now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Store.AcceptArrival(t.Context(), id, "", "arrival-selection", "mid", "receipt-selection", "hash-selection", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := f.Store.MomentRouteSegments(t.Context(), id)
+	if err != nil || len(segments) != 2 || segments[0].FromPhotoMomentID != old.ID ||
+		fmt.Sprint(segments[0].PathNodeIDs) != "[mid cp-b]" ||
+		segments[1].FromPhotoMomentID != second.ID || segments[1].ToPhotoMomentID != nil ||
+		fmt.Sprint(segments[1].PathNodeIDs) != "[cp-b mid]" {
+		t.Fatalf("accepted photo or internal arrival lost its route: %+v %v", segments, err)
+	}
+	snapshot, err := f.Store.DisplaySnapshot(t.Context(), now.Add(2*time.Minute))
+	if err != nil || len(snapshot.Arrivals) != 1 ||
+		fmt.Sprint(snapshot.Arrivals[0].PathNodeIDs) != "[mid cp-b mid]" ||
+		len(snapshot.Arrivals[0].PhotoCheckpoints) != 2 ||
+		snapshot.Arrivals[0].PhotoCheckpoints[0].CheckpointID != "mid" ||
+		snapshot.Arrivals[0].PhotoCheckpoints[1].CheckpointID != "cp-b" {
+		t.Fatalf("display dropped accepted non-selectable photo: %+v %v", snapshot, err)
+	}
+	if err := f.Store.DeletePhotoMoment(t.Context(), id, old.ID, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	segments, err = f.Store.MomentRouteSegments(t.Context(), id)
+	if err != nil || len(segments) != 1 || segments[0].FromPhotoMomentID != second.ID ||
+		segments[0].ToPhotoMomentID != nil || fmt.Sprint(segments[0].PathNodeIDs) != "[cp-b mid]" {
+		t.Fatalf("deletion did not retain internal arrival endpoint: %+v %v", segments, err)
 	}
 }

@@ -53,8 +53,8 @@ type node struct {
 		East  float64 `json:"east"`
 		North float64 `json:"north"`
 	} `json:"local"`
-	GPSSnap bool   `json:"gpsSnap"`
-	Role    string `json:"role"`
+	GPSSnap    bool `json:"gpsSnap"`
+	Selectable bool `json:"selectable"`
 }
 
 type hours struct {
@@ -91,7 +91,7 @@ type Graph struct {
 	Nodes                   []node `json:"nodes"`
 	Edges                   []edge `json:"edges"`
 	adj                     [][]int
-	checkpointNodes         map[string]int
+	nodeIDs                 map[string]int
 	originLat, originLon    float64
 	originEast, originNorth float64
 }
@@ -125,7 +125,6 @@ func Parse(data []byte) (*Graph, error) {
 	g.originLat, g.originLon = g.Nodes[0].Latitude, g.Nodes[0].Longitude
 	g.originEast, g.originNorth = g.Nodes[0].Local.East, g.Nodes[0].Local.North
 	ids := make(map[string]int, len(g.Nodes))
-	checkpoints := make(map[string]int, len(g.Nodes))
 	g.adj = make([][]int, len(g.Nodes))
 	for i, n := range g.Nodes {
 		if n.ID == "" || !finite(n.Latitude) || !finite(n.Longitude) || !finite(n.Local.East) || !finite(n.Local.North) || n.Latitude < -90 || n.Latitude > 90 || n.Longitude < -180 || n.Longitude > 180 {
@@ -135,9 +134,6 @@ func Parse(data []byte) (*Graph, error) {
 			return nil, errors.New("duplicate graph node")
 		}
 		ids[n.ID] = i
-		if n.Role == "checkpoint" {
-			checkpoints[n.ID] = i
-		}
 		x, z := g.project(n.Latitude, n.Longitude)
 		if math.Hypot(x-n.Local.East, z-n.Local.North) > 0.3 {
 			return nil, errors.New("graph local and WGS84 coordinates disagree")
@@ -182,18 +178,22 @@ func Parse(data []byte) (*Graph, error) {
 		g.adj[e.a] = append(g.adj[e.a], i)
 		g.adj[e.b] = append(g.adj[e.b], i)
 	}
-	g.checkpointNodes = checkpoints
+	g.nodeIDs = ids
 	return &g, nil
 }
 
-// CheckpointNode resolves a participant-chosen checkpoint ID to a graph node
-// index. Only role=="checkpoint" nodes count; every other ID fails.
-func (g *Graph) CheckpointNode(id string) (int, bool) {
-	if id == "" {
-		return -1, false
-	}
-	i, ok := g.checkpointNodes[id]
+// NodeIndex resolves internal route endpoints, signed arrival locations and
+// already accepted photo locations independently of current photo selectability.
+func (g *Graph) NodeIndex(id string) (int, bool) {
+	i, ok := g.nodeIDs[id]
 	return i, ok
+}
+
+// PhotoCheckpointNode accepts only explicitly selectable photo locations.
+// Missing, false or null selectable attributes never enable new photo input.
+func (g *Graph) PhotoCheckpointNode(id string) (int, bool) {
+	i, ok := g.NodeIndex(id)
+	return i, ok && g.Nodes[i].Selectable
 }
 
 func clock(s string) (int, error) {
@@ -489,8 +489,8 @@ func condense(path []Point) []Point {
 }
 
 type Endpoint struct {
-	// Anchor is set for legacy photos that stored GPS. Checkpoint is the ID of
-	// the participant-chosen checkpoint node, or empty without one.
+	// Anchor is set for legacy photos that stored GPS. Checkpoint is the graph
+	// node ID of an accepted photo or signed arrival, or empty without one.
 	Anchor     *Anchor
 	Checkpoint string
 	CapturedAt time.Time
@@ -504,7 +504,7 @@ type mount struct {
 
 func (g *Graph) placements(e *Endpoint, startAt, endAt time.Time) []mount {
 	if e.Checkpoint != "" {
-		node, ok := g.CheckpointNode(e.Checkpoint)
+		node, ok := g.NodeIndex(e.Checkpoint)
 		if !ok {
 			return nil
 		}

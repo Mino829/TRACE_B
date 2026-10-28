@@ -59,18 +59,11 @@ case "$mode" in
       fi
       api_secrets+=",TRACE_ARRIVAL_ISSUER_KEY=$GCP_ARRIVAL_ISSUER_SECRET,TRACE_ARRIVAL_PROOF_KEY=$GCP_ARRIVAL_PROOF_SECRET"
     fi
-    if [[ -n "${GCP_DISPLAY_ISSUER_SECRET:-}" || -n "${GCP_DISPLAY_TOKEN_SECRET:-}" ]]; then
-      : "${GCP_DISPLAY_ISSUER_SECRET:?set GCP_DISPLAY_ISSUER_SECRET}"
-      : "${GCP_DISPLAY_TOKEN_SECRET:?set GCP_DISPLAY_TOKEN_SECRET}"
-      for ref in "$GCP_DISPLAY_ISSUER_SECRET" "$GCP_DISPLAY_TOKEN_SECRET"; do
-        if [[ ! "$ref" =~ ^[a-zA-Z][a-zA-Z0-9_-]*:[1-9][0-9]*$ ]]; then
-          echo "Display secrets must be pinned Secret Manager name:version references" >&2; exit 2
-        fi
-      done
-      if [[ "$GCP_DISPLAY_ISSUER_SECRET" == "$GCP_DISPLAY_TOKEN_SECRET" ]]; then
-        echo "Display issuer and token secrets must differ" >&2; exit 2
+    if [[ -n "${GCP_DISPLAY_TOKEN_SECRET:-}" ]]; then
+      if [[ ! "$GCP_DISPLAY_TOKEN_SECRET" =~ ^[a-zA-Z][a-zA-Z0-9_-]*:[1-9][0-9]*$ ]]; then
+        echo "Display token secret must be a pinned Secret Manager name:version reference" >&2; exit 2
       fi
-      api_secrets+=",TRACE_DISPLAY_ISSUER_KEY=$GCP_DISPLAY_ISSUER_SECRET,TRACE_DISPLAY_TOKEN_KEY=$GCP_DISPLAY_TOKEN_SECRET"
+      api_secrets+=",TRACE_DISPLAY_TOKEN_KEY=$GCP_DISPLAY_TOKEN_SECRET"
     fi
     api_secrets+="${runtime_secrets#DB_PASSWORD=$GCP_APP_PASSWORD_SECRET}"
     if grep -Eq '^[[:space:]]*(TRACE_EDGE_SHARED_SECRET|TRACE_(ARRIVAL|DISPLAY)_(ISSUER|PROOF|TOKEN)_KEY)[[:space:]]*:' "$env_file"; then

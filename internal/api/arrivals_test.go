@@ -259,7 +259,7 @@ func TestArrivalWithStoppedLiveStillRecordsMemoryEvent(t *testing.T) {
 	}
 }
 
-func TestArrivalQueuePendingPhotoTimeoutSkipAndDeletion(t *testing.T) {
+func TestArrivalQueuePendingPhotoWaitAndDeletion(t *testing.T) {
 	f := testdb.Open(t)
 	cfg := arrivalConfig()
 	h := api.New(cfg, f.Store, nil)
@@ -297,16 +297,16 @@ func TestArrivalQueuePendingPhotoTimeoutSkipAndDeletion(t *testing.T) {
 	if list.Code != 200 || !strings.Contains(list.Body.String(), `"readyPhotoCount":1`) {
 		t.Fatalf("one ready photo: %d %s", list.Code, list.Body.String())
 	}
-	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE arrival_events SET replay_deadline=$2 WHERE memory_session_id=$1", c.Memory.SessionID, now.Add(-time.Second)); err != nil {
+	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE arrival_events SET arrived_at=$2,photo_wait_until=$2 WHERE memory_session_id=$1", c.Memory.SessionID, now.Add(-2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	list = request(t, h, "GET", path, "", issuerHeaders(cfg, "GET", path))
-	if list.Code != 200 || strings.Contains(list.Body.String(), `"arrivalId"`) {
-		t.Fatalf("timeout candidate still visible: %d %s", list.Code, list.Body.String())
+	if list.Code != 200 || !strings.Contains(list.Body.String(), `"readyPhotoCount":1`) {
+		t.Fatalf("long-waiting arrival disappeared: %d %s", list.Code, list.Body.String())
 	}
 	var status, reason string
-	if err := f.SQL.QueryRowContext(t.Context(), "SELECT replay_status,skip_reason FROM arrival_events WHERE memory_session_id=$1", c.Memory.SessionID).Scan(&status, &reason); err != nil || status != "skipped" || reason != "timeout" {
-		t.Fatalf("timeout: %s/%s %v", status, reason, err)
+	if err := f.SQL.QueryRowContext(t.Context(), "SELECT replay_status,COALESCE(skip_reason,'') FROM arrival_events WHERE memory_session_id=$1", c.Memory.SessionID).Scan(&status, &reason); err != nil || status != "queued" || reason != "" {
+		t.Fatalf("long wait was skipped: %s/%s %v", status, reason, err)
 	}
 	// Removing a MemorySession cascades its arrival and excludes it from durable queue.
 	noPhoto := createExperience(t, h, cfg)

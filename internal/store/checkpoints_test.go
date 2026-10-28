@@ -13,14 +13,14 @@ import (
 )
 
 // checkpointFixture keeps route assertions independent of live mapping data:
-// two checkpoints 40m apart through one waypoint that also accepts GPS snaps.
+// two selectable photo nodes 40m apart through a non-selectable arrival node.
 func checkpointFixture(t *testing.T, f *testdb.Fixture) {
 	t.Helper()
 	lonStep := 20 / (6378137 * math.Cos(35*math.Pi/180) * math.Pi / 180)
 	raw := fmt.Sprintf(`{"schemaVersion":1,"campusGraphVersion":"g1","coordinateVersion":"c1","threeDMapVersion":"m1","nodes":[`+
-		`{"id":"cp-a","lat":35,"lon":139,"local":{"east":0,"north":0},"gpsSnap":true,"role":"checkpoint"},`+
-		`{"id":"mid","lat":35,"lon":%.9f,"local":{"east":20,"north":0},"gpsSnap":true},`+
-		`{"id":"cp-b","lat":35,"lon":%.9f,"local":{"east":40,"north":0},"gpsSnap":true,"role":"checkpoint"}],`+
+		`{"id":"cp-a","lat":35,"lon":139,"local":{"east":0,"north":0},"gpsSnap":true,"role":"checkpoint","selectable":true},`+
+		`{"id":"mid","lat":35,"lon":%.9f,"local":{"east":20,"north":0},"gpsSnap":true,"role":"checkpoint","selectable":false},`+
+		`{"id":"cp-b","lat":35,"lon":%.9f,"local":{"east":40,"north":0},"gpsSnap":true,"role":"waypoint","selectable":true}],`+
 		`"edges":[{"id":"am","from":"cp-a","to":"mid","kind":"ground","lengthMetres":20,"passable":true},`+
 		`{"id":"mb","from":"mid","to":"cp-b","kind":"ground","lengthMetres":20,"passable":true}]}`, 139+lonStep, 139+2*lonStep)
 	g, err := route.Parse([]byte(raw))
@@ -45,10 +45,12 @@ func TestCheckpointPhotoRegistrationRecordsGraphVersion(t *testing.T) {
 	memory := fixtureExperience(t, f, now)
 	id := memory.MemorySessionID
 
-	unknown := photoInput(id, "photo-unknown", now)
-	unknown.CheckpointID = "classroom-entrance" // a real checkpoint of the embedded graph, absent here
-	if _, err := f.Store.CreatePhoto(t.Context(), unknown, now.Add(3*time.Minute)); !errors.Is(err, store.ErrInvalidCheckpoint) {
-		t.Fatalf("unknown checkpoint: %v", err)
+	for _, checkpoint := range []string{"classroom-entrance", "mid"} {
+		rejected := photoInput(id, "photo-rejected", now)
+		rejected.CheckpointID = checkpoint
+		if _, err := f.Store.CreatePhoto(t.Context(), rejected, now.Add(3*time.Minute)); !errors.Is(err, store.ErrInvalidCheckpoint) {
+			t.Fatalf("unknown or non-selectable photo location %q: %v", checkpoint, err)
+		}
 	}
 	missing := photoInput(id, "photo-missing", now)
 	missing.CheckpointID, missing.Location = "cp-a", &store.PhotoLocation{Latitude: 35, Longitude: 139, AccuracyM: 1, RecordedAt: now}
@@ -151,8 +153,8 @@ func TestArrivalCheckpointExtendsRoute(t *testing.T) {
 	id := fixtureExperience(t, f, now).MemorySessionID
 	insert_arrival := func(arrivedAt time.Time) {
 		if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until,replay_deadline)
- VALUES ('arr-1',$1,'qr','cp-b','skipped','operator',$2,$2,$3)`, id, arrivedAt, arrivedAt.Add(time.Minute)); err != nil {
+ (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
+ VALUES ('arr-1',$1,'qr','cp-b','skipped','operator',$2,$2)`, id, arrivedAt); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -194,8 +196,8 @@ func TestArrivalWithUnresolvableCheckpointKeepsNoSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until,replay_deadline)
- VALUES ('arr-2',$1,'qr','retired-checkpoint','skipped','operator',$2,$2,$3)`, id, now.Add(time.Hour), now.Add(2*time.Hour)); err != nil {
+ (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
+ VALUES ('arr-2',$1,'qr','retired-checkpoint','skipped','operator',$2,$2)`, id, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Store.RefreshRoutes(t.Context(), id, now.Add(time.Hour)); err != nil {

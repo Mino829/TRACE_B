@@ -15,23 +15,27 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mino829/trace_Backend/internal/config"
 	"github.com/Mino829/trace_Backend/internal/photo"
 	"github.com/Mino829/trace_Backend/internal/push"
 	"github.com/Mino829/trace_Backend/internal/store"
+	"google.golang.org/api/idtoken"
 )
 
 const maxJSONBody = 16 << 10
 
 type Server struct {
-	cfg     config.Config
-	store   *store.Store
-	limiter *rateLimiter
-	now     func() time.Time
-	photos  *photo.Service
-	push    *push.Service
+	cfg                   config.Config
+	store                 *store.Store
+	limiter               *rateLimiter
+	now                   func() time.Time
+	photos                *photo.Service
+	push                  *push.Service
+	validateGoogleIDToken func(context.Context, string, string) (*idtoken.Payload, error)
+	displayConnections    *atomic.Int64
 }
 
 type apiError struct {
@@ -43,7 +47,8 @@ type apiError struct {
 func (e *apiError) Error() string { return e.Code }
 
 func New(cfg config.Config, db *store.Store, photos *photo.Service, sender ...*push.Service) http.Handler {
-	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter(), photos: photos}
+	server := &Server{cfg: cfg, store: db, now: time.Now, limiter: newRateLimiter(), photos: photos,
+		validateGoogleIDToken: idtoken.Validate, displayConnections: new(atomic.Int64)}
 	if len(sender) != 0 {
 		server.push = sender[0]
 	}
@@ -57,6 +62,11 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service, sender ...*p
 	mux.HandleFunc("POST /v1/experiences", server.limitedPublic("create", server.createExperience))
 	mux.HandleFunc("POST /v1/operator/arrival-proofs", server.issueArrivalProof)
 	mux.HandleFunc("GET /v1/operator/arrivals", server.operatorArrivals)
+	mux.HandleFunc("GET /v1/operator/status", server.operatorStatus)
+	mux.HandleFunc("POST /v1/operator/fallback", server.setFallback)
+	mux.HandleFunc("DELETE /v1/operator/fallback", server.setFallback)
+	mux.HandleFunc("POST /v1/operator/registration/close", server.closeRegistration)
+	mux.HandleFunc("POST /v1/operator/notifications/stop", server.stopNotifications)
 	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/skip", server.operatorSkipArrival)
 	mux.HandleFunc("POST /v1/operator/display-tokens", server.issueDisplayToken)
 	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/retry", server.operatorRetryArrival)
@@ -92,12 +102,20 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", requestID)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		if (strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/v2/")) && s.cfg.EdgeSharedSecret != "" &&
+		// These two routes authenticate the display browser directly; never
+		// distribute the participant Worker secret to a browser.
+		directDisplay := r.URL.Path == "/v1/operator/display-tokens" || r.URL.Path == "/v1/display/ws"
+		if !directDisplay && (strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/v2/")) && s.cfg.EdgeSharedSecret != "" &&
 			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Trace-Edge-Secret")), []byte(s.cfg.EdgeSharedSecret)) != 1 {
 			s.writeError(w, requestID, &apiError{Code: "EDGE_ACCESS_DENIED", Message: "access denied", Status: http.StatusForbidden})
 			return
 		}
-		if origin := r.Header.Get("Origin"); origin != "" && s.originAllowed(origin) {
+		origin := r.Header.Get("Origin")
+		allowedOrigin := s.originAllowed(origin)
+		if directDisplay {
+			allowedOrigin = s.displayOriginAllowed(origin) && len(r.Header.Values("Origin")) == 1
+		}
+		if origin != "" && allowedOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Trace-Live-Token")
@@ -105,7 +123,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 		}
 		if r.Method == http.MethodOptions {
-			if origin := r.Header.Get("Origin"); origin != "" && !s.originAllowed(origin) {
+			if (origin != "" || directDisplay) && !allowedOrigin {
 				s.writeError(w, requestID, &apiError{Code: "ORIGIN_NOT_ALLOWED", Message: "origin is not allowed", Status: http.StatusForbidden})
 				return
 			}
@@ -162,9 +180,27 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) publicConfig(w http.ResponseWriter, r *http.Request) {
+	registrationOpen := s.cfg.RegistrationOpen
+	if registrationOpen {
+		closed, err := s.store.RegistrationClosed(r.Context())
+		if err != nil {
+			s.writeStoreError(w, r, err)
+			return
+		}
+		registrationOpen = !closed
+	}
 	vapidPublicKey := ""
-	if s.cfg.PushEnabled && s.push != nil {
+	pushEnabled := s.cfg.PushEnabled && s.push != nil
+	if pushEnabled {
+		stopped, err := s.store.PushStopped(r.Context())
+		if err != nil {
+			s.writeStoreError(w, r, err)
+			return
+		}
+		pushEnabled = !stopped
+	}
+	if pushEnabled {
 		vapidPublicKey = s.cfg.PushVAPIDPublicKey
 	}
 	var photoConfig map[string]any
@@ -186,7 +222,7 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	response := map[string]any{
-		"registrationOpen":    s.cfg.RegistrationOpen,
+		"registrationOpen":    registrationOpen,
 		"livePresenceEnabled": false,
 		"consent": map[string]any{
 			"version":  s.cfg.MemoryConsentVersion,
@@ -204,7 +240,7 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 		},
 		"photo": photoConfig,
 		"notification": map[string]any{
-			"enabled":                 s.cfg.PushEnabled && s.push != nil,
+			"enabled":                 pushEnabled,
 			"defaultIntervalMinutes":  30,
 			"allowedIntervalsMinutes": []int{30},
 			"exactDeliveryGuaranteed": false,
@@ -271,8 +307,7 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		value.PhotoMode = store.PhotoModeDevice
 	}
 	if err := s.store.CreateExperience(r.Context(), value); err != nil {
-		slog.Error("create experience", "requestId", requestID(r), "error", err)
-		s.writeError(w, requestID(r), internalError())
+		s.writeStoreError(w, r, err)
 		return
 	}
 	response := map[string]any{
@@ -575,6 +610,13 @@ func (s *Server) saveIdempotency(r *http.Request, scope string, requestBody []by
 
 func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, store.ErrPushStopped):
+		s.writeError(w, requestID(r), &apiError{Code: "PUSH_UNAVAILABLE", Message: "notifications are unavailable", Status: http.StatusServiceUnavailable})
+	case errors.Is(err, store.ErrRegistrationClosed):
+		s.writeError(w, requestID(r), &apiError{Code: "REGISTRATION_CLOSED", Message: "registration is closed", Status: http.StatusServiceUnavailable})
+	case errors.Is(err, store.ErrArrivalQueueFull):
+		w.Header().Set("Retry-After", "5")
+		s.writeError(w, requestID(r), &apiError{Code: "ARRIVAL_QUEUE_FULL", Message: "arrival queue is full; retry after space becomes available", Status: http.StatusServiceUnavailable})
 	case errors.Is(err, store.ErrNotFound):
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_FOUND", Message: "resource was not found", Status: http.StatusNotFound})
 	case errors.Is(err, store.ErrConflict):

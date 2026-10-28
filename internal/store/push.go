@@ -21,6 +21,9 @@ func (s *Store) PutPush(ctx context.Context, p PushSubscription, now time.Time) 
 		return PushSubscription{}, ErrConflict
 	}
 	err := s.Transaction(ctx, p.MemorySessionID, func(tx *Store) error {
+		if err := tx.lockPushControl(ctx); err != nil {
+			return err
+		}
 		expires, err := tx.pushEligible(ctx, p.MemorySessionID, now)
 		if err != nil {
 			return err
@@ -67,6 +70,9 @@ func (s *Store) PatchPush(ctx context.Context, id string, interval *int, status 
 	}
 	var p PushSubscription
 	err := s.Transaction(ctx, id, func(tx *Store) error {
+		if err := tx.lockPushControl(ctx); err != nil {
+			return err
+		}
 		if _, err := tx.pushEligible(ctx, id, now); err != nil {
 			return err
 		}
@@ -148,7 +154,10 @@ func (s *Store) DeletePush(ctx context.Context, id string) error {
 }
 
 func (s *Store) DuePushIDs(ctx context.Context, now time.Time, limit int) ([]string, error) {
-	rows, err := s.q.QueryContext(ctx, `SELECT memory_session_id FROM push_subscriptions WHERE status='active' AND next_send_at<=$1 ORDER BY next_send_at LIMIT $2`, now, limit)
+	rows, err := s.q.QueryContext(ctx, `SELECT memory_session_id FROM push_subscriptions
+ WHERE status='active' AND next_send_at<=$1
+ AND (SELECT stopped_at IS NULL FROM notification_control WHERE singleton=TRUE)
+ ORDER BY next_send_at LIMIT $2`, now, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -164,12 +173,18 @@ func (s *Store) DuePushIDs(ctx context.Context, now time.Time, limit int) ([]str
 	return ids, rows.Err()
 }
 
-// DeliverPush holds the per-session transaction lock through the provider response.
-// Stops, deletion and photo completion cannot race a send once acquired. A
-// provider-accepted request followed by a database failure can be retried;
-// exactly-once delivery cannot be guaranteed by Web Push.
+// DeliverPush holds the notification-control and per-session transaction locks
+// through the provider response. Stops, deletion and photo completion cannot race
+// a send once acquired. A provider-accepted request followed by a database failure
+// can be retried; exactly-once delivery cannot be guaranteed by Web Push.
 func (s *Store) DeliverPush(ctx context.Context, id string, now time.Time, send func(PushSubscription) (int, error)) error {
 	return s.Transaction(ctx, id, func(tx *Store) error {
+		if err := tx.lockPushControl(ctx); err != nil {
+			if errors.Is(err, ErrPushStopped) {
+				return nil
+			}
+			return err
+		}
 		expires, err := tx.pushEligible(ctx, id, now)
 		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
 			return tx.StopPushForMemory(ctx, id)
