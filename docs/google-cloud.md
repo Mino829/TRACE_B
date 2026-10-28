@@ -111,7 +111,7 @@ bash deploy/gcp/deploy.sh serve
 
 `/health/ready`を起動確認、`/health/live`を死活確認に使用します。DB障害だけでAPIを再起動し続けないよう、livenessはDBへ問い合わせません。
 
-任意の描画WSは`TRACE_DISPLAY_ENABLED=false`のまま配備し、承認後に`007_display.sql`のmigration、`runtime-grants.sql`、安全なrenderer用の外向き専用HTTPS/WSS入口を用意します。鍵は参加者・到着運営・Edgeと独立した32バイト以上のSecret Manager版で、`settings.env`の`GCP_DISPLAY_ISSUER_SECRET`/`GCP_DISPLAY_TOKEN_SECRET`に**版名だけ**を指定し、APIにだけ注入します。実行サービスアカウントのAccessor権限を対象Secretに限定してください。`runtime.env.yaml`の`TRACE_DISPLAY_ENABLED=true`で有効化します。参加者Workerからの描画/運営経路転送は拒否し、署名付き資格の発行は運営の別入口から行います。
+任意の描画WSは`TRACE_DISPLAY_ENABLED=false`のまま配備し、承認後に最新migration、`runtime-grants.sql`、ブラウザから直接到達できる専用HTTPS/WSS入口を用意します。Google OAuth WebクライアントID、許可するGmail/Workspaceメール、展示ページOriginを`TRACE_DISPLAY_GOOGLE_CLIENT_ID`/`TRACE_DISPLAY_OPERATOR_EMAILS`/`TRACE_DISPLAY_ALLOWED_ORIGINS`へ設定します。Google OAuthの許可JavaScript Originにも同じ展示Originを登録してください。到着・Edgeとは独立した32バイト以上の署名鍵をSecret Managerに置き、`settings.env`の`GCP_DISPLAY_TOKEN_SECRET`に数値版参照だけを書いてAPIへ注入します。旧描画issuer鍵は不要です。実行サービスアカウントのAccessor権限は対象Secretだけに限定します。発行はGoogle IDトークン、WSは最初の`renderer.authenticate`で描画資格と版を検証します。仕様・失効の制約は[README](../README.md#描画websocket既定無効)を参照してください。該当2経路だけEdge secretを免除しますが、IAM保護を迂回するものではありません。実Googleログイン・許可外資格拒否・Frontend再接続・承認済み公開経路の検証後にのみ有効化を検討し、参加者Workerへ描画/運営経路や鍵を渡さないでください。
 
 `deploy.sh serve`は描画有効/無効にかかわらずCloud Runリクエスト上限を3600秒へ設定します。WS本体は50分で終了、10秒ping/pong、30秒無応答切断。HTTP 10秒middleware期限はWS upgradeへ適用しません。Cloud Run timeout/instance replacement後はrendererが短期資格を再取得し、指数バックオフで新snapshotへ再接続します。上限の長い接続は請求とconcurrency枠を消費するため、現場60人規模の実負荷で検証してください。WebSocket経路をCloudflare Workerの参加者用proxyへ流さず、HTTPS upgrade透過・権限・秘密ヘッダー非記録を運営経路で確認してください。変更しても既存stagingへのデプロイを意味しません。
 

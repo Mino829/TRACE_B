@@ -92,7 +92,8 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
 | Web Push購読・変更・解除 | Memory参加トークンごとに10回/分・burst 10 |
 | 到着proof発行・候補照会・運営skip | 有効な運営署名の要求を全体で1回/秒・burst 10 |
-| 描画token発行 | 有効な発行署名の要求を全体で1回/秒・burst 10 |
+| 描画token発行（不正資格を含む） | 接続元IPごとに12回/分・burst 5、全体1回/秒・burst 10 |
+| 描画WS接続試行（認証前） | 接続元IPごとに1回/秒・burst 10、全体10回/秒・burst 20 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
 
 超過時は`429 RATE_LIMITED`と秒数の`Retry-After`を返し、その間は送信を止めて再試行します。失敗要求も制限対象です。新`/v2`の写真POSTは6回/分、本人GET/DELETEは一般のセッション操作枠30回/分を使います。Pushの購読・変更・解除は別の10回/分枠です。描画WSは1接続あたり10メッセージ/秒、各256KiBで制限します。
@@ -134,15 +135,34 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 ## 描画WebSocket（既定無効）
 
-`TRACE_DISPLAY_ENABLED=false`が既定です。有効化するには参加者・到着運営・Edgeとは異なる32バイト以上の`TRACE_DISPLAY_ISSUER_KEY`と`TRACE_DISPLAY_TOKEN_KEY`が必須です。写真の有無を問わず起動時に座標/CampusGraph/3D Map版を埋め込みCampusGraphと照合し、既定の未審査bundleとは不一致なら起動を拒否します。秘密値はSecret Managerで個別管理し、署名鍵をローテーションすると既発行資格を即時失効します。描画PCが外向きHTTPS/WSSでアクセスする**承認済み専用経路**を用意してください。参加者サイトWorkerは`/v1/display/*`と`/v1/operator/*`を転送しないでください。Edge共有シークレットが有効なら承認済み経路から`X-Trace-Edge-Secret`も送ります。WSSトークンをURL、ブラウザ、ログ、写真やQRへ載せないでください。
+`TRACE_DISPLAY_ENABLED=false`が既定です。有効化にはGoogle OAuthのWebクライアントID（`TRACE_DISPLAY_GOOGLE_CLIENT_ID`）、運営者のメールアドレス許可リスト（`TRACE_DISPLAY_OPERATOR_EMAILS`）、展示ページの専用Origin許可リスト（`TRACE_DISPLAY_ALLOWED_ORIGINS`）と、到着・Edgeから独立した32バイト以上の`TRACE_DISPLAY_TOKEN_KEY`が必要です。リストはカンマ区切り・完全一致で、wildcardは認めません。OriginはHTTPS、開発時のみ`http://localhost:<port>`/`http://127.0.0.1:<port>`を許可します。署名鍵はSecret Managerに置き、ブラウザやWorkerへ渡しません。座標/CampusGraph/3D Map版は埋め込みGraphと照合します。Google OAuthの許可JavaScript Originにも展示ページのOriginを登録してください。
 
-運営の専用発行器から空bodyの`POST /v1/operator/display-tokens`へ、`X-Trace-Display-Issuer-Timestamp: <Unix秒>`と`X-Trace-Display-Issuer-Signature: base64url(HMAC-SHA256(TRACE_DISPLAY_ISSUER_KEY, \"POST\\n/v1/operator/display-tokens\\n\" + timestamp))`を送ります（時差最大15秒）。レスポンス`displayToken`は2分有効で、参加者Bearer/到着運営署名と互換性がありません。`GET /v1/display/ws`へ`Authorization: Bearer <displayToken>`、`X-Trace-Schema-Version: 1`、`X-Trace-Coordinate-Version`、`X-Trace-Campus-Graph-Version`、`X-Trace-Three-D-Map-Version`（現行設定と完全一致）を付け、Origin・query stringは付けません。不一致はHTTP 409、資格エラーは401、機能無効は503です。
+展示ブラウザはGoogleログインで得たIDトークンを`Authorization: Bearer <Google ID token>`へ設定し、Backendへ直接、空bodyの`POST /v1/operator/display-tokens`を送ります。Googleの署名・audience・issuer・期限・発行時刻・sub・`email_verified`・存在する場合の`azp`を検証し、許可メールだけにOrigin束縛の2分有効な`displayToken`と`expiresAt`を返します。メールはGmail、またはGoogleが管理するWorkspace（署名済み`hd`あり）に限定します。任意の外部メールを登録しただけのGoogleアカウントは、Googleが現在のメール所有者を保証しないため拒否します（[Googleの検証指針](https://developers.google.com/identity/sign-in/web/backend-auth)）。旧HMAC発行とnative rendererの独自HTTPヘッダー接続は廃止しました。参加者資格・描画資格では発行できません。
 
-WS接続直後の`display.snapshot`は`data.cursor`と再生待ち/再生中の`arrivals`を含みます。到着・再生イベントの`eventId`はDB連番で、欠番や再接続時はsnapshotで全置換します。`participant.arrived`とsnapshotの各`arrivals`には端末内写真の`pathNodeIds`、撮影順の`photoCheckpoints`（`checkpointId`と`capturedAt`のみ）、`replayDurationSeconds`を含めます。到着後の`photo.moment.created/deleted`は同じ到着の**更新後の全経路と写真地点**を送るため、同じ地点・撮影時刻の写真が複数でも描画機は`arrivalId`で丸ごと置換できます。到着前の写真変更は描画へ流さず、最初の到着イベントで現在値を渡します。保存Graph版が現行版と合わない、経路が途切れる場合は経路を空にし、旧GPS写真を新しい端末内経路へ混ぜません。旧`position.updated/expired`、`tracking.stopped`、Live位相イベントは廃止し、snapshotの`participants`も返しません。画像、写真URL、PhotoMoment ID、MemorySession ID、旧位置、生GPS、LivePresence ID、色・記号による照合情報、参加者資格は描画へ含みません。映像へ正確な時刻やIDを表示しないでください。
+ブラウザは`new WebSocket("wss://<backend>/v1/display/ws")`で直接接続し、5秒以内に次の**最初のテキストメッセージ**を送ります。版は配備済みbundleと完全一致させます。資格をURL・query・subprotocol・ログ・写真・QRへ載せず、Google IDトークンと描画トークンはブラウザメモリ内だけで保持してください。
+
+```json
+{
+  "schemaVersion": 1,
+  "type": "renderer.authenticate",
+  "displayToken": "<issued-display-token>",
+  "coordinateVersion": "campus-2026-01",
+  "campusGraphVersion": "graph-2026-01",
+  "threeDMapVersion": "map-2026-01"
+}
+```
+
+認証前はsnapshot・差分・リースを渡しません。認証メッセージは16KiBまで、資格不正・認証未送信はclose 4401、版不一致は4409、サイズ超過は1009で切断します。Originなし・許可外Origin・query・旧Authorizationヘッダー付きWS接続はHTTP 403です。発行の資格不正は401、機能無効は503、レート超過は429/`Retry-After`です。接続前にHTTP認証が済んだと扱わず、最初のsnapshot受信を認証成功として扱ってください。
+
+この2経路だけはブラウザ向け認証を行うためEdge共有secretを要求せず、専用OriginでCORSを返します。参加者の`/v1`・`/v2`とその他の運営APIは引き続きEdge保護の対象です。サイトWorkerは描画・運営経路を中継しません。Cloud Run IAMは別の境界であり、この実装ではIAM非公開サービスへ直接接続できません。承認済み到達経路・OAuth設定・Frontendログイン/更新・実Googleログイン・実機の8時間再接続試験が済むまで本番公開しないでください。
+
+再接続では有効なGoogle IDトークンから新しい描画トークンを発行し直します。Googleの資格が期限切れならGoogle側の再認証が必要です。許可リスト更新後に旧APIを停止・置換すると新規発行を拒否しますが、発行済み資格は最大2分、認証済み接続は最大50分残り得ます。緊急失効は受付/描画を停止し、署名鍵のローテーションと旧API/revision・既存接続の停止を組み合わせてください。接続中の個別強制失効APIは提供しません。
+
+認証成功後の最初の`display.snapshot`は`data.cursor`と再生待ち/再生中の`arrivals`を含みます。到着・再生イベントの`eventId`はDB連番で、欠番や再接続時はsnapshotで全置換します。`participant.arrived`とsnapshotの各`arrivals`には端末内写真の`pathNodeIds`、撮影順の`photoCheckpoints`（`checkpointId`と`capturedAt`のみ）、`replayDurationSeconds`を含めます。到着後の`photo.moment.created/deleted`は同じ到着の**更新後の全経路と写真地点**を送るため、同じ地点・撮影時刻の写真が複数でも描画機は`arrivalId`で丸ごと置換できます。到着前の写真変更は描画へ流さず、最初の到着イベントで現在値を渡します。保存Graph版が現行版と合わない、経路が途切れる場合は経路を空にし、旧GPS写真を新しい端末内経路へ混ぜません。旧`position.updated/expired`、`tracking.stopped`、Live位相イベントは廃止し、snapshotの`participants`も返しません。画像、写真URL、PhotoMoment ID、MemorySession ID、旧位置、生GPS、LivePresence ID、色・記号による照合情報、参加者資格は描画へ含みません。映像へ正確な時刻やIDを表示しないでください。
 
 送信JSONはすべて`schemaVersion:1`、3種のversion、`type`を含めます。`renderer.primary.acquire`で主リースを要求し、`renderer.primary.granted`の`data.leaseId`を保存します。他接続には`renderer.primary.conflict`を返します。`arrival.replay.started`、`arrival.replay.completed`、`arrival.replay.failed`にはクライアント生成の一意な`eventId`（8～128文字）、`arrivalId`、`leaseId`を指定します。成功は`renderer.ack`、競合・失効は`renderer.rejected`です。同じeventId・同じ操作の再送は24時間同じ結果となり、異なる内容は拒否します。切断/30秒heartbeat欠落/リース期限切れは再生中を`skipped`に確定し、別端末による自動再生はしません。運営の署名済み明示retryのみが再投入できます。10秒間隔のping/pong（または`renderer.heartbeat`）と30秒応答期限を設け、50分でWSを終了します。Cloud Run設定は3600秒で、クライアント側は切断時に指数バックオフで**新しい資格を取得し**snapshotから再接続します。
 
-旧LiveSessionで受け付けた最新位置は本人照会のため単一BackendのGoメモリにTTLまで保持し、停止・削除時に消去します。新規位置は受け付けず、描画WSへも投影しません。到着・再生イベントと主描画機leaseはDBに保存します。Backendの最大インスタンス数は1のままにし、DB migration `007_display.sql`と`deploy/gcp/runtime-grants.sql`を適用してください。設計`docs/api.md`の`participant.arrived` JSON例には`sessionId`と`photoMomentId`が残っていますが、同資料の公開情報制限および`docs/privacy.md`の禁止に従い描画へ送信しません。設計例の修正とFrontendでの直接WSS認証・描画統合は別途必要です。
+旧LiveSessionで受け付けた最新位置は本人照会のため単一BackendのGoメモリにTTLまで保持し、停止・削除時に消去します。新規位置は受け付けず、描画WSへも投影しません。到着・再生イベントと主描画機leaseはDBに保存します。Backendの最大インスタンス数は1のままにし、最新migrationと`deploy/gcp/runtime-grants.sql`を適用してください。今回の認証切替に追加migrationはありません。設計の公開情報制限に合わせ、描画へ`sessionId`と`photoMomentId`は送信しません。FrontendでのGoogleログイン・資格更新・直接WSSと再生の統合は別途必要です。
 
 ## 旧クラウド写真の設定とライフサイクル
 

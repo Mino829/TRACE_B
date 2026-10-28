@@ -7,7 +7,7 @@
 
 ## 認証境界
 
-サイトWorkerは許可した`/api/backend/*`だけをGoの`/v1/*`や新`/v2/*`へ転送し、`X-Trace-Edge-Secret`を追加する。Goは`TRACE_EDGE_SHARED_SECRET`が設定されている場合、両版のすべてのAPIで一致を要求する。値が未設定なら既存のAPI動作を維持するため、**公開用Cloud RunではSecret Managerから設定することが必須**。32バイト未満の値では起動を拒否する。Worker側で`/v2`を許可・転送する改修はこのBackend PRに含まれず、Frontend側の接続まで一般公開できない。
+サイトWorkerは許可した`/api/backend/*`だけをGoの`/v1/*`や新`/v2/*`へ転送し、`X-Trace-Edge-Secret`を追加する。Goは`TRACE_EDGE_SHARED_SECRET`が設定されている場合、参加者APIと運営APIで一致を要求する。例外は直接ブラウザ認証を行う`/v1/operator/display-tokens`と`/v1/display/ws`の2経路だけで、専用Origin許可リストとGoogle/描画資格を別途検証する（[描画契約](../README.md#描画websocket既定無効)）。値が未設定なら既存のAPI動作を維持するため、**公開用Cloud RunではSecret Managerから設定することが必須**。32バイト未満の値では起動を拒否する。Worker側で`/v2`を許可・転送する改修はこのBackend PRに含まれず、Frontend側の接続まで一般公開できない。
 
 これはWorkerとGoの間のアクセス制限であり、参加者のBearer token、CORS、受付停止、レート制限の代わりにはならない。WorkerはCloudflareが付与した`CF-Connecting-IP`の有効なIPだけを`X-Trace-Client-IP`としてGoへ送り、ブラウザからの`X-Forwarded-For`や同名ヘッダーは破棄する。Goは共有シークレット一致時だけ単一のIPv4/IPv6を制限単位に使い、欠落・不正・複数の同名ヘッダー・IPv6 zone付きなら接続元IPへ戻す。シークレットを設定しない直接到達モードでは転送ヘッダーを一切信用しない。`/health/live`と`/health/ready`はこのヘッダーを要求しない。Workerのsecretをブラウザへ渡さず、Goもヘッダー値をログへ出さない。
 

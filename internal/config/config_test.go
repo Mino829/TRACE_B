@@ -14,7 +14,7 @@ func baseEnv(t *testing.T) {
 	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_METADATA_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
 		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY",
 		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID",
-		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_ISSUER_KEY", "TRACE_DISPLAY_TOKEN_KEY"} {
+		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_GOOGLE_CLIENT_ID", "TRACE_DISPLAY_OPERATOR_EMAILS", "TRACE_DISPLAY_ALLOWED_ORIGINS", "TRACE_DISPLAY_TOKEN_KEY"} {
 		t.Setenv(key, "")
 	}
 	for _, key := range []string{"TRACE_COORDINATE_VERSION", "TRACE_CAMPUS_GRAPH_VERSION", "TRACE_THREE_D_MAP_VERSION"} {
@@ -210,35 +210,75 @@ func TestArrivalIssuerAndProofKeysStaySeparateAndDisabledByDefault(t *testing.T)
 	}
 }
 
-func TestDisplayCredentialsAreOptionalAndSeparated(t *testing.T) {
+func displayEnv(t *testing.T) {
+	t.Helper()
+	baseEnv(t)
+	t.Setenv("TRACE_DISPLAY_ENABLED", "true")
+	t.Setenv("TRACE_DISPLAY_GOOGLE_CLIENT_ID", "123456789-testwebclient.apps.googleusercontent.com")
+	t.Setenv("TRACE_DISPLAY_OPERATOR_EMAILS", " Operator@Example.com , second@example.org ")
+	t.Setenv("TRACE_DISPLAY_ALLOWED_ORIGINS", "https://display.example.com, http://localhost:3000,http://127.0.0.1:5173")
+	t.Setenv("TRACE_DISPLAY_TOKEN_KEY", "independent-display-token-secret-5678")
+}
+
+func TestDisplayGoogleConfigurationIsExplicitAndKeysStaySeparate(t *testing.T) {
 	baseEnv(t)
 	cfg, err := FromEnv()
 	if err != nil || cfg.DisplayEnabled {
 		t.Fatalf("display must default disabled: %v", err)
 	}
-	t.Setenv("TRACE_DISPLAY_ENABLED", "true")
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("display without secrets accepted")
-	}
-	issuer := "independent-display-issuer-secret-1234"
-	token := "independent-display-token-secret-5678"
-	t.Setenv("TRACE_DISPLAY_ISSUER_KEY", issuer)
-	t.Setenv("TRACE_DISPLAY_TOKEN_KEY", issuer)
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("reused display signing key accepted")
-	}
-	t.Setenv("TRACE_DISPLAY_TOKEN_KEY", token)
+	displayEnv(t)
 	cfg, err = FromEnv()
 	if err != nil || !cfg.DisplayEnabled {
-		t.Fatalf("independent keys refused: %v", err)
+		t.Fatalf("valid Google display configuration rejected: %v", err)
 	}
-	t.Setenv("TRACE_EDGE_SHARED_SECRET", issuer)
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("edge key reused for display issuer")
+	if strings.Join(cfg.DisplayOperatorEmails, ",") != "operator@example.com,second@example.org" ||
+		len(cfg.DisplayAllowedOrigins) != 3 || cfg.DisplayAllowedOrigins[1] != "http://localhost:3000" {
+		t.Fatalf("display configuration was not normalized: %+v", cfg.DisplayOperatorEmails)
 	}
-	t.Setenv("TRACE_EDGE_SHARED_SECRET", "")
-	t.Setenv("TRACE_ARRIVAL_ISSUER_KEY", token)
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("arrival issuer key reused for display signing")
+	for _, key := range []string{"TRACE_EDGE_SHARED_SECRET", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY"} {
+		t.Run(key, func(t *testing.T) {
+			displayEnv(t)
+			t.Setenv(key, cfg.DisplayTokenKey)
+			if _, err := FromEnv(); err == nil {
+				t.Fatal("display signing key reused for another credential")
+			}
+		})
+	}
+}
+
+func TestDisplayRejectsMissingOrInvalidGoogleConfiguration(t *testing.T) {
+	for _, tt := range []struct{ key, value string }{
+		{"TRACE_DISPLAY_GOOGLE_CLIENT_ID", ""},
+		{"TRACE_DISPLAY_GOOGLE_CLIENT_ID", "not-a-google-client"},
+		{"TRACE_DISPLAY_GOOGLE_CLIENT_ID", "123-secret.apps.googleusercontent.com/"},
+		{"TRACE_DISPLAY_OPERATOR_EMAILS", ""},
+		{"TRACE_DISPLAY_OPERATOR_EMAILS", "*@example.com"},
+		{"TRACE_DISPLAY_OPERATOR_EMAILS", "Operator <operator@example.com>"},
+		{"TRACE_DISPLAY_OPERATOR_EMAILS", "operator@example.com,"},
+		{"TRACE_DISPLAY_OPERATOR_EMAILS", "operator@-example.com"},
+		{"TRACE_DISPLAY_OPERATOR_EMAILS", "operator..name@example.com"},
+		{"TRACE_DISPLAY_OPERATOR_EMAILS", "operator@example.com\nother@example.com"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", ""},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "*"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "https://*.example.com"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "https://display.example.com/"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "https://display.example.com?"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "https://display.example.com#"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "https://user@display.example.com"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "http://display.example.com"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "http://localhost.evil.example:3000"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "https://display.example.com:70000"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "https://display.example.com,"},
+		{"TRACE_DISPLAY_ALLOWED_ORIGINS", "null"},
+		{"TRACE_DISPLAY_TOKEN_KEY", ""},
+		{"TRACE_DISPLAY_TOKEN_KEY", "too-short"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			displayEnv(t)
+			t.Setenv(tt.key, tt.value)
+			if _, err := FromEnv(); err == nil {
+				t.Fatal("invalid display configuration accepted")
+			}
+		})
 	}
 }
