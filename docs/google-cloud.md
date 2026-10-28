@@ -53,6 +53,12 @@ psqlの`\password trace_owner`と`\password trace_app`でパスワードを対�
 マイグレーションは所有者ユーザー、API・清掃ジョブはアプリユーザーで実行します。初回と以降のschema migration後には`trace_owner`として`deploy/gcp/runtime-grants.sql`を実行してください。新しいruntimeテーブルを追加した場合は、このファイルへ必要なテーブル権限を個別に追記し、`trace_app`でアクセスを確認してから新アプリを配信します。
 アプリユーザーにDDL権限がなくても、API・清掃・readinessは動作します。readinessはDBへの接続だけでなく、埋め込みmigrationと適用済み連番の一致も確認します（個別テーブルの権限試験は別途必要）。
 
+`014_registration_control.sql`は運営による新規参加停止を永続化します。環境設定で受付停止→旧API/清掃revision停止→バックアップ→明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順に更新し、実行ユーザーで公開設定と非公開`GET /v1/operator/status`を確認してください。`POST /v1/operator/registration/close`の署名・応答・監査は[Backend README](../README.md#新規参加受付の停止)を参照してください。停止は再起動で解除されず、既存参加者の写真・到着・削除や期限清掃は維持します。個人別運営権限・再開API・本番運営入口の承認はこの追加に含みません。
+
+`015_notification_control.sql`は運営による全撮影通知停止を永続化します。参加受付とPushを環境設定で無効化し、旧API/清掃revision停止→バックアップ→明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順に更新します。実行ユーザーでready・公開設定・非公開statusを確認してください。停止APIの認証・監査・送信中要求との順序付けは[全撮影通知の停止](../README.md#全撮影通知の停止)を参照してください。停止は全購読のendpoint・鍵・予定を削除し、再起動後も購読・送信を禁止します。既にproviderが受理した通知は取り消せません。通知再開APIと個人別運営権限は対象外です。
+
+`016_display_fallback.sql`は運営の通常/切替待ち/fallbackモードと30秒の固定期限を永続化します。受付・描画を無効化し、旧API/清掃revision停止→バックアップ→未適用の014・015・016を番号順に明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順で更新してください。`trace_app`には制御行のSELECT/UPDATEだけを付与し、readyと非公開statusを確認します。対応するFrontendの合成表示とsnapshot全置換を結合し、再生中30秒期限・待機保持・明示復帰・再起動で解除されないことをstagingで確認するまで描画を公開しません。認証・API・イベントは[運営によるfallback切替と復帰](../README.md#運営によるfallback切替と復帰)を参照してください。
+
 ## 4. 設定とビルド
 
 リポジトリルートで次のテンプレートをコピーして値を埋めます。
