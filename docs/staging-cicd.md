@@ -1,37 +1,40 @@
 # 検証環境の自動デプロイ（GitHub Actions → Cloud Build → Cloud Run）
 
-対象は `Mino829/TRACE_B` の `main` と `trace-staging-507216` だけです。本番には使いません。
-ファイルの追加だけでは自動デプロイは有効になりません。下記のクラウド側設定とGitHubの有効化が必要です。
+対象は`Mino829/TRACE_B`の`main`、`trace-staging-async5855`の既存`trace-backend-preview`だけです。停止受付のstaging用でproductionには使いません。
+このPRではCloud設定やGitHub variables/secretsを変更せず、自動デプロイも有効化しません。実配備・IAM/WIF設定は別途承認後に行います。
 Cloud Buildのpushトリガーは作りません。既存Actionsのテストと別トリガーを並行起動すると、テスト結果を待たずに配信してしまうためです。
 
 ## 1. 自動化する範囲
 
 1. push / PRで既存のPostgreSQL統合テスト、vet、ビルドとデプロイ処理のオフラインテストを実行。
 2. `main`へのpushかつテスト成功時のみ、`STAGING_DEPLOY_ENABLED=true`ならデプロイへ進む。
-3. 古いコミット、DB構造変更、公開設定、受付開始、想定外のDBユーザー等を検出したら停止。認証なしの実際のHTTP呼び出しが拒否されることも確認する。
+3. 古いコミット、DB構造/権限変更、private側の再稼働、未知のrevisionタグ、想定外の実行SA・DB資格・feature有効化を検出したら停止。既存public-invoker＋Edge境界を維持する。
 4. Cloud Build専用アカウントでイメージを作成。SHA＋実行ID＋再試行番号の一意タグを使い、配信はdigestで固定。
 5. 現在の環境変数・Secret参照・サービスアカウント・CPU等を保持し、APIのイメージだけ更新。最初は既存APIへのトラフィックを維持する。
-6. 一時タグ付きURLへ認証して `/health/ready`、`registrationOpen=false`、`livePresenceEnabled=false` を確認。
+6. 一時タグ付きURLで、Edgeなしconfigの403と正しいEdgeでのready・受付停止・GPS無効・写真/Push無効・同一bundleを確認。
 7. 削除ジョブのイメージを更新して実行し、成功を待つ。
 8. APIのトラフィックを候補リビジョンへ100%切り替え、通常URLでも確認。
 9. 候補検証または切替前の失敗では、旧トラフィックを維持しジョブのイメージを復旧する。切替後の失敗では旧revisionのGPS受付を復活させず、候補revisionと新ジョブを保持して受付停止のまま修正版で復旧する。並行する手動変更は上書きせず、復旧が失敗した場合もActionsを失敗にする。
 
 長期利用のサービスアカウント鍵やDBパスワードをGitHubに保存しません。Workload Identity Federation（WIF）で認証します。
 最大1時間の短期アクセストークンをrunnerの一時領域に置き、Cloud Buildへのソース送信から分離します。認証ファイルの除外設定も追加しています。
-呼び出し用IDトークンは候補確認時と切替直前に別途取得します。タグ付きURLへ呼ぶ場合も、audienceは通常のサービスURLです。
+HTTP probeにGoogle IDトークンは不要です。既存previewはIAM public-invokerで、GoのEdge secretが参加APIを保護します。WIFの短期access tokenは管理API専用です。
 
 注意：候補APIも起動時・常駐の期限削除を実行し、削除ジョブの試験も実データへ作用します。「トラフィックなし」は「DB書き込みなし」ではありません。
 ロールバックで、期限削除された行を復元したりDB構造を巻き戻したりはしません。
 
 ## 2. 作業前の確認
 
-- 初回手動デプロイ済みの `trace-backend`、`trace-cleanup` が存在すること。
-- 両方とも `trace-runtime`、DBユーザー `trace_app`、`trace-app-db-password` の数値バージョンを使用すること。
-- 受付はfalse。サービスのIAM認証は有効で、allUsers / allAuthenticatedUsersへのバインディングがないこと。
-- 現在のサービスが正常で、トラフィックが既存の1リビジョンへ100%向いていること。
-- `DATABASE_URL` は設定しないこと（DB_*設定を上書きするため）。
-- APIで`TRACE_EDGE_SHARED_SECRET`を有効にする場合はSecret Managerの数値版を参照し、同じ値をGitHub Actions Secret `STAGING_EDGE_SHARED_SECRET`へ設定すること。無効な場合はGitHub側も未設定にする。
-- `624ecc1bba4a7c61529b609a1110facf58d38746` は初回schema version 1だけの履歴上の基準であり、現行mainのmigration 002を適用済みという証拠にはならない。管理者が実DBの適用版・権限とAPI/清掃ジョブの互換性を確認するまで自動デプロイを有効にしない。
+- [手動移行手順](google-cloud.md#5-マイグレーション--権限付与--api)を実施し、連続schema001〜016とruntime権限、ready、清掃を実環境で確認すること。2026-10-28時点の実DBは003で、自動化の前提をまだ満たしません。
+- `trace-backend-preview`と`trace-cleanup`が同一immutable digestを使い、最新ready revisionへ100%配信すること。
+- APIは`trace-preview-runtime`、cleanupは`trace-runtime`。DBは`trace_app`、app-passwordは同じ数値版。所有者資格は渡さないこと。
+- `trace-backend`はmanual 0・反映完了・タグなし。2 APIを同時稼働させないこと。
+- previewはservice-level max1/min0、1 vCPU/512MiB、request-based CPU。revision max12でもservice max1で制限されるが、revision maxだけでは十分でないこと。
+- 受付・端末写真・旧写真upload・Push・到着・描画の各flagを明示falseにすること。常駐Push/描画の本番用CPU・最小台数をこの閉鎖profileで保証しないこと。
+- 既存のinvoker IAM checkと`allUsers:roles/run.invoker`を維持すること。CIはIAMを変更しないこと。
+- `DATABASE_URL`や旧`TRACE_SESSION_TTL`を設定せず、DB_*と3つのbundle版をAPI/cleanupで一致させること。
+- `TRACE_EDGE_SHARED_SECRET`は`trace-preview-edge-secret`の数値版、GitHub Secret `STAGING_EDGE_SHARED_SECRET`は同じ値であること。必須であり、未設定時の無保護互換はないこと。
+- 過去のschema001だけのSHAは現在の適用証拠ではない。mainのmergeだけでbaselineを進めないこと。
 
 以降は管理者がCloud Shellで実行する一度限りのセットアップです。リソース作成・権限付与・課金が発生します。
 同名リソースが既にある場合はまず内容を確認し、その作成コマンドだけ省略してください。削除して作り直したり、エラーを無視して次へ進んだりしないでください。
@@ -40,11 +43,12 @@ GitHubにpushする前は `STAGING_DEPLOY_ENABLED` を未設定またはfalseの
 ## 3. ビルド用・デプロイ用アカウントを用意する
 
 ```bash
-export TRACE_CI_PROJECT="trace-staging-507216"
+export TRACE_CI_PROJECT="trace-staging-async5855"
 export TRACE_CI_REGION="asia-northeast1"
 export TRACE_CI_BUILD_SA="trace-build@${TRACE_CI_PROJECT}.iam.gserviceaccount.com"
 export TRACE_CI_DEPLOY_SA="trace-github-deploy@${TRACE_CI_PROJECT}.iam.gserviceaccount.com"
-export TRACE_CI_RUNTIME_SA="trace-runtime@${TRACE_CI_PROJECT}.iam.gserviceaccount.com"
+export TRACE_CI_API_RUNTIME_SA="trace-preview-runtime@${TRACE_CI_PROJECT}.iam.gserviceaccount.com"
+export TRACE_CI_CLEANUP_RUNTIME_SA="trace-runtime@${TRACE_CI_PROJECT}.iam.gserviceaccount.com"
 export TRACE_CI_SOURCE_BUCKET="gs://${TRACE_CI_PROJECT}-github-build-source"
 
 gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
@@ -102,16 +106,20 @@ gcloud storage buckets add-iam-policy-binding "$TRACE_CI_SOURCE_BUCKET" \
 gcloud iam service-accounts add-iam-policy-binding "$TRACE_CI_BUILD_SA" \
   --project="$TRACE_CI_PROJECT" --member="serviceAccount:$TRACE_CI_DEPLOY_SA" \
   --role=roles/iam.serviceAccountUser
-gcloud iam service-accounts add-iam-policy-binding "$TRACE_CI_RUNTIME_SA" \
+gcloud iam service-accounts add-iam-policy-binding "$TRACE_CI_API_RUNTIME_SA" \
+  --project="$TRACE_CI_PROJECT" --member="serviceAccount:$TRACE_CI_DEPLOY_SA" \
+  --role=roles/iam.serviceAccountUser
+gcloud iam service-accounts add-iam-policy-binding "$TRACE_CI_CLEANUP_RUNTIME_SA" \
   --project="$TRACE_CI_PROJECT" --member="serviceAccount:$TRACE_CI_DEPLOY_SA" \
   --role=roles/iam.serviceAccountUser
 
-gcloud run services add-iam-policy-binding trace-backend \
+gcloud run services add-iam-policy-binding trace-backend-preview \
   --project="$TRACE_CI_PROJECT" --region="$TRACE_CI_REGION" \
   --member="serviceAccount:$TRACE_CI_DEPLOY_SA" --role=roles/run.developer
+# Read the stopped service only; do not give CI permission to restart it.
 gcloud run services add-iam-policy-binding trace-backend \
   --project="$TRACE_CI_PROJECT" --region="$TRACE_CI_REGION" \
-  --member="serviceAccount:$TRACE_CI_DEPLOY_SA" --role=roles/run.invoker
+  --member="serviceAccount:$TRACE_CI_DEPLOY_SA" --role=roles/run.viewer
 gcloud run jobs add-iam-policy-binding trace-cleanup \
   --project="$TRACE_CI_PROJECT" --region="$TRACE_CI_REGION" \
   --member="serviceAccount:$TRACE_CI_DEPLOY_SA" --role=roles/run.developer
@@ -169,90 +177,63 @@ GitHub Actionsの設定だけでなく、Google側でも特定リポジトリ・
 
 1. `Mino829/TRACE_B` → Settings → Secrets and variables → Actions → Variables を開く。
 2. Repository variable `GCP_WORKLOAD_IDENTITY_PROVIDER` に、上で控えたproviderのフル名を設定する。
-3. 初回手動配備の前後を通じて `STAGING_DEPLOY_ENABLED` は未設定または `false` に保つ。実DBのmigration 002と権限を確認し、未適用なら下記の非互換DB変更手順に従って旧API/清掃ジョブを停止してから手動適用する。現行schema対応版の起動・ready・清掃・復旧を確認する。
+3. `STAGING_DEPLOY_ENABLED`は未設定/falseに保ち、[manual rollout](google-cloud.md#5-マイグレーション--権限付与--api)で旧両API/Scheduler停止、停止後backup、004〜016、runtime-grants、preview/cleanup更新と権限・清掃・Edge/Worker疎通を実環境で検証する。
 4. 実DBへ適用・検証したschemaと権限に対応する **mainのフルコミットSHA** をRepository variable `STAGING_SCHEMA_BASELINE` に設定する。旧version 1のSHAやPRのSHAを、検証済みの代わりに設定しない。未設定・不正値ならCIはクラウド操作前に停止する。
 5. その状態でレビュー済みの変更をmainへpushし、`test`ジョブの成功を確認する。Repository variable `STAGING_DEPLOY_ENABLED` を文字列 `true` にするのは、手動配備の疎通とrollback確認が済んだ後だけにする。
 6. 現在のmainに対するpush実行を再実行するか、次のレビュー済み変更をmainへpushする。PR実行の再実行ではデプロイされない。
 7. Actionsの `Deploy staging after tests` が成功し、Summaryにコミット・digest・リビジョンが表示されることを確認する。
 8. Cloud Runの配信先がそのリビジョンであること、削除ジョブが同じdigestで動くことを確認する。
 
-`STAGING_SCHEMA_BASELINE` は常に明示設定が必要です。migration実装・SQL・権限SQLに変更がある場合は自動デプロイを止め、手動適用・権限・ready・旧版互換性を確認した後に限り、そのDB構造に対応するmainのフルコミットSHAへ更新します。コード変更をマージしただけではbaselineを進めません。写真のPR #18をマージした場合もmigration 003と権限を実DBで検証するまで同じ手順です。
+`STAGING_SCHEMA_BASELINE`は常に明示設定が必要です。migration実装・SQL・権限SQLに差分があれば、自動化停止→停止窓で手動適用→実権限・ready・互換性・復旧確認の後に、そのschemaに対応するmainのフルSHAへ更新します。現在の003を016適用済みとみなす設定、mergeだけのbaseline更新は禁止です。
 GitHub Environmentの有料プラン機能には依存していません。利用できる場合はmainの保護ルールとCIファイルへのレビュー要件を追加してください。
 依存Actionsは検証時のコミットSHAで固定しているため、更新はレビューして行います。
 
-### edge共有secretを有効にしたprobe
+### 必須のEdge共有secretによるprobe
 
 | 資格情報 | 役割 | CIでの扱い |
 |---|---|---|
-| WIFで取得する短期IDトークン | Cloud RunのIAM認証 | 候補・通常URLのhealth/configへAuthorizationヘッダーで送信 |
-| `STAGING_EDGE_SHARED_SECRET` | Goの`/v1/*`へのアクセス確認 | `TRACE_STAGING_EDGE_SHARED_SECRET`環境変数から読み、configだけへ`X-Trace-Edge-Secret`で送信 |
-| 参加者Bearer token | 個別セッションの操作 | 受付停止の配備probeでは使用しない |
+| WIFの短期access token | Cloud Build/Run管理API | runner一時領域のみ。APIの参加者Authorizationには送らない |
+| `STAGING_EDGE_SHARED_SECRET` | Goの参加APIへのWorker/CI認証 | 環境変数から取り出し`X-Trace-Edge-Secret`で送る。値をstate/output/Summaryへ保存しない |
+| 参加者Bearer / Google・描画資格 | 本人操作・展示 | 受付停止の配備probeでは使わない |
 
-Cloud Runの`TRACE_EDGE_SHARED_SECRET`は平文環境変数や`latest`ではなく、Secret Managerの数値版を参照させます。手動配備では`settings.env`の`GCP_EDGE_SHARED_SECRET`に数値版参照だけを設定し、`deploy.sh serve`のAPIへ注入します。無指定で再配備すると参照が外れるため、edge secret有効中は必ず維持してください。管理者は同じ値を **Repository Secret** `STAGING_EDGE_SHARED_SECRET`へ登録してください。Repository Variableへ値を置かず、コマンド引数・チャット・設定ファイルへ貼り付けないでください。CI用の値は32文字以上の空白・改行を含まない可視ASCII文字とします。
+Cloud Runは`trace-preview-edge-secret:<numeric-version>`を参照し、管理者は同じ値をRepository **Secret**へ登録します。Variable、ソース、コマンド引数、チャットへ置きません。CI用の値は32文字以上の空白・改行なしの可視ASCIIです。CLIで手動確認するときも[秘匿環境入力](google-cloud.md#5-マイグレーション--権限付与--api)を使います。
 
-CIはSecret Managerから値を読み出さず、デプロイ用アカウントへSecret Accessorを追加しません。その代わり、両保管先の同期が運用上の前提になります。API側のSecret参照があるのにGitHub側が空、API側が無効なのにGitHub側だけ設定済み、数値版以外の参照、不正なヘッダー値はprepare段階でビルド・配備前に拒否します。値そのものの不一致は候補configの403で検出し、通常トラフィックを切り替えません。切替後のconfig確認が失敗した場合も既存のrollback対象です。
+CIアカウントにSecret Accessorを与えません。API側の平文/未指定/非数値参照、GitHub側の欠落、不正ヘッダー値はbuild前に拒否します。値の不一致はEdgeありconfigの403で停止し、未検証候補へ通常trafficを切り替えません。Edgeなしconfigが成功した場合も拒否します。public healthの200は許容します。redirectに追従せず、別originへ資格を渡しません。
 
-Secretの同期変更は自動化を止め、進行中の配備が終了してから行います。APIの数値版とGitHub Secretを同じ値へ更新し、認証付きの疎通を確認してから再開してください。値はstate JSON、GitHub output、Summaryへ保存しません。workflowのdeployジョブ環境には存在するため、mainとworkflowの変更権限・レビューを保護してください。PRのtestジョブには渡しません。
+Secretローテーションは自動化を止め、進行中の配備終了後に両保管先を同期して確認します。workflow/ mainの変更権限とレビューを保護し、PRのtestジョブには秘密値を渡しません。
 
-### 最初は非公開Backendだけを確認する
 
-Cloudflare WorkerのIAMトークン取得方式と正式採否は別途未決定です。最初のstaging配備ではCloud Runを一般公開せず、開発者の認証付き経路で確認します。管理者がCloud Shell等で以下を実行します。
+### 読み取り専用の配備前確認
 
-```sh
-gcloud run services proxy trace-backend --project=trace-staging-507216 \
-  --region=asia-northeast1 --port=8085
-```
-
-同じ端末の別ターミナルで、secretをコマンド引数へ置かずに確認します。IAM認証は上のプロキシが担当します。edge secretを無効にしている場合は空入力とします。
+以下はGitHub実行identityなしで使えます。管理APIへの書込み、DB credential取得、一時Job作成は行いません。
 
 ```sh
-python3 - <<'PY'
-import getpass
-import json
-import urllib.request
-
-secret = getpass.getpass("Staging edge secret (empty if disabled): ")
-for path in ("/health/ready", "/v1/public/config"):
-    headers = {"Accept": "application/json"}
-    if path.startswith("/v1/") and secret:
-        headers["X-Trace-Edge-Secret"] = secret
-    request = urllib.request.Request("http://127.0.0.1:8085" + path, headers=headers)
-    with urllib.request.urlopen(request, timeout=10) as response:
-        data = json.load(response)
-    if path == "/health/ready":
-        assert data.get("status") == "ready"
-    else:
-        assert data.get("registrationOpen") is False
-    print(path, "OK")
-PY
+python3 deploy/gcp/ci_staging.py check-maintenance
+# Active profile uses TRACE_STAGING_EDGE_SHARED_SECRET from a hidden input.
+python3 deploy/gcp/ci_staging.py check-active
 ```
 
-これは配備・DB ready・受付停止の確認であり、参加者E2Eではありません。実際のWIF・IAM、Cloud Build、清掃ジョブ、切替と復旧はクラウド上で別途検証します。Cloudflareからの参加→位置→停止→削除が完了するまでBackend #5全体は閉じません。本番提供者の承認、実参加者データの利用承認や一般公開の代替にもなりません。
+`check-maintenance`は両APIのmanual 0/反映完了/タグなし、Scheduler pause、cleanup非terminal実行なしを検証します。意図して停止したサービスのserving Readyを要求しません。`check-active`はprivate停止、preview/cleanupのprofile・同digest・bundle・秘密参照・SA、実HTTPのEdge拒否/許可と受付停止を確認します。現在の旧環境は2 API稼働なので、停止不足で拒否されるのが期待結果です。
+
+Cloudflare構成の採用は[設計PR #22](https://github.com/Mino829/trace-campus-installation/pull/22)で承認済みです。これは実配備・参加者E2E・大学/運営による公開承認とは別です。正しいWorker configだけで参加→本人メタデータ→到着/再生→停止/削除を確認済みとはせず、Backend #5は閉じません。
 
 
 ## 6. 運用と復旧
 
-- 自動化を止める：Repository variable `STAGING_DEPLOY_ENABLED=false`。実行中のジョブは止まらず、新しい実行から無効になる。
-- デプロイは直列実行。新しいmainがある古い実行は安全側に倒して失敗終了する。途中のpending実行はGitHubによって置き換えられることがある。
-- 手動デプロイやDB変更は同じタイミングで行わない。自動化を無効化し、実行中デプロイが完了してから作業する。
-- DB変更：自動化を止め、レビュー済みの後方互換migration・必要な権限付与を手動で行い、旧APIと新APIの互換性を確認してからbaselineを進める。適用済みSQLの編集やDBの自動ダウングレードは行わない。
-  1. `STAGING_DEPLOY_ENABLED=false`にし、進行中の配信・清掃ジョブが終わったことを確認する。DBをバックアップし、停止できる旧API・清掃ジョブ、直前イメージとschema版を記録する。version 1の存在しか調べない以前のバイナリは新版schemaを検知できないため、非互換変更の前に停止・置換する。
-  2. 適用済み`001_initial.sql`は改変せず、`002_名前.sql`以降を連番で追加する。まず専用DBで初回/追加/再実行/競合/失敗時のrollbackを検証し、stagingでトランザクションとロック時間を確認する。DDLはexpand-contractとし、非互換の旧アプリを同じDBで稼働させない。DB更新後、互換性のある旧版へしかアプリを戻せない。
-  3. migration用の新しいイメージを手動ビルドして`GCP_IMAGE`へ指定し、所有者の`bash deploy/gcp/deploy.sh migrate`を実行する。`schema_migrations`の版が1から連続し、期待版まで適用されたことを確認する。失敗したら旧APIへトラフィックを移さず原因を調べる（DDLはトランザクションごとrollback、DBを自動で巻き戻さない）。
-  4. `trace_owner`で`deploy/gcp/runtime-grants.sql`を適用し、追加テーブルには明示的に必要な`trace_app`権限だけを付与する。`trace_app`接続で`schema_migrations`のSELECT、新規テーブルの必要操作、DDL不可を確認する。DB接続が成功しても権限の誤設定はready検査だけでは見つからない。
-  5. 同じ版に対応する新APIを一時タグへデプロイし、`/health/ready`と受付停止設定、既存E2Eを確認した後に昇格する。新しいschemaを扱えない旧API/清掃ジョブはready/起動に失敗する（新版判定実装済みのバイナリのみ）。再実行は適用済み版を飛ばす。
-  6. 手動検証を記録して`STAGING_SCHEMA_BASELINE`を対応するmainのフルSHAへ更新し、自動化を再開する。単なるアプリrollbackはDBを戻さないため、直前イメージが現行schemaに対応できない場合は切り戻さず受付停止を維持し、forward migrationなどの復旧計画を決める。
-  今回の`002_remove_live_positions.sql`は例外として旧APIと非互換で、位置テーブルの既存データを破棄する。追跡受付を停止し、旧APIと旧清掃ジョブの稼働・トラフィックを止めてから適用する。`TRACE_SESSION_TTL`を削除し、`TRACE_MEMORY_SESSION_TTL`/`TRACE_LIVE_SESSION_TTL`を設定した新APIだけを起動する。旧イメージへの自動rollbackはできない。APIの最大インスタンス数を1へ変更してからCIを再開する。
-- スクリプトはmigration実装・SQLディレクトリ・権限SQLの差分を検知するもので、任意のGoコードが行うDB変更を完全に検知するセキュリティ境界ではない。
-- 候補起動で失敗：通常のAPIトラフィックは旧版のまま。一時タグは終了処理で外す。
-- 削除ジョブまたは切替後の確認で失敗：旧配信先・旧削除イメージへ復旧を試みる。元の失敗はActions上で失敗のまま残す。
-- 強制キャンセル・runner消失・権限喪失時は復旧を保証できない。Cloud Runの実状態を確認する。旧リビジョン・旧イメージは削除しない。
-- rollback後の既存サービスの最新作成リビジョンが失敗状態なら、自動化の事前確認も停止する。手動で正常な設定を再デプロイしてから再開する。
-- 本番、一般公開、受付開始、ドメイン/CORS/同意文/座標の変更、Secretローテーション、Scheduler設定変更、監視アラート作成はこの自動化の対象外。
-- Cloud BuildのビルドログはCloud Loggingで確認する。CIアカウントはログ本文の閲覧権限を持たず、ビルド結果だけ参照する。
-- ビルド、ソース保管、候補リビジョンの起動、ジョブ実行等に料金が発生する。現在の最小1台・CPU常時割当は維持する。
+- 自動化停止は`STAGING_DEPLOY_ENABLED=false`。実行中Jobは止まらないため完了を待ち、手動変更と重ねない。
+- releaseは直列実行。古いmain実行や外部image/config/traffic/tag変更は拒否し、別作業を上書きしない。
+- schema/grants変更は[停止窓の手順](google-cloud.md#5-マイグレーション--権限付与--api)で明示適用。DBの自動downgradeや適用済みSQLの書換えはしない。
+- migration/grants/serveの失敗ではSchedulerをpause、privateをmanual 0のまま維持する。旧003/GPS/画像受付版を再起動しない。
+- 候補検証前やcleanup更新の失敗では、配信中の確認済み旧版を維持し、変更したcleanup imageだけを復旧する。期限清掃で消えた行は戻らない。
+- 切替を試行した後の不確実な失敗では、検証済みGPSなし候補と新cleanupを維持しfix-forwardする。旧GPS writerへtrafficを戻さない。外部変更や復旧失敗もActionsを失敗にする。
+- 候補失敗後はlatest template/Readyが未昇格候補を指す場合があり、次回prepareが拒否され得る。自動化を止め、同schemaの確認済みGPSなし版で状態を揃えてから再開する。
+- 一時タグは当該runが所有する候補だけを外す。未知のタグは勝手に削除しない。タグだけで到達可能な旧revisionをmanual 0のまま残さない。
+- 強制キャンセル・runner消失・権限喪失時は自動復旧を保証しない。実状態、タグ、Jobを確認し、同schema対応の修正版で復旧する。
+- このCIはmigration/grants差分を検知するが、任意のGoコードのDB変更を完全に防ぐsecurity boundaryではない。main/workflowをレビューする。
+- production、参加受付/新feature開始、Secret/同意/Graph/Origin変更、IAM/backup/Scheduler/監視設定変更は自動化しない。
+- build/ソース保管/候補起動/Jobに料金が発生する。閉鎖previewはmin0/request-based CPUを維持する。常駐Push/描画の費用・可用性は別途判断する。
 
-旧位置の最新値はGoメモリにしかなく清掃ジョブや別revisionと共有できない。GPS廃止後は旧revisionが新規位置・写真GPSを受け付けるため、CIの候補revisionと旧revisionを並走させて一般参加者に開かない。`TRACE_REGISTRATION_OPEN=false`を維持し、位置追跡がない停止窓で旧APIのトラフィックを止めて切り替える。GPSを再受付する旧revisionへロールバックせず、問題があれば受付停止のまま修正版を配信する。
+位置キャッシュ、レート制限、描画接続数は複数プロセスで共有されません。候補URLの内部probeは一般参加者への並列公開ではなく、全featureを閉じたまま検証します。追跡中/描画中/実参加受付中にこの閉鎖profileを流用しません。
 
 ## 7. ローカル検証
 
@@ -262,7 +243,7 @@ go test ./...
 go vet ./...
 ```
 
-PythonテストではGoogle Cloud操作を模擬し、認証付きprobeはループバックHTTPサーバーでも検証します。外部クラウドへの通信・実際のデプロイ・DB削除は行いません。
+PythonテストではCloud操作を模擬し、Edge欠落・不一致・redirect拒否をloopback HTTPでも検証します。外部Cloud通信や実配備はしません。manualの入力/backup鮮度/タグによる停止漏れも検証します。
 GoのAPI/DB統合テストは、専用DBを指定した `make integration` で別途確認します。GitHubのtestジョブではPostgreSQLを起動して実行します。
 実際のWIF・IAM・Cloud Build・Cloud Runの疎通は、セットアップ後の初回Actions実行で検証する必要があります。
 
