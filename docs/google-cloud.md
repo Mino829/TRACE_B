@@ -113,6 +113,16 @@ bash deploy/gcp/deploy.sh serve
 
 任意の描画WSは`TRACE_DISPLAY_ENABLED=false`のまま配備し、承認後に最新migration、`runtime-grants.sql`、ブラウザから直接到達できる専用HTTPS/WSS入口を用意します。Google OAuth WebクライアントID、許可するGmail/Workspaceメール、展示ページOriginを`TRACE_DISPLAY_GOOGLE_CLIENT_ID`/`TRACE_DISPLAY_OPERATOR_EMAILS`/`TRACE_DISPLAY_ALLOWED_ORIGINS`へ設定します。Google OAuthの許可JavaScript Originにも同じ展示Originを登録してください。到着・Edgeとは独立した32バイト以上の署名鍵をSecret Managerに置き、`settings.env`の`GCP_DISPLAY_TOKEN_SECRET`に数値版参照だけを書いてAPIへ注入します。旧描画issuer鍵は不要です。実行サービスアカウントのAccessor権限は対象Secretだけに限定します。発行はGoogle IDトークン、WSは最初の`renderer.authenticate`で描画資格と版を検証します。仕様・失効の制約は[README](../README.md#描画websocket既定無効)を参照してください。該当2経路だけEdge secretを免除しますが、IAM保護を迂回するものではありません。実Googleログイン・許可外資格拒否・Frontend再接続・承認済み公開経路の検証後にのみ有効化を検討し、参加者Workerへ描画/運営経路や鍵を渡さないでください。
 
+### PR #37の展示ブラウザ接続設定
+
+以下は[PR #37のコメント](https://github.com/Mino829/TRACE_B/pull/37#issuecomment-6461440141)への配置手順です。依頼者からWebクライアントIDと運営メールの指定を受け、`.env.example`と`runtime.env.yaml.example`へ反映済みです。描画フラグは無効を維持しており、staging適用・Frontendビルドへの反映・実Googleログインを完了済みとは扱いません。
+
+1. 対象プロジェクトの[Google Auth Platform > Clients](https://console.cloud.google.com/auth/clients?project=trace-staging-507216)で、種類「ウェブアプリケーション」のOAuthクライアントを作成または既存クライアントを確認します。承認済みJavaScript生成元には`https://trace-log.async5855.workers.dev`を登録します。画面のパス`/display`は付けません。OAuth同意画面・対象ユーザー・必要なテストユーザーも運営方針に沿って設定します。
+2. [runtime.env.yaml.example](../deploy/gcp/runtime.env.yaml.example)の`TRACE_DISPLAY_GOOGLE_CLIENT_ID`をFrontend #49の`NEXT_PUBLIC_GOOGLE_CLIENT_ID`へ同じ値で渡し、`NEXT_PUBLIC_DISPLAY_API_URL`も設定してFrontendをビルドし直します。どちらかが未設定ならFrontendはテスト再生のままです。Google Identity ServicesのIDトークンcallback方式であり、クライアントsecretをBackendやFrontendへ渡す処理はありません。
+3. 明示的に許可したGmail/Workspaceメールだけを`TRACE_DISPLAY_OPERATOR_EMAILS`へカンマ区切りで設定します。GitHub名や例示メールから推定しません。`TRACE_DISPLAY_ALLOWED_ORIGINS`には手順1と同じOriginを設定します。現在の設定例と異なるURLへ展示を配置する場合はGoogleとBackendを同時に更新します。
+4. [runtime.env.yaml.example](../deploy/gcp/runtime.env.yaml.example)の3つの空間版をそのまま使用し、Backendの固定Graph・Frontend #61と同じbundleにします。到着・写真・再生中のデータを別Graphへ読み替えず、受付を閉じた移行窓で旧revisionを停止してから切り替えます。
+5. `TRACE_DISPLAY_ENABLED=false`のまま必要な設定・独立した署名secret・承認済みブラウザ到達経路を用意し、実行ユーザーでreadyと公開設定の`spatial`を確認します。承認後に描画を有効化し、実Googleログイン→描画token発行→初回snapshot→主lease→到着→started/completedのackを確認します。旧版の4409、許可外アカウントの401、許可外Originの403も確認します。実Googleログインと長時間再接続が未確認なら公開完了にしません。
+
 `deploy.sh serve`は描画有効/無効にかかわらずCloud Runリクエスト上限を3600秒へ設定します。WS本体は50分で終了、10秒ping/pong、30秒無応答切断。HTTP 10秒middleware期限はWS upgradeへ適用しません。Cloud Run timeout/instance replacement後はrendererが短期資格を再取得し、指数バックオフで新snapshotへ再接続します。上限の長い接続は請求とconcurrency枠を消費するため、現場60人規模の実負荷で検証してください。WebSocket経路をCloudflare Workerの参加者用proxyへ流さず、HTTPS upgrade透過・権限・秘密ヘッダー非記録を運営経路で確認してください。変更しても既存stagingへのデプロイを意味しません。
 
 ## 6. 期限削除の補助ジョブ

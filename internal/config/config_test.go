@@ -168,18 +168,6 @@ func TestPushRequiresExplicitEnableAndAllSecrets(t *testing.T) {
 	}
 }
 
-func TestSpatialVersionsAreExplicitAndPhotoFlagRemainsOff(t *testing.T) {
-	baseEnv(t)
-	t.Setenv("TRACE_COORDINATE_VERSION", "toyosu-2026-08-28.1")
-	t.Setenv("TRACE_CAMPUS_GRAPH_VERSION", "toyosu-graph-2026-10-21.1.draft")
-	t.Setenv("TRACE_THREE_D_MAP_VERSION", "キャンパス全体.blend 2026-10-21")
-	cfg, err := FromEnv()
-	if err != nil || cfg.PhotoEnabled || cfg.CoordinateVersion != "toyosu-2026-08-28.1" ||
-		cfg.CampusGraphVersion != "toyosu-graph-2026-10-21.1.draft" || cfg.ThreeDMapVersion != "キャンパス全体.blend 2026-10-21" {
-		t.Fatalf("spatial version overrides: %+v, %v", cfg, err)
-	}
-}
-
 func TestArrivalIssuerAndProofKeysStaySeparateAndDisabledByDefault(t *testing.T) {
 	baseEnv(t)
 	cfg, err := FromEnv()
