@@ -94,11 +94,12 @@ func googleWebTokenHeaderValid(token string) bool {
 	if len(token) == 0 || len(token) > 16<<10 || strings.ContainsAny(token, " \t\r\n,") {
 		return false
 	}
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
+	encodedHeader, rest, headerOK := strings.Cut(token, ".")
+	_, signature, signatureOK := strings.Cut(rest, ".")
+	if !headerOK || !signatureOK || strings.Contains(signature, ".") {
 		return false
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	raw, err := base64.RawURLEncoding.DecodeString(encodedHeader)
 	if err != nil {
 		return false
 	}
