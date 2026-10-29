@@ -177,6 +177,29 @@ func (s *Store) MomentRouteSegments(ctx context.Context, memoryID string) ([]Rou
  (SELECT sequence_no FROM photo_moments WHERE id=from_photo_moment_id)`)
 }
 
+// PhotoMomentMemory reads one committed snapshot, including when bulk expiry
+// cleanup bypasses the session mutation lock. Writers need not wait for readers.
+func (s *Store) PhotoMomentMemory(ctx context.Context, memoryID string) ([]PhotoMoment, []RouteSegment, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	view := Store{q: tx}
+	moments, err := view.PhotoMoments(ctx, memoryID)
+	if err != nil {
+		return nil, nil, err
+	}
+	segments, err := view.MomentRouteSegments(ctx, memoryID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return moments, segments, nil
+}
+
 func (s *Store) RefreshMomentRoutes(ctx context.Context, memoryID string, now time.Time) error {
 	return s.Transaction(ctx, memoryID, func(tx *Store) error {
 		m, err := tx.MemorySession(ctx, memoryID)
