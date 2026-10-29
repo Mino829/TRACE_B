@@ -111,8 +111,13 @@ func googleWebTokenHeaderValid(token string) bool {
 }
 
 func (s *Server) displayOperatorAllowed(payload *idtoken.Payload, now time.Time) bool {
+	return googleIdentityAllowed(payload, s.cfg.DisplayGoogleClientID, s.cfg.DisplayOperatorEmails, now)
+}
+
+// Both Google roles share strict identity validation, never their entitlement.
+func googleIdentityAllowed(payload *idtoken.Payload, audience string, emails []string, now time.Time) bool {
 	if payload == nil || (payload.Issuer != "https://accounts.google.com" && payload.Issuer != "accounts.google.com") ||
-		payload.Audience != s.cfg.DisplayGoogleClientID || payload.Subject == "" || len(payload.Subject) > 255 ||
+		payload.Audience != audience || payload.Subject == "" || len(payload.Subject) > 255 ||
 		strings.ContainsAny(payload.Subject, " \t\r\n") || payload.IssuedAt <= 0 || payload.IssuedAt > now.Unix() ||
 		payload.Expires <= now.Unix() || payload.Expires <= payload.IssuedAt {
 		return false
@@ -121,7 +126,7 @@ func (s *Server) displayOperatorAllowed(payload *idtoken.Payload, now time.Time)
 	// tokens. If an authorized party is present it must be this Web client too.
 	if azp, exists := payload.Claims["azp"]; exists {
 		party, ok := azp.(string)
-		if !ok || party != s.cfg.DisplayGoogleClientID {
+		if !ok || party != audience {
 			return false
 		}
 	}
@@ -142,7 +147,7 @@ func (s *Server) displayOperatorAllowed(payload *idtoken.Payload, now time.Time)
 			return false
 		}
 	}
-	for _, allowed := range s.cfg.DisplayOperatorEmails {
+	for _, allowed := range emails {
 		if email == allowed {
 			return true
 		}

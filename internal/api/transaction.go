@@ -27,10 +27,9 @@ func (s *Server) atomic(handle func(*Server, http.ResponseWriter, *http.Request)
 			s.writeError(w, requestID(r), err)
 			return
 		}
-		key := r.PathValue("liveSessionId")
-		if key == "" {
-			key = r.PathValue("memorySessionId")
-		}
+		// Arrival, replay, Memory deletion/stop and legacy Live retirement all
+		// take the display lock before their per-session mutation locks.
+		key := "display:lease"
 		response := &bufferedResponse{header: make(http.Header)}
 		rejected := errors.New("request rejected")
 		txErr := s.store.Transaction(r.Context(), key, func(db *store.Store) error {

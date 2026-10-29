@@ -27,11 +27,11 @@ ROOT = Path(__file__).resolve().parents[2]
 GUARD = ROOT / "deploy/gcp/ci_staging.py"
 FLAGS = (
     "TRACE_REGISTRATION_OPEN", "TRACE_PHOTO_METADATA_ENABLED", "TRACE_PHOTO_ENABLED",
-    "TRACE_PUSH_ENABLED", "TRACE_ARRIVAL_ENABLED", "TRACE_DISPLAY_ENABLED",
+    "TRACE_PUSH_ENABLED", "TRACE_ARRIVAL_ENABLED", "TRACE_DISPLAY_ENABLED", "TRACE_OPERATOR_ENABLED",
 )
 API_SECRET_NAMES = (
     "TRACE_EDGE_SHARED_SECRET", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_ENCRYPTION_KEY",
-    "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_DISPLAY_TOKEN_KEY",
+    "TRACE_ARRIVAL_PROOF_KEY", "TRACE_DISPLAY_TOKEN_KEY",
 )
 
 
@@ -83,8 +83,9 @@ def target():
     expected("GCP_SQL_CONNECTION", SQL)
     # Never silently accept the former shared runtime-identity convention.
     require(not os.environ.get("GCP_RUNTIME_SA"), "Remove obsolete GCP_RUNTIME_SA; use separate API/cleanup identities")
+    require(not os.environ.get("GCP_ARRIVAL_ISSUER_SECRET"), "Remove obsolete GCP_ARRIVAL_ISSUER_SECRET; operator access is personal")
     for name in ("GCP_PUSH_VAPID_PRIVATE_SECRET", "GCP_PUSH_ENCRYPTION_SECRET",
-                 "GCP_ARRIVAL_ISSUER_SECRET", "GCP_ARRIVAL_PROOF_SECRET", "GCP_DISPLAY_TOKEN_SECRET"):
+                 "GCP_ARRIVAL_PROOF_SECRET", "GCP_DISPLAY_TOKEN_SECRET"):
         require(not os.environ.get(name), f"Remove {name}; this closed staging profile does not deploy optional feature keys")
     for name, value in (("GCP_SERVICE", SERVICE), ("GCP_STOPPED_SERVICE", STOPPED_SERVICE), ("GCP_JOB", JOB)):
         require(name not in os.environ or os.environ[name] == value, f"{name} cannot override this fixed staging profile")
@@ -232,6 +233,7 @@ def runtime_env():
         require(values.get(key) == value, f"Closed staging profile requires {key}={value}")
     require("DATABASE_URL" not in values and "DB_PASSWORD" not in values and "TRACE_SESSION_TTL" not in values,
             "Remove password/DB URL overrides and obsolete TRACE_SESSION_TTL from runtime.env.yaml")
+    require("TRACE_ARRIVAL_ISSUER_KEY" not in values, "Remove obsolete TRACE_ARRIVAL_ISSUER_KEY; operator access is personal")
     require(not any(key in values for key in API_SECRET_NAMES), "Use pinned Secret references, never credentials in runtime.env.yaml")
     try:
         connections = int(values.get("TRACE_DB_MAX_CONNECTIONS", ""))

@@ -26,7 +26,7 @@ APIの接続プールは最大5。実DBの`max_connections=25`に対し、Job・
 ### 2026-10-28の配備前確認
 
 - 2 APIは旧`manual-20261021-1311-144cc03`。mainのmergeだけでは更新されていません。
-- 実DBは連続した`001`〜`003`。アプリ用7テーブルは全て0件、`schema_migrations`は3件でした。必要なのは**004〜016**です。
+- 実DBは連続001～003で、当時のアプリ用7テーブルは0件、migration履歴は3件でした。本変更の必要最終版は018ですが、実DBを更新した記録ではありません。
 - `trace_app`は非superuser、CREATEDB/CREATEROLEなし、publicへのCREATEなし、migration表はSELECTのみ。
 - 既存バックアップは1世代、PITR無効、保存先`asia`。保持・処理地域・復元後消去の承認を省略できません。既存ポリシーを自動変更しません。
 - `trace-build`、preview/cleanup/migration/Schedulerの実行SAは存在します。GitHub用deploy SAは未作成、Actions variables/secretsは未設定です。
@@ -113,7 +113,7 @@ export GCP_QUIESCED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 ```sh
 gcloud sql backups create --instance=trace-postgres --project="$GCP_PROJECT_ID" \
-  --location=asia-northeast1 --description="reviewed schema003-to016 maintenance"
+  --location=asia-northeast1 --description="reviewed schema003-to018 maintenance"
 gcloud sql backups list --instance=trace-postgres --project="$GCP_PROJECT_ID" \
   --format='table(id,type,status,startTime,endTime,location)'
 # Select the completed backup from THIS maintenance, never an old scheduled backup.
@@ -122,7 +122,7 @@ bash deploy/gcp/deploy.sh migrate
 bash deploy/gcp/deploy.sh runtime-grants
 ```
 
-backup ID、対象instance、ON_DEMAND/SUCCESSFUL、停止記録以後の開始・完了時刻を検証します。`migrate`は連続003または既に適用した現行版から実行し、owner Jobで004〜016を適用、事後に連続001〜016を確認します。成功後の再実行は適用済み版を飛ばします。001/002や想定外の履歴をこの手順で自動処理しません。
+backup ID・対象instance・ON_DEMAND/SUCCESSFUL・停止以後の開始/完了時刻を検証します。migrateは連続003または適用済み現行版から004～018を番号順に適用し、連続001～018を確認します。017の参加停止/receipt所有と018の個人運営資格/監査も必要です。成功後の再実行は適用済み版を飛ばします。001/002や不整合履歴はこの手順で自動処理しません。
 
 次に既存Edge keyを、画面非表示入力でこのシェルの環境だけへ読み込みます。ファイルや引数へ渡しません。
 
@@ -140,7 +140,7 @@ unset TRACE_STAGING_EDGE_SHARED_SECRET
 
 指定済みのWeb client ID、運営メール、`https://trace-log.async5855.workers.dev`はruntime例に保持しています。[PR #37のコメント](https://github.com/Mino829/TRACE_B/pull/37#issuecomment-6461440141)と[描画契約](../README.md#描画websocket既定無効)を参照してください。Googleの承認済みJavaScript originには`/display`を含めません。
 
-この閉鎖profileは描画鍵を配布せず、`TRACE_DISPLAY_ENABLED=false`を強制します。Google Auth Platformの設定、Frontendの同じclient ID/API URLでのビルド、直接HTTPS/WSS入口、独立署名鍵の配備・Accessor権限、実Googleログイン・再接続は別の承認された有効化作業です。Googleログインは描画資格だけを発行し、運営HMAC権限にはなりません。ブラウザに運営鍵やEdge keyを渡しません。
+閉鎖profileはTRACE_DISPLAY_ENABLED=falseとTRACE_OPERATOR_ENABLED=falseを強制し、描画/到着署名鍵を配布しません。実Google設定・直接HTTPS/WSS・署名鍵/Accessor・運営入口の配備は別途承認が必要です。個人operator資格は独立のGoogle audience/メール/Origin設定から発行し、描画資格で運営操作はできません。初期許可者はasync5855@gmail.comのみです。会場PCの認証付きloopback brokerはEdge keyをサーバー側だけに保持し、資格取得/失効・QR発行を中継します。ブラウザへ長期鍵を渡さず、WSSは中継しません。ローカル検証を実Google/staging/機材確認済みとしません。
 
 ## 6. 期限削除の補助ジョブ
 

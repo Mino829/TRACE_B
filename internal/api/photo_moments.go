@@ -153,7 +153,7 @@ func (s *Server) createPhotoMoment(w http.ResponseWriter, r *http.Request) {
 		receipt, err := tx.GetIdempotency(r.Context(), scope, key, now)
 		if err == nil {
 			if receipt.RequestHash != requestHash {
-				return store.ErrConflict
+				return store.ErrIdempotencyConflict
 			}
 			var locator struct {
 				PhotoHash string `json:"photoHash"`
@@ -182,7 +182,7 @@ func (s *Server) createPhotoMoment(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		return tx.SaveIdempotency(r.Context(), scope, key, requestHash, http.StatusCreated, locator, now.Add(24*time.Hour))
+		return tx.SaveMemoryIdempotency(r.Context(), memoryID, scope, key, requestHash, http.StatusCreated, locator, now.Add(24*time.Hour))
 	})
 	if err != nil {
 		s.photoError(w, r, err)
@@ -232,7 +232,7 @@ func (s *Server) deletePhotoMoment(w http.ResponseWriter, r *http.Request) {
 		receipt, err := tx.GetIdempotency(r.Context(), scope, key, now)
 		if err == nil {
 			if receipt.RequestHash != hashBytes(nil) || receipt.ResponseStatus != http.StatusNoContent {
-				return store.ErrConflict
+				return store.ErrIdempotencyConflict
 			}
 			return nil
 		}
@@ -242,7 +242,7 @@ func (s *Server) deletePhotoMoment(w http.ResponseWriter, r *http.Request) {
 		if err := tx.DeletePhotoMoment(r.Context(), memory.ID, photoID, now); err != nil {
 			return err
 		}
-		return tx.SaveIdempotency(r.Context(), scope, key, hashBytes(nil), http.StatusNoContent, []byte{}, now.Add(24*time.Hour))
+		return tx.SaveMemoryIdempotency(r.Context(), memory.ID, scope, key, hashBytes(nil), http.StatusNoContent, []byte{}, now.Add(24*time.Hour))
 	})
 	if err != nil {
 		s.photoError(w, r, err)

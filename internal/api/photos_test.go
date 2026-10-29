@@ -366,8 +366,11 @@ func TestPhotoUploadStoryAndDeletionCapabilities(t *testing.T) {
 	}
 	altered["sha256"] = strings.Repeat("0", 64)
 	different, _ := json.Marshal(altered)
-	if r := request(t, h, "POST", path+"/photos", string(different), map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "register-one"}); r.Code != 409 {
+	if r := request(t, h, "POST", path+"/photos", string(different), map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "register-one"}); r.Code != 409 || !strings.Contains(r.Body.String(), `"IDEMPOTENCY_CONFLICT"`) {
 		t.Fatalf("idempotent photo content conflict accepted: %d %s", r.Code, r.Body.String())
+	}
+	if r := request(t, h, "POST", path+"/photos", string(different), map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "fresh-client-conflict"}); r.Code != 409 || !strings.Contains(r.Body.String(), `"STATE_CONFLICT"`) {
+		t.Fatalf("client photo conflict was not distinct: %d %s", r.Code, r.Body.String())
 	}
 	headers["Idempotency-Key"] = "delete-one"
 	for range 2 {

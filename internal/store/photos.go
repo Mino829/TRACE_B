@@ -28,6 +28,7 @@ func photoMode(mode string) string {
 type MemorySession struct {
 	ID, CampusGraphVersion, PhotoMode string
 	CreatedAt, ExpiresAt, DeleteAfter time.Time
+	StoppedAt                         *time.Time
 	Deleting                          bool
 }
 
@@ -92,8 +93,8 @@ func scanPhoto(row photoScanner) (Photo, error) {
 
 func (s *Store) MemorySession(ctx context.Context, id string) (MemorySession, error) {
 	var m MemorySession
-	err := s.q.QueryRowContext(ctx, `SELECT id,created_at,expires_at,delete_after,deleting,COALESCE(campus_graph_version,''),photo_mode FROM memory_sessions WHERE id=$1`, id).
-		Scan(&m.ID, &m.CreatedAt, &m.ExpiresAt, &m.DeleteAfter, &m.Deleting, &m.CampusGraphVersion, &m.PhotoMode)
+	err := s.q.QueryRowContext(ctx, `SELECT id,created_at,expires_at,delete_after,deleting,COALESCE(campus_graph_version,''),photo_mode,stopped_at FROM memory_sessions WHERE id=$1`, id).
+		Scan(&m.ID, &m.CreatedAt, &m.ExpiresAt, &m.DeleteAfter, &m.Deleting, &m.CampusGraphVersion, &m.PhotoMode, &m.StoppedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MemorySession{}, ErrNotFound
 	}
@@ -105,7 +106,7 @@ func (s *Store) activePhotoMemory(ctx context.Context, id string, now time.Time)
 	if err != nil {
 		return m, err
 	}
-	if m.Deleting || !now.Before(m.ExpiresAt) {
+	if m.Deleting || m.StoppedAt != nil || !now.Before(m.ExpiresAt) {
 		return m, ErrConflict
 	}
 	return m, nil

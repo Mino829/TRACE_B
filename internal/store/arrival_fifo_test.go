@@ -46,7 +46,7 @@ func TestArrivalWaitContinuesPastThirtySeconds(t *testing.T) {
 		t.Fatalf("ordinary waiting lost its arrival: %+v %v", candidates, err)
 	}
 	state, err := f.Store.ExperienceByMemoryToken(t.Context(), "fifo-experience-wait", "fifo-token-wait", later)
-	if err != nil || state.ReplayStatus != "queued" {
+	if err != nil || state.ReplayStatus == nil || *state.ReplayStatus != "queued" {
 		t.Fatalf("owner waiting state: %+v %v", state, err)
 	}
 	acquired, err := f.Store.AcquireDisplayLease(t.Context(), "holder", "lease", later)
@@ -115,7 +115,7 @@ func TestArrivalQueueAcceptsFiftyAndRetriesAfterCapacityReturns(t *testing.T) {
 			t.Fatalf("full queue persisted %s: %d %v", table, count, err)
 		}
 	}
-	if err := f.Store.SkipArrival(t.Context(), "fifo-arrival-capacity-00", now.Add(time.Second)); err != nil {
+	if err := f.Store.SkipArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), "fifo-arrival-capacity-00", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "overflow-arrival", "booth", "overflow-receipt", "request", now.Add(2*time.Second)); err != nil {
@@ -195,5 +195,51 @@ func TestPendingHeadCannotBeBypassedAndExpiryReleasesQueue(t *testing.T) {
 	}
 	if _, err := f.Store.DisplayReplay(t.Context(), "holder", "lease", "next-start", second, "arrival.replay.started", now.Add(17*time.Second)); err != nil {
 		t.Fatalf("expired head blocked next arrival: %v", err)
+	}
+}
+
+func TestStoppedQueueHeadDoesNotProjectOrBlockNextReplay(t *testing.T) {
+	f := testdb.Open(t)
+	f.Store.EnableDisplay()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	stopped := fifoArrival(t, f, "stopped-head", now)
+	active := fifoArrival(t, f, "active-next", now.Add(time.Second))
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE memory_sessions SET stopped_at=$1 WHERE id='fifo-memory-stopped-head'`, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.Store.DisplaySnapshot(t.Context(), now.Add(2*time.Second))
+	if err != nil || len(snapshot.Arrivals) != 1 || snapshot.Arrivals[0].ArrivalID != active {
+		t.Fatalf("stopped arrival projected: %+v %v", snapshot, err)
+	}
+	if ok, err := f.Store.AcquireDisplayLease(t.Context(), "holder", "lease", now.Add(2*time.Second)); err != nil || !ok {
+		t.Fatalf("lease: %t %v", ok, err)
+	}
+	if _, err := f.Store.DisplayReplay(t.Context(), "holder", "lease", "stopped-start", stopped, "arrival.replay.started", now.Add(2*time.Second)); err != store.ErrConflict {
+		t.Fatalf("stopped replay started: %v", err)
+	}
+	if _, err := f.Store.DisplayReplay(t.Context(), "holder", "lease", "active-start", active, "arrival.replay.started", now.Add(2*time.Second)); err != nil {
+		t.Fatalf("stopped head blocked active replay: %v", err)
+	}
+	if err := f.Store.RefreshDisplay(t.Context(), now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var status, reason string
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT replay_status,skip_reason FROM arrival_events WHERE id=$1`, stopped).Scan(&status, &reason); err != nil || status != "skipped" || reason != "participant_request" {
+		t.Fatalf("stopped stale queue not removed: %s/%s %v", status, reason, err)
+	}
+}
+
+func TestStoppedMemoryDoesNotOccupyQueueCapacity(t *testing.T) {
+	f := testdb.Open(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	for i := range store.ArrivalQueueLimit {
+		fifoArrival(t, f, fmt.Sprintf("stopped-capacity-%02d", i), now)
+	}
+	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE memory_sessions SET stopped_at=$1 WHERE id='fifo-memory-stopped-capacity-00'`, now); err != nil {
+		t.Fatal(err)
+	}
+	memoryID := fifoExperience(t, f, "active-capacity", now)
+	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "active-capacity-arrival", "booth", "active-receipt", "request", now); err != nil {
+		t.Fatalf("stopped arrival retained queue capacity: %v", err)
 	}
 }

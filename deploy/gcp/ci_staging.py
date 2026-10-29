@@ -30,7 +30,7 @@ SOURCE_BUCKET = f"gs://{PROJECT}-github-build-source/source"
 SCHEMA_PATHS = ["internal/store/migrate.go", "internal/store/migrations", "deploy/gcp/runtime-grants.sql"]
 FEATURE_FLAGS = (
     "TRACE_REGISTRATION_OPEN", "TRACE_PHOTO_METADATA_ENABLED", "TRACE_PHOTO_ENABLED",
-    "TRACE_PUSH_ENABLED", "TRACE_ARRIVAL_ENABLED", "TRACE_DISPLAY_ENABLED",
+    "TRACE_PUSH_ENABLED", "TRACE_ARRIVAL_ENABLED", "TRACE_DISPLAY_ENABLED", "TRACE_OPERATOR_ENABLED",
 )
 BUNDLE_ENV = {
     "coordinateVersion": "TRACE_COORDINATE_VERSION",
@@ -39,7 +39,7 @@ BUNDLE_ENV = {
 }
 API_SECRETS = (
     "TRACE_EDGE_SHARED_SECRET", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_ENCRYPTION_KEY",
-    "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_DISPLAY_TOKEN_KEY",
+    "TRACE_ARRIVAL_PROOF_KEY", "TRACE_DISPLAY_TOKEN_KEY",
 )
 
 
@@ -135,6 +135,8 @@ def check_runtime(spec, mode):
         raise RefuseRelease("Set an explicit application DB connection budget") from None
     if not 1 <= connections <= 5:
         raise RefuseRelease("Application DB pool must stay within the staging connection budget of five")
+    if "TRACE_ARRIVAL_ISSUER_KEY" in env:
+        raise RefuseRelease("Remove obsolete service issuer credentials; operator access is personal")
     if any(name in env for name in API_SECRETS if name != "TRACE_EDGE_SHARED_SECRET"):
         raise RefuseRelease("Remove unused optional feature credentials from the closed runtime")
     if "DATABASE_URL" in env:

@@ -90,7 +90,7 @@ func requireFallbackAudit(t *testing.T, f *testdb.Fixture, enables, disables int
 	if err := f.SQL.QueryRowContext(t.Context(), `SELECT
  COUNT(*) FILTER (WHERE action='fallback.enable'),
  COUNT(*) FILTER (WHERE action='fallback.disable'),
- COUNT(*) FILTER (WHERE operator_id<>'arrival_issuer' OR target_id_short<>'fallback')
+ COUNT(*) FILTER (WHERE operator_id<>'verified-test-operator' OR target_id_short<>'fallback')
  FROM arrival_operator_audit WHERE action IN ('fallback.enable','fallback.disable')`).Scan(&gotEnables, &gotDisables, &unsafe); err != nil {
 		t.Fatal(err)
 	}
@@ -118,12 +118,12 @@ func TestFallbackImmediateEnableRetainsQueueAndRequiresExplicitResume(t *testing
 	second := fifoArrival(t, f, "fallback-second", now.Add(time.Microsecond))
 	fallbackLease(t, f, now)
 	enabledAt := now.Add(time.Second)
-	state, err := f.Store.SetFallback(t.Context(), true, enabledAt)
+	state, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, enabledAt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireFallback(t, state, "fallback", enabledAt, time.Time{})
-	state, err = f.Store.SetFallback(t.Context(), true, now.Add(2*time.Second))
+	state, err = f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,12 +149,12 @@ func TestFallbackImmediateEnableRetainsQueueAndRequiresExplicitResume(t *testing
 		t.Fatalf("repeated enable emitted transitions: %+v", transitions)
 	}
 	resumedAt := now.Add(4 * time.Second)
-	state, err = f.Store.SetFallback(t.Context(), false, resumedAt)
+	state, err = f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), false, resumedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireFallback(t, state, "normal", resumedAt, time.Time{})
-	state, err = f.Store.SetFallback(t.Context(), false, now.Add(5*time.Second))
+	state, err = f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), false, now.Add(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestFallbackContinuesAcceptingArrivalsUnderExistingQueueLimit(t *testing.T)
 	f := testdb.Open(t)
 	f.Store.EnableDisplay()
 	now := fallbackNow()
-	if _, err := f.Store.SetFallback(t.Context(), true, now); err != nil {
+	if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now); err != nil {
 		t.Fatal(err)
 	}
 	for i := range store.ArrivalQueueLimit {
@@ -202,7 +202,7 @@ func TestFallbackPendingFinishesOnRendererCompletionOrFailure(t *testing.T) {
 			fallbackLease(t, f, now)
 			fallbackReplay(t, f.Store, "pending-start", playing, "started", "playing", now.Add(time.Second))
 			enabledAt := now.Add(2 * time.Second)
-			state, err := f.Store.SetFallback(t.Context(), true, enabledAt)
+			state, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, enabledAt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -245,7 +245,7 @@ func TestFallbackDeadlinePersistsAndLateCompletionCommitsTimeout(t *testing.T) {
 			fallbackReplay(t, f.Store, "deadline-start", playing, "started", "playing", now.Add(time.Second))
 			enabledAt := now.Add(2 * time.Second)
 			deadline := enabledAt.Add(30 * time.Second)
-			if _, err := f.Store.SetFallback(t.Context(), true, enabledAt); err != nil {
+			if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, enabledAt); err != nil {
 				t.Fatal(err)
 			}
 			if renewed, err := f.Store.RenewDisplayLease(t.Context(), "holder", "lease", now.Add(10*time.Second)); err != nil || !renewed {
@@ -259,7 +259,7 @@ func TestFallbackDeadlinePersistsAndLateCompletionCommitsTimeout(t *testing.T) {
 				t.Fatal(err)
 			}
 			fallbackArrivalState(t, f, playing, "playing", "")
-			state, err := restarted.SetFallback(t.Context(), true, before)
+			state, err := restarted.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, before)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -281,14 +281,14 @@ func TestFallbackDeadlinePersistsAndLateCompletionCommitsTimeout(t *testing.T) {
 			}
 			// A receipt records the original accepted result, not today's arrival state.
 			fallbackReplay(t, restarted, "deadline-start", playing, "started", "playing", at.Add(time.Second))
-			if _, err := restarted.SetFallback(t.Context(), true, at.Add(time.Second)); err != nil {
+			if _, err := restarted.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, at.Add(time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			if len(fallbackTransitions(t, f)) != 2 {
 				t.Fatal("deadline refresh or repeated enable duplicated transition")
 			}
 			resumedAt := at.Add(2 * time.Second)
-			if _, err := restarted.SetFallback(t.Context(), false, resumedAt); err != nil {
+			if _, err := restarted.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), false, resumedAt); err != nil {
 				t.Fatal(err)
 			}
 			fallbackArrivalState(t, f, playing, "skipped", "operator")
@@ -309,11 +309,11 @@ func TestFallbackDisableCancelsPendingWithoutInterruptingCurrentReplay(t *testin
 	queued := fifoArrival(t, f, "cancel-queued", now.Add(time.Microsecond))
 	fallbackLease(t, f, now)
 	fallbackReplay(t, f.Store, "cancel-start", playing, "started", "playing", now.Add(time.Second))
-	if _, err := f.Store.SetFallback(t.Context(), true, now.Add(2*time.Second)); err != nil {
+	if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	resumedAt := now.Add(10 * time.Second)
-	state, err := f.Store.SetFallback(t.Context(), false, resumedAt)
+	state, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), false, resumedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestFallbackLeaseLossAndReconnectNeverResume(t *testing.T) {
 			if loss == "simultaneous-deadline" {
 				enabledAt = now
 			}
-			if _, err := f.Store.SetFallback(t.Context(), true, enabledAt); err != nil {
+			if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, enabledAt); err != nil {
 				t.Fatal(err)
 			}
 			lostAt := now.Add(30 * time.Second)
@@ -387,7 +387,7 @@ func TestFallbackMemoryExpiryFinishesPendingWithoutDroppingQueue(t *testing.T) {
 	queued := fifoArrival(t, f, "expiry-queued", now.Add(time.Microsecond))
 	fallbackLease(t, f, now)
 	fallbackReplay(t, f.Store, "expiry-start", playing, "started", "playing", now.Add(time.Second))
-	if _, err := f.Store.SetFallback(t.Context(), true, now.Add(2*time.Second)); err != nil {
+	if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	expiredAt := now.Add(10 * time.Second)
@@ -417,7 +417,7 @@ func TestFallbackAuditFailureRollsBackControlAndTransitionEvents(t *testing.T) {
 			if _, err := f.SQL.ExecContext(t.Context(), `ALTER TABLE arrival_operator_audit ADD CONSTRAINT reject_fallback_enable CHECK (action<>'fallback.enable')`); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := f.Store.SetFallback(t.Context(), true, now.Add(time.Second)); err == nil {
+			if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now.Add(time.Second)); err == nil {
 				t.Fatal("failed audit reported successful enable")
 			}
 			requireFallback(t, readFallback(t, f.Store), "normal", initial.ChangedAt, time.Time{})
@@ -440,7 +440,7 @@ func TestFallbackDeadlineRollbackKeepsReplayStateEventsAndCursorAtomic(t *testin
 			fallbackLease(t, f, now)
 			fallbackReplay(t, f.Store, "rollback-start", playing, "started", "playing", now)
 			enabledAt := now.Add(time.Second)
-			if _, err := f.Store.SetFallback(t.Context(), true, enabledAt); err != nil {
+			if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, enabledAt); err != nil {
 				t.Fatal(err)
 			}
 			before, err := f.Store.DisplaySnapshot(t.Context(), enabledAt)
@@ -456,7 +456,7 @@ func TestFallbackDeadlineRollbackKeepsReplayStateEventsAndCursorAtomic(t *testin
 			}
 			deadline := enabledAt.Add(30 * time.Second)
 			if failure == "audit" {
-				_, err = f.Store.SetFallback(t.Context(), true, deadline)
+				_, err = f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, deadline)
 			} else {
 				err = f.Store.RefreshDisplay(t.Context(), deadline)
 			}
@@ -482,13 +482,13 @@ func TestFallbackDisableAuditAndOuterTransactionRollback(t *testing.T) {
 	f := testdb.Open(t)
 	f.Store.EnableDisplay()
 	now := fallbackNow()
-	if _, err := f.Store.SetFallback(t.Context(), true, now); err != nil {
+	if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `ALTER TABLE arrival_operator_audit ADD CONSTRAINT reject_fallback_disable CHECK (action<>'fallback.disable')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Store.SetFallback(t.Context(), false, now.Add(time.Second)); err == nil {
+	if _, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), false, now.Add(time.Second)); err == nil {
 		t.Fatal("failed disable audit reported success")
 	}
 	requireFallback(t, readFallback(t, f.Store), "fallback", now, time.Time{})
@@ -497,7 +497,7 @@ func TestFallbackDisableAuditAndOuterTransactionRollback(t *testing.T) {
 	}
 	rollback := errors.New("intentional rollback")
 	if err := f.Store.Transaction(t.Context(), "", func(tx *store.Store) error {
-		if _, err := tx.SetFallback(t.Context(), false, now.Add(2*time.Second)); err != nil {
+		if _, err := tx.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), false, now.Add(2*time.Second)); err != nil {
 			return err
 		}
 		return rollback
@@ -518,12 +518,12 @@ func TestFallbackControlReturnsDurableSubmicrosecondDeadline(t *testing.T) {
 	arrival := fifoArrival(t, f, "precision-playing", now)
 	fallbackLease(t, f, now)
 	fallbackReplay(t, f.Store, "precision-start", arrival, "started", "playing", now)
-	first, err := f.Store.SetFallback(t.Context(), true, now.Add(time.Second))
+	first, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
 	persisted := readFallback(t, f.Store)
-	repeated, err := f.Store.SetFallback(t.Context(), true, now.Add(2*time.Second))
+	repeated, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), "verified-test-operator"), true, now.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}

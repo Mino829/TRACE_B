@@ -60,22 +60,27 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service, sender ...*p
 	mux.HandleFunc("GET /health/ready", server.ready)
 	mux.HandleFunc("GET /v1/public/config", server.limitedPublic("config", server.publicConfig))
 	mux.HandleFunc("POST /v1/experiences", server.limitedPublic("create", server.createExperience))
-	mux.HandleFunc("POST /v1/operator/arrival-proofs", server.issueArrivalProof)
-	mux.HandleFunc("GET /v1/operator/arrivals", server.operatorArrivals)
-	mux.HandleFunc("GET /v1/operator/status", server.operatorStatus)
-	mux.HandleFunc("POST /v1/operator/fallback", server.setFallback)
-	mux.HandleFunc("DELETE /v1/operator/fallback", server.setFallback)
-	mux.HandleFunc("POST /v1/operator/registration/close", server.closeRegistration)
-	mux.HandleFunc("POST /v1/operator/notifications/stop", server.stopNotifications)
-	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/skip", server.operatorSkipArrival)
+	mux.HandleFunc("POST /v1/operator/credentials", server.issueOperatorCredential)
+	mux.HandleFunc("DELETE /v1/operator/credentials/current", server.operatorOnly(server.revokeOperatorCredential))
+	mux.HandleFunc("DELETE /v1/operator/credentials", server.operatorOnly(server.revokeOperatorCredentials))
+	mux.HandleFunc("POST /v1/operator/arrival-proofs", server.operatorOnly(server.issueArrivalProof))
+	mux.HandleFunc("GET /v1/operator/arrivals", server.operatorOnly(server.operatorArrivals))
+	mux.HandleFunc("GET /v1/operator/status", server.operatorOnly(server.operatorStatus))
+	mux.HandleFunc("POST /v1/operator/fallback", server.operatorOnly(server.setFallback))
+	mux.HandleFunc("DELETE /v1/operator/fallback", server.operatorOnly(server.setFallback))
+	mux.HandleFunc("POST /v1/operator/registration/close", server.operatorOnly(server.closeRegistration))
+	mux.HandleFunc("POST /v1/operator/notifications/stop", server.operatorOnly(server.stopNotifications))
+	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/skip", server.operatorOnly(server.operatorSkipArrival))
 	mux.HandleFunc("POST /v1/operator/display-tokens", server.issueDisplayToken)
-	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/retry", server.operatorRetryArrival)
+	mux.HandleFunc("POST /v1/operator/arrivals/{arrivalId}/retry", server.operatorOnly(server.operatorRetryArrival))
 	mux.HandleFunc("GET /v1/display/ws", server.displayWS)
 	mux.HandleFunc("GET /v1/experiences/{experienceId}", server.limitedSession("session", server.experienceState))
 	mux.HandleFunc("DELETE /v1/experiences/{experienceId}", server.limitedSession("experience-delete", server.deleteExperience))
+	mux.HandleFunc("GET /v1/live-presence-sessions/{liveSessionId}", server.limitedSession("session", server.liveState))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/position", server.limitedSession("position", server.atomic((*Server).updatePosition)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/on-site", server.limitedSession("session", server.atomic((*Server).onSite)))
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopLive)))
+	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopMemory)))
 	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/arrival", server.limitedSession("session", server.arrive))
 	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/arrival/skip", server.limitedSession("session", server.skipOwnArrival))
 	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.limitedSession("session", server.prepareMemoryPhotoDeletion(server.atomic((*Server).deleteMemory))))
@@ -114,6 +119,8 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		allowedOrigin := s.originAllowed(origin)
 		if directDisplay {
 			allowedOrigin = s.displayOriginAllowed(origin) && len(r.Header.Values("Origin")) == 1
+		} else if strings.HasPrefix(r.URL.Path, "/v1/operator/") {
+			allowedOrigin = s.operatorOriginAllowed(origin) && len(r.Header.Values("Origin")) == 1
 		}
 		if origin != "" && allowedOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -123,7 +130,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 		}
 		if r.Method == http.MethodOptions {
-			if (origin != "" || directDisplay) && !allowedOrigin {
+			if (origin != "" || directDisplay || strings.HasPrefix(r.URL.Path, "/v1/operator/")) && !allowedOrigin {
 				s.writeError(w, requestID, &apiError{Code: "ORIGIN_NOT_ALLOWED", Message: "origin is not allowed", Status: http.StatusForbidden})
 				return
 			}
@@ -294,12 +301,11 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 	memoryID := randomID("mem")
 	memoryExpires := now.Add(s.cfg.MemorySessionTTL)
 	memoryDeleteAfter := memoryExpires.Add(s.cfg.DataRetention)
-	color, symbol := displayAlias(experienceID)
 	value := store.NewExperience{
 		ExperienceID: experienceID, MemorySessionID: memoryID,
-		MemoryTokenHash: hash(memoryToken),
-		MemoryConsent:   input.MemoryConsentVersion,
-		ConsentLanguage: input.ConsentLanguage, DisplayColor: color, DisplaySymbol: symbol,
+		MemoryTokenHash:    hash(memoryToken),
+		MemoryConsent:      input.MemoryConsentVersion,
+		ConsentLanguage:    input.ConsentLanguage,
 		CampusGraphVersion: s.cfg.CampusGraphVersion,
 		CreatedAt:          now, MemoryExpiresAt: memoryExpires, MemoryDeleteAfter: memoryDeleteAfter,
 	}
@@ -313,10 +319,9 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 	response := map[string]any{
 		"experienceId": experienceID,
 		"memorySession": map[string]any{
-			"sessionId": memoryID, "participantToken": memoryToken, "expiresAt": memoryExpires, "deleteAfter": memoryDeleteAfter,
+			"sessionId": memoryID, "participantToken": memoryToken, "status": "main", "expiresAt": memoryExpires, "deleteAfter": memoryDeleteAfter,
 			"campusGraphVersion": s.cfg.CampusGraphVersion,
 		},
-		"displayAlias": map[string]string{"color": color, "symbol": symbol},
 	}
 	s.writeJSON(w, http.StatusCreated, response)
 }
@@ -339,9 +344,8 @@ func (s *Server) experienceState(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{
 		"memorySession": map[string]any{
-			"sessionId": state.MemorySessionID, "expiresAt": state.MemoryExpiresAt, "deleteAfter": state.MemoryDeleteAfter,
+			"sessionId": state.MemorySessionID, "status": state.MemoryStatus, "expiresAt": state.MemoryExpiresAt, "deleteAfter": state.MemoryDeleteAfter,
 		},
-		"displayAlias": map[string]string{"color": state.DisplayColor, "symbol": state.DisplaySymbol},
 		"photoSummary": map[string]int{"ready": summary.Ready, "pending": summary.Pending, "failed": summary.Failed, "maxCount": 12},
 		"replayStatus": state.ReplayStatus,
 	}
@@ -404,12 +408,12 @@ func (s *Server) stopLive(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), apiErr)
 		return
 	}
-	scope := "stop:" + liveID
-	if replayed := s.replayIdempotent(w, r, scope, body); replayed {
-		return
-	}
 	if err := s.authenticateLive(r, liveID); err != nil {
 		s.writeError(w, requestID(r), err)
+		return
+	}
+	scope := "stop:" + liveID
+	if replayed := s.replayIdempotent(w, r, scope, body); replayed {
 		return
 	}
 	var input stopRequest
@@ -619,6 +623,8 @@ func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err err
 		s.writeError(w, requestID(r), &apiError{Code: "ARRIVAL_QUEUE_FULL", Message: "arrival queue is full; retry after space becomes available", Status: http.StatusServiceUnavailable})
 	case errors.Is(err, store.ErrNotFound):
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_FOUND", Message: "resource was not found", Status: http.StatusNotFound})
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		s.writeError(w, requestID(r), &apiError{Code: "IDEMPOTENCY_CONFLICT", Message: "the idempotency key was already used with different content", Status: http.StatusConflict})
 	case errors.Is(err, store.ErrConflict):
 		s.writeError(w, requestID(r), &apiError{Code: "STATE_CONFLICT", Message: "operation is not valid in the current state", Status: http.StatusConflict})
 	default:
@@ -719,13 +725,6 @@ func nullableString(value string) any {
 		return nil
 	}
 	return value
-}
-
-func displayAlias(seed string) (string, string) {
-	colors := []string{"cyan", "magenta", "amber", "violet", "lime", "coral"}
-	symbols := []string{"circle", "triangle", "diamond", "star", "wave", "square"}
-	sum := sha256.Sum256([]byte(seed))
-	return colors[int(sum[0])%len(colors)], symbols[int(sum[1])%len(symbols)]
 }
 
 func internalError() *apiError {

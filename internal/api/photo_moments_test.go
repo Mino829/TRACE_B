@@ -108,10 +108,10 @@ func TestDevicePhotoMetadataAuthValidationIdempotencyAndRoutes(t *testing.T) {
 	if again := send("POST", base+"/photos", body, secondKey); again.status != 200 || !strings.Contains(again.body, first.ID) {
 		t.Fatalf("client ID retry: %+v", again)
 	}
-	if conflict := send("POST", base+"/photos", devicePhotoBody("device-one", "cp-b", captured), ownerHeaders); conflict.status != 409 {
+	if conflict := send("POST", base+"/photos", devicePhotoBody("device-one", "cp-b", captured), ownerHeaders); conflict.status != 409 || !strings.Contains(conflict.body, `"IDEMPOTENCY_CONFLICT"`) {
 		t.Fatalf("same key changed content: %+v", conflict)
 	}
-	if conflict := send("POST", base+"/photos", devicePhotoBody("device-one", "cp-b", captured), secondKey); conflict.status != 409 {
+	if conflict := send("POST", base+"/photos", devicePhotoBody("device-one", "cp-b", captured), map[string]string{"Authorization": ownerHeaders["Authorization"], "Idempotency-Key": "fresh-client-conflict"}); conflict.status != 409 || !strings.Contains(conflict.body, `"STATE_CONFLICT"`) {
 		t.Fatalf("same ID changed content: %+v", conflict)
 	}
 	older := send("POST", base+"/photos", devicePhotoBody("device-two", "cp-b", time.Now().UTC()), map[string]string{"Authorization": ownerHeaders["Authorization"], "Idempotency-Key": "second-moment"})

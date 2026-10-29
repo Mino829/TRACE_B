@@ -19,6 +19,9 @@ func (s *Store) RegistrationClosed(ctx context.Context) (bool, error) {
 // CloseRegistration waits for in-flight enrollments and commits the stop with
 // its audit record. Existing sessions and their expiry times are unchanged.
 func (s *Store) CloseRegistration(ctx context.Context, now time.Time) error {
+	if OperatorActor(ctx) == "" {
+		return ErrConflict
+	}
 	return s.Transaction(ctx, "", func(tx *Store) error {
 		var closedAt sql.NullTime
 		if err := tx.q.QueryRowContext(ctx, `SELECT closed_at FROM registration_control WHERE singleton=TRUE FOR UPDATE`).Scan(&closedAt); err != nil {
@@ -31,8 +34,6 @@ func (s *Store) CloseRegistration(ctx context.Context, now time.Time) error {
 			}
 			outcome = "closed"
 		}
-		_, err := tx.q.ExecContext(ctx, `INSERT INTO arrival_operator_audit
- (operator_id,action,target_id_short,result,created_at) VALUES ('arrival_issuer','registration.close','registration',$1,$2)`, outcome, now)
-		return err
+		return tx.auditOperator(ctx, "registration.close", "registration", outcome, now)
 	})
 }

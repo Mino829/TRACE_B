@@ -26,6 +26,9 @@ func (s *Store) ReadFallback(ctx context.Context) (FallbackState, error) {
 // privacy-safe operator audit either all commit or all roll back.
 func (s *Store) SetFallback(ctx context.Context, enabled bool, now time.Time) (FallbackState, error) {
 	var state FallbackState
+	if OperatorActor(ctx) == "" {
+		return state, ErrConflict
+	}
 	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
 		var err error
 		state, err = tx.advanceFallback(ctx, now)
@@ -58,9 +61,7 @@ func (s *Store) SetFallback(ctx context.Context, enabled bool, now time.Time) (F
 			}
 			outcome = state.Mode
 		}
-		_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_operator_audit
- (operator_id,action,target_id_short,result,created_at) VALUES ('arrival_issuer',$1,'fallback',$2,$3)`, action, outcome, now)
-		return err
+		return tx.auditOperator(ctx, action, "fallback", outcome, now)
 	})
 	return state, err
 }

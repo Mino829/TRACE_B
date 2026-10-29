@@ -26,6 +26,7 @@ type createdExperience struct {
 	Memory       struct {
 		SessionID          string    `json:"sessionId"`
 		ParticipantToken   string    `json:"participantToken"`
+		Status             string    `json:"status"`
 		ExpiresAt          time.Time `json:"expiresAt"`
 		CampusGraphVersion string    `json:"campusGraphVersion"`
 		DeleteAfter        time.Time `json:"deleteAfter"`

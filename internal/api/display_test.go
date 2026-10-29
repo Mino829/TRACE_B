@@ -22,8 +22,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func displayConfig() config.Config {
-	cfg := arrivalConfig()
+func displayConfig(t *testing.T, f *testdb.Fixture) config.Config {
+	t.Helper()
+	cfg := arrivalConfig(t, f)
 	cfg.DisplayEnabled = true
 	cfg.DisplayGoogleClientID = "display-test.apps.googleusercontent.com"
 	cfg.DisplayOperatorEmails = []string{"operator@example.test"}
@@ -135,7 +136,7 @@ func assertDisplaySafe(t *testing.T, frame displayFrameTest, experience createdE
 
 func TestDisplayDoesNotPublishLegacyPositionsButKeepsArrival(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
 	token := displayToken(t, cfg)
@@ -190,7 +191,7 @@ func TestDisplayDoesNotPublishLegacyPositionsButKeepsArrival(t *testing.T) {
 			t.Fatalf("unexpected display read failure: %v", err)
 		}
 	}
-	proof := projectedProof(t, handler, cfg)
+	proof := projectedProof(t, handler)
 	if arrived := arriveRequest(t, handler, created, proof, "legacy-display-arrival"); arrived.code != http.StatusOK {
 		t.Fatalf("legacy memory arrival: %d %s", arrived.code, arrived.body)
 	}
@@ -199,7 +200,7 @@ func TestDisplayDoesNotPublishLegacyPositionsButKeepsArrival(t *testing.T) {
 
 func TestDisplayBrowserGapResynchronizesWithSnapshot(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
 	conn, response, err := dialDisplay(t, server.URL, displayToken(t, cfg), cfg)
@@ -239,7 +240,7 @@ func TestDisplayBrowserGapResynchronizesWithSnapshot(t *testing.T) {
 
 func TestDisplayBrowserWebsocketLeaseReplayAndVersionRejection(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
 	token := displayToken(t, cfg)
@@ -249,7 +250,7 @@ func TestDisplayBrowserWebsocketLeaseReplayAndVersionRejection(t *testing.T) {
 	}
 	t.Cleanup(func() { secondDB.Close() })
 	standbyServer := displayServer(t, api.New(cfg, secondDB, nil))
-	for _, invalid := range []string{"participant-token", cfg.ArrivalIssuerKey, cfg.DisplayTokenKey} {
+	for _, invalid := range []string{"participant-token", strings.TrimPrefix(operatorTestHeaders()["Authorization"], "Bearer "), cfg.DisplayTokenKey} {
 		conn, response, err := dialDisplay(t, server.URL, invalid, cfg)
 		if err != nil {
 			t.Fatalf("browser handshake: %v %v", err, response)
@@ -295,7 +296,7 @@ func TestDisplayBrowserWebsocketLeaseReplayAndVersionRejection(t *testing.T) {
 	displayInput(t, standby, cfg, "renderer.primary.acquire", "", "", "")
 	nextDisplay(t, standby, "renderer.primary.conflict")
 	created := createExperience(t, handler, cfg)
-	proof := projectedProof(t, handler, cfg)
+	proof := projectedProof(t, handler)
 	result := arriveRequest(t, handler, created, proof, "replay-arrival")
 	if result.code != 200 {
 		t.Fatalf("arrival: %d %s", result.code, result.body)
@@ -332,7 +333,7 @@ func TestDisplayBrowserWebsocketLeaseReplayAndVersionRejection(t *testing.T) {
 
 func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	handler := api.New(cfg, f.Store, nil)
 	server := displayServer(t, handler)
 	conn, response, err := dialDisplay(t, server.URL, displayToken(t, cfg), cfg)
@@ -347,7 +348,7 @@ func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T)
 	}
 	_ = json.Unmarshal(granted.Data, &lease)
 	created := createExperience(t, handler, cfg)
-	arrivalResult := arriveRequest(t, handler, created, projectedProof(t, handler, cfg), "disconnect-test")
+	arrivalResult := arriveRequest(t, handler, created, projectedProof(t, handler), "disconnect-test")
 	if arrivalResult.code != 200 {
 		t.Fatalf("arrival: %s", arrivalResult.body)
 	}
@@ -373,7 +374,7 @@ func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T)
 		time.Sleep(20 * time.Millisecond)
 	}
 	retryPath := "/v1/operator/arrivals/" + arrival.ID + "/retry"
-	retried := request(t, handler, "POST", retryPath, "", issuerHeaders(cfg, "POST", retryPath))
+	retried := request(t, handler, "POST", retryPath, "", operatorTestHeaders())
 	if retried.Code != 200 {
 		t.Fatalf("operator retry: %d %s", retried.Code, retried.Body.String())
 	}
@@ -409,7 +410,7 @@ func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T)
 // display changes must carry the complete, current route without private IDs.
 func TestDisplayDevicePhotoRouteArrivalSnapshotAndMutations(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	cfg.PhotoMetadataEnabled = true
 	photoGraphFixture(t, f, &cfg)
 	cfg.ArrivalCheckpointID = "cp-b"
@@ -442,7 +443,7 @@ func TestDisplayDevicePhotoRouteArrivalSnapshotAndMutations(t *testing.T) {
 	}
 	first := create("display-first", "cp-a")
 	second := create("display-second", "cp-b")
-	proof := projectedProof(t, handler, cfg)
+	proof := projectedProof(t, handler)
 	arrival := arriveRequest(t, handler, owner, proof, "display-device-arrival")
 	if arrival.code != http.StatusOK {
 		t.Fatalf("arrival: %d %s", arrival.code, arrival.body)
@@ -560,7 +561,7 @@ func TestDisplayDevicePhotoRouteArrivalSnapshotAndMutations(t *testing.T) {
 
 func TestDisplayBrowserOriginAndEdgeSeparation(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	cfg.EdgeSharedSecret = "participant-worker-secret-not-for-displays"
 	cfg.AllowedOrigins = []string{"https://participant.example.test"}
 	h := api.New(cfg, f.Store, nil)
@@ -607,7 +608,7 @@ func TestDisplayBrowserOriginAndEdgeSeparation(t *testing.T) {
 
 func TestDisplayBrowserAuthenticatesBeforeSendingState(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	cfg.DisplayAllowedOrigins = append(cfg.DisplayAllowedOrigins, "https://standby.example.test")
 	h := api.New(cfg, f.Store, nil)
 	server := displayServer(t, h)
@@ -646,4 +647,80 @@ func TestDisplayBrowserAuthenticatesBeforeSendingState(t *testing.T) {
 		}
 		expectDisplayClose(t, conn, websocket.CloseMessageTooBig)
 	})
+}
+
+func TestDisplayZeroAndOnePhotoArrivalRoutesAndStoppedDeletion(t *testing.T) {
+	for _, photoCount := range []int{0, 1} {
+		t.Run(fmt.Sprintf("photos=%d", photoCount), func(t *testing.T) {
+			f := testdb.Open(t)
+			cfg := displayConfig(t, f)
+			cfg.PhotoMetadataEnabled = true
+			photoGraphFixture(t, f, &cfg)
+			cfg.ArrivalCheckpointID = "cp-b"
+			handler := api.New(cfg, f.Store, nil)
+			owner := createExperience(t, handler, cfg)
+			base := "/v2/memory-sessions/" + owner.Memory.SessionID + "/photos"
+			var photoID string
+			if photoCount == 1 {
+				response := request(t, handler, "POST", base, devicePhotoBody("only-photo", "cp-a", time.Now().UTC()),
+					map[string]string{"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": "only-photo"})
+				var photo struct {
+					ID string `json:"photoMomentId"`
+				}
+				if response.Code != http.StatusCreated || json.Unmarshal(response.Body.Bytes(), &photo) != nil || photo.ID == "" {
+					t.Fatalf("photo: %d %s", response.Code, response.Body.String())
+				}
+				photoID = photo.ID
+			}
+			proof := projectedProof(t, handler)
+			arrival := arriveRequest(t, handler, owner, proof, "route-arrival")
+			if arrival.code != http.StatusOK {
+				t.Fatalf("arrival: %d %s", arrival.code, arrival.body)
+			}
+			var accepted struct {
+				ID string `json:"arrivalId"`
+			}
+			if err := json.Unmarshal([]byte(arrival.body), &accepted); err != nil || accepted.ID == "" {
+				t.Fatalf("arrival ID: %s %v", arrival.body, err)
+			}
+			state, err := f.Store.DisplaySnapshot(t.Context(), time.Now().UTC())
+			if err != nil || len(state.Arrivals) != 1 {
+				t.Fatalf("arrival snapshot: %+v %v", state, err)
+			}
+			wantPath := []string{}
+			if photoCount == 1 {
+				wantPath = []string{"cp-a", "mid", "cp-b"}
+			}
+			if fmt.Sprint(state.Arrivals[0].PathNodeIDs) != fmt.Sprint(wantPath) || len(state.Arrivals[0].PhotoCheckpoints) != photoCount {
+				t.Fatalf("photo-to-arrival route: %+v want %v", state.Arrivals[0], wantPath)
+			}
+			stop := request(t, handler, "POST", "/v1/memory-sessions/"+owner.Memory.SessionID+"/stop", "",
+				map[string]string{"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": "stop-route"})
+			if stop.Code != http.StatusOK {
+				t.Fatalf("stop: %d %s", stop.Code, stop.Body.String())
+			}
+			if photoID != "" {
+				deleted := request(t, handler, "DELETE", base+"/"+photoID, "", map[string]string{
+					"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": "delete-stopped-photo",
+				})
+				if deleted.Code != http.StatusNoContent {
+					t.Fatalf("stopped owner photo deletion: %d %s", deleted.Code, deleted.Body.String())
+				}
+			}
+			state, err = f.Store.DisplaySnapshot(t.Context(), time.Now().UTC())
+			if err != nil || len(state.Arrivals) != 0 {
+				t.Fatalf("stopped arrival projected: %+v %v", state, err)
+			}
+			var photoEvents int
+			if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM display_events WHERE kind='photo.moment.deleted'`).Scan(&photoEvents); err != nil || photoEvents != 0 {
+				t.Fatalf("stopped photo deletion emitted projection: %d %v", photoEvents, err)
+			}
+			expired := signProof(t, cfg, cfg.ArrivalVenue, time.Now().Add(-time.Minute), time.Now().Add(-40*time.Second))
+			retry := arriveRequest(t, handler, owner, expired, "stopped-arrival-retry")
+			if retry.code != http.StatusOK || !strings.Contains(retry.body, `"status":"skipped"`) ||
+				!strings.Contains(retry.body, accepted.ID) {
+				t.Fatalf("stopped owner current arrival: %d %s", retry.code, retry.body)
+			}
+		})
+	}
 }

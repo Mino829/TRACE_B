@@ -47,7 +47,8 @@ class ManualSafetyTests(unittest.TestCase):
         variants = [{"GCP_PROJECT_ID": "another-project"}, {"GCP_REGION": "us-central1"},
                     {"GCP_SQL_CONNECTION": manual.SQL + "-other"},
                     {"GCP_IMAGE": f"{manual.REGION}-docker.pkg.dev/{manual.PROJECT}/trace/backend:latest"},
-                    {"GCP_RUNTIME_SA": "old-account"}, {"GCP_DISPLAY_TOKEN_SECRET": "old-key:1"}]
+                    {"GCP_RUNTIME_SA": "old-account"}, {"GCP_DISPLAY_TOKEN_SECRET": "old-key:1"},
+                    {"GCP_ARRIVAL_ISSUER_SECRET": "obsolete-key:1"}]
         for values in variants:
             with self.subTest(values=values), patch.dict(os.environ, values), patch.object(manual, "cloud") as cloud:
                 with patch.object(sys, "argv", ["deploy.sh", "quiesce"]), self.assertRaises(manual.Refuse):
@@ -60,11 +61,21 @@ class ManualSafetyTests(unittest.TestCase):
                 self.write_runtime({**self.runtime, name: "true"})
                 with self.assertRaises(manual.Refuse):
                     manual.runtime_env()
-        for name in ("DB_PASSWORD", "DATABASE_URL", "TRACE_EDGE_SHARED_SECRET", "TRACE_PUSH_VAPID_PRIVATE_KEY"):
+        for name in ("DB_PASSWORD", "DATABASE_URL", "TRACE_EDGE_SHARED_SECRET", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_ARRIVAL_ISSUER_KEY"):
             with self.subTest(credential=name):
                 self.write_runtime({**self.runtime, name: "offline-not-a-credential"})
                 with self.assertRaises(manual.Refuse):
                     manual.runtime_env()
+
+    def test_operator_flag_must_be_explicitly_closed_without_cloud_access(self):
+        for value in ("true", None):
+            runtime = {**self.runtime, "TRACE_OPERATOR_ENABLED": value}
+            if value is None:
+                del runtime["TRACE_OPERATOR_ENABLED"]
+            self.write_runtime(runtime)
+            with patch.object(manual, "cloud") as cloud, self.assertRaises(manual.Refuse):
+                manual.runtime_env()
+            cloud.assert_not_called()
 
     def test_ambiguous_or_incomplete_runtime_is_rejected(self):
         for extra in ('DB_USER: "another-role"\n', 'nested:\n  DB_USER: "trace_owner"\n'):

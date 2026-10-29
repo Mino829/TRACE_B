@@ -291,6 +291,19 @@ class ReleaseTests(unittest.TestCase):
                 spec["containers"][0]["env"].pop()
         self.assertEqual(self.writes, [])
 
+    def test_operator_enablement_and_obsolete_issuer_block_before_build(self):
+        for spec in (self.service["spec"]["template"]["spec"], ci.job_spec(self.job)):
+            flag = environment(spec, "TRACE_OPERATOR_ENABLED")
+            flag["value"] = "true"
+            with self.assertRaises(ci.RefuseRelease):
+                self.release.prepare()
+            flag["value"] = "false"
+            spec["containers"][0]["env"].append({"name": "TRACE_ARRIVAL_ISSUER_KEY", "value": "obsolete-offline-key"})
+            with self.assertRaises(ci.RefuseRelease):
+                self.release.prepare()
+            spec["containers"][0]["env"].pop()
+        self.assertEqual(self.writes, [])
+
     def test_active_private_service_blocks_ci_before_mutations(self):
         self.private["metadata"]["annotations"]["run.googleapis.com/manualInstanceCount"] = "1"
         with self.assertRaises(ci.RefuseRelease):

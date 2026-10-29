@@ -47,6 +47,10 @@ func (s *Server) photoAvailable(w http.ResponseWriter, r *http.Request, writing 
 		s.photoError(w, r, err)
 		return false
 	}
+	if writing && memory.StoppedAt != nil {
+		s.photoError(w, r, store.ErrConflict)
+		return false
+	}
 	if memory.PhotoMode == store.PhotoModeDevice {
 		s.photoError(w, r, store.ErrNotFound)
 		return false
@@ -67,6 +71,8 @@ func (s *Server) photoError(w http.ResponseWriter, r *http.Request, err error) {
 		failure = &apiError{Code: "UPLOAD_INCOMPLETE", Message: "upload the image before completing it", Status: http.StatusConflict}
 	case errors.Is(err, store.ErrInvalidCheckpoint):
 		failure = &apiError{Code: "INVALID_CHECKPOINT", Message: "checkpointId is missing or not a selectable photo location", Status: http.StatusBadRequest}
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		failure = &apiError{Code: "IDEMPOTENCY_CONFLICT", Message: "the idempotency key was already used with different content", Status: http.StatusConflict}
 	case errors.Is(err, store.ErrConflict):
 		failure = &apiError{Code: "STATE_CONFLICT", Message: "photo state or request content conflicts", Status: http.StatusConflict}
 	}
@@ -124,7 +130,7 @@ func (s *Server) createPhoto(w http.ResponseWriter, r *http.Request) {
 		receipt, err := tx.GetIdempotency(r.Context(), scope, key, now)
 		if err == nil {
 			if receipt.RequestHash != requestHash {
-				return store.ErrConflict
+				return store.ErrIdempotencyConflict
 			}
 			var locator struct {
 				PhotoHash string `json:"photoHash"`
@@ -158,13 +164,13 @@ func (s *Server) createPhoto(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		created = result.ID == id
-		// Keep only a one-way locator in the 24h receipt, not photo IDs,
+		// Keep only a session-bound one-way locator, not photo IDs,
 		// signed capabilities, image hashes, GPS, or complete request content.
 		locator, err := json.Marshal(map[string]string{"photoHash": hash(result.ID)})
 		if err != nil {
 			return err
 		}
-		return tx.SaveIdempotency(r.Context(), scope, key, requestHash, http.StatusCreated, locator, now.Add(24*time.Hour))
+		return tx.SaveMemoryIdempotency(r.Context(), memoryID, scope, key, requestHash, http.StatusCreated, locator, now.Add(24*time.Hour))
 	})
 	if err != nil {
 		s.photoError(w, r, err)
@@ -397,6 +403,9 @@ func (s *Server) deletePhoto(w http.ResponseWriter, r *http.Request) {
 	complete := false
 	err := s.store.Transaction(r.Context(), memoryID, func(tx *store.Store) error {
 		receipt, err := tx.GetIdempotency(r.Context(), scope, key, now)
+		if err == nil && receipt.RequestHash != hashBytes(nil) {
+			return store.ErrIdempotencyConflict
+		}
 		if err == nil && receipt.ResponseStatus == http.StatusNoContent {
 			complete = true
 			return nil
@@ -416,7 +425,10 @@ func (s *Server) deletePhoto(w http.ResponseWriter, r *http.Request) {
 		if err := tx.QueuePhotoDeletion(r.Context(), memoryID, photoID, "deleted", ""); err != nil {
 			return err
 		}
-		return tx.SaveIdempotency(r.Context(), scope, key, hashBytes(nil), http.StatusAccepted, []byte{}, now.Add(24*time.Hour))
+		if intent {
+			return nil
+		}
+		return tx.SaveMemoryIdempotency(r.Context(), memoryID, scope, key, hashBytes(nil), http.StatusAccepted, []byte{}, now.Add(24*time.Hour))
 	})
 	if err != nil {
 		s.photoError(w, r, err)

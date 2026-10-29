@@ -27,13 +27,24 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 
 新規写真の`checkpointId`は固定Graphに存在し、`selectable:true`であることを必須にします。`role`に依存しないため、選択可能なwaypointも登録できます。未選択・未知ID・`selectable:false`・属性欠落・nullは400 `INVALID_CHECKPOINT`です。SessionのGraph版が現行版と違う場合、新規追加は従来どおり409 `STATE_CONFLICT`で拒否します。Frontendのpayloadへ座標・role・selectable・Graph版を追加する必要はありません。
 
-同じID/同じ内容の再送は同じ記録、別内容は409です。12枚を上限とし、撮影時刻順のチェックポイント経路を作ります。削除はメタデータ・地点・経路を同一トランザクションで消し、削除済み`clientPhotoId`だけのfenceをMemorySessionの`deleteAfter`まで維持するためオフライン再送は404です。0/1枚の到着も維持します。従来のセッションは`photo_mode=legacy`のまま、GCS設定を保持したときだけ旧`/v1`の写真一覧・本人memory画像閲覧・個別削除を期限まで提供します。新モード中は旧`/v1`の登録・upload-url・completeを503で拒否します。
+同じID/同じ内容の再送は同じ記録、同じ冪等性キーで別内容は409 `IDEMPOTENCY_CONFLICT`、同じclient IDを別内容で使う場合は409 `STATE_CONFLICT`です。12枚を上限とし、撮影時刻順にチェックポイント経路を作ります。削除はメタデータ・地点・経路を同一transactionで消し、削除済みclient IDのfenceをMemoryのdeleteAfterまで維持するため遅延再送は404です。写真0枚は経路なし、1枚でも到着後は写真地点からShibaLabまでの区間を返します。旧Sessionはlegacyのまま、GCS設定を保持した場合だけ旧本人APIで一覧・画像閲覧・削除を期限まで提供します。新モード中の旧登録・upload-url・completeは503です。
 
 本人用`GET /v2/.../memory`の写真一覧と経路は、同じ読み取り専用`REPEATABLE READ`トランザクションのコミット済みスナップショットから取得します。読取途中に写真追加・個別削除・期限清掃が確定しても、異なる時点の写真と経路を混在させません。セッション単位ロックを経由しない一括期限削除も対象です。読取終了後はトランザクションを閉じ、API形式・写真0/1枚の既存動作・保存期限・受付フラグは変更しません。この修正に追加migrationは不要です。
 
 新モードと`TRACE_PHOTO_ENABLED=true`（旧アップロード）は併用できません。旧画像・署名付きURLのfenceが残る間は、旧アップロードを無効にしても`TRACE_PHOTO_BUCKET`と`TRACE_PHOTO_SIGNER_EMAIL`をAPI・清掃ジョブ双方に残します。画像が存在するのにGCSへアクセスできない状態では起動を拒否します。`TRACE_REGISTRATION_OPEN=true`には新モードと、**既定の草案とは別に**設定した同意版・本文が必要です。設定値が存在するだけでは大学・運営の承認を証明できません。設計PR #25の確定、同意・保持期間の承認、Frontend/Worker・展示の統合試験までは受付を閉じたままにします。
 
 `010_device_photo_moments.sql`と`011_push_thirty_minutes.sql`は明示的に適用し、`deploy/gcp/runtime-grants.sql`を再適用します。後者は旧15分通知の次回予定を15分延ばして30分へ移行します。旧revisionを止め、受付停止・バックアップ・旧画像の残数とfence・migration・権限を確認してから新APIと清掃ジョブを起動してください。切替後は旧URLが全て期限切れとなり、fenceの再消去が完了するまでGCS設定を外せません。
+
+## 参加停止・本人状態と旧Liveの保持
+
+`POST /v1/memory-sessions/{memorySessionId}/stop`は本人Memory Bearer、Idempotency-Key、空bodyで参加を終端化します。最初のstoppedAtを固定し、Push購読・予定を削除、queued/playingをparticipant_requestでskipし、描画除外とfallback進行まで同じtransactionで確定します。以後の新規写真・初回到着・Push再購読・演出開始は拒否します。単純な通知解除とは異なり再開できません。
+
+停止は削除ではありません。expiresAt/deleteAfterを変更せず、本人の状態・写真ストーリーの閲覧と削除はdeleteAfterまで維持します。本人GETのmemorySession.statusは未到着main、到着後arrived、停止または失効後ended。到着前のreplayStatusはnullで、演出completed/skippedだけでは参加状態をendedにしません。displayAliasとonSiteChoiceRequiredは返しません。
+
+旧Liveは`GET /v1/live-presence-sessions/{liveSessionId}`を自身のLive Bearerで照会し、sessionId・trackingStatus・expiresAt・deleteAfterだけを取得できます。Memory削除後やLive失効後も、Live自身のdeleteAfterまで照会・停止・削除を維持します。Memory/他人のBearerや保持期限後は401。停止で期限を延長せず、旧位置送信・on-site継続を復活させません。
+
+017は停止時刻と写真/停止receiptのMemory所有関係を追加します。新receiptは最大24時間かつMemoryのdeleteAfter以内で、Memory全削除時にcascade消去します。識別可能な既存写真receiptも関連付けます。既に写真が消えて一方向scopeから所有者を復元できない旧receiptは既存期限を維持します。内容なしの全体/一括削除の成功・部分成功receiptだけは従来の最大24時間の再送契約を維持します。
+
 
 ## 実装範囲
 
@@ -48,7 +59,7 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 - 明示的なDBマイグレーションと期限削除コマンド
 - 新規端末写真のメタデータ・経路を返す本人`/v2` API。旧`/v1`のクラウド写真は期限内の閲覧・削除のみ継続
 - 任意同意後のWeb Push撮影リマインダー（既定で無効）：購読情報の暗号化、30分間隔、停止・期限消去
-- 既定無効の投影QR到着受付、運営専用署名発行、永続演出キュー、本人向け再生状態
+- 既定無効の投影QR到着受付、個人運営資格によるproof発行、永続演出キュー、本人向け現在状態
 - 既定無効の描画WSS：短期専用資格、snapshot→PostgreSQL連番差分、単一主描画機lease、再生開始・完了・失敗と期限切れ・切断skip
 
 | メソッド | エンドポイント |
@@ -62,6 +73,8 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | POST | /v1/live-presence-sessions/{liveSessionId}/position |
 | POST | /v1/live-presence-sessions/{liveSessionId}/on-site |
 | POST | /v1/live-presence-sessions/{liveSessionId}/stop |
+| GET | /v1/live-presence-sessions/{liveSessionId} |
+| POST | /v1/memory-sessions/{memorySessionId}/stop |
 | POST | /v1/memory-sessions/{memorySessionId}/arrival |
 | POST | /v1/memory-sessions/{memorySessionId}/arrival/skip |
 | DELETE | /v1/memory-sessions/{memorySessionId} |
@@ -75,6 +88,9 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | DELETE | /v2/memory-sessions/{memorySessionId}/photos/{photoMomentId} |
 | GET | /v2/memory-sessions/{memorySessionId}/memory |
 | PUT / PATCH / DELETE | /v1/memory-sessions/{memorySessionId}/push-subscription |
+| POST | /v1/operator/credentials |
+| DELETE | /v1/operator/credentials/current |
+| DELETE | /v1/operator/credentials |
 | POST | /v1/operator/arrival-proofs |
 | GET | /v1/operator/arrivals |
 | GET | /v1/operator/status |
@@ -86,7 +102,7 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | POST | /v1/operator/arrivals/{arrivalId}/retry |
 | GET (WSS) | /v1/display/ws |
 
-到着QRと描画WebSocketは機能フラグで個別に有効化します。旧写真ストーリーの経路は保存済み写真GPSとCampusGraphから推定し、端末内写真は`checkpointId`から別のメタデータ経路を作ります。端末内写真の到着時・描画機再接続時・到着後の写真追加/削除時には写真地点とノード経路を描画WSへ投影します。非公開運営資格による状態照会・受付停止・全通知停止・fallback切替を提供しますが、Frontend `/display`との表示・認証の結合、旧写真の到着演出素材、個人別運営認証まで完了したとは扱いません。旧写真ピン・フォトスポット表示は廃止しました。
+到着QRと描画WSSは個別flagで有効化します。端末写真のチェックポイント経路を到着・再接続・写真変更時に描画へ投影します。個人別Google運営認証、資格失効、監査、状態照会・受付停止・全通知停止・fallbackまでローカル実装しています。公式Google検証器と合成JWKSによるHTTP/WS・実ブラウザ検証は、実Googleアカウント・staging・投影機材・大学の公開承認の代わりではありません。旧写真ピン・フォトスポット表示は廃止済みです。
 新規写真メタデータは既定で無効です。旧写真ストレージは既存データが消えるまで必要であり、コードのローカル検証だけで一般公開や実データ利用の準備完了を意味しません。
 
 ### 公開APIのレート制限
@@ -99,7 +115,8 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | 本人状態取得、到着、演出skip、会場内選択、停止、個別・一括削除 | 参加トークンごとに30回/分・burst 30 |
 | 写真メタデータ登録 | Memory参加トークンごとに6回/分・burst 6、保持中12件まで |
 | Web Push購読・変更・解除 | Memory参加トークンごとに10回/分・burst 10 |
-| 到着proof発行・候補照会・運営skip | 有効な運営署名の要求を全体で1回/秒・burst 10 |
+| 運営操作 | 認証済actorごとに60回/分・burst 30、全体20回/秒・burst 100 |
+| 個人運営資格の発行 | 検証前のIPごとに12回/分・burst 5、全体1回/秒・burst 10。検証後のactorごとに6回/分・burst 5 |
 | 描画token発行（不正資格を含む） | 接続元IPごとに12回/分・burst 5、全体1回/秒・burst 10 |
 | 描画WS接続試行（認証前） | 接続元IPごとに1回/秒・burst 10、全体10回/秒・burst 20 |
 | 公開APIの追加上限 | 認証付きAPIはIPごとに1200回/分・burst 120。全API合計100回/秒・burst 100 |
@@ -121,31 +138,43 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 10秒ごとに最大50件を抽出し、DB内のMemoryロックと状態再確認のもと、5秒以内にプロバイダへ送信します。送信時刻は厳密には保証しません。payloadは固定の一般文面と相対URL`/photo`だけで、位置・写真・セッションID・参加記号を含みません。正常2xxでは次回を間隔後へ、404/410では鍵を削除、その他の失敗は1分後に再試行します。Web Pushに配信のexactly-once保証はなく、プロバイダ受理後DB commit失敗時には重複し得ます。写真の初回`ready`時は同じトランザクションで次回を延期します。Memory削除準備・Memory/Live削除・Live停止・到着確定・期限清掃は購読も削除します。到着時は同じMemory Storeトランザクション内で`push_stopped=true`を確定し、再購読を禁止します。単純解除は再購読可能です。
 
+## 個人別Google運営認証（既定無効）
+
+TRACE_OPERATOR_ENABLED=falseが既定です。有効化にはTRACE_OPERATOR_GOOGLE_CLIENT_ID、完全一致のTRACE_OPERATOR_EMAILS、TRACE_OPERATOR_ALLOWED_ORIGINSと32バイト以上のTRACE_EDGE_SHARED_SECRETが必要です。初期許可者はasync5855@gmail.comのみ、Web client IDは768829535838-9v4875nkjopo91uobrmggneqodmvec85.apps.googleusercontent.comです。描画用設定・資格とは独立し、Google本人確認を共有しても描画資格だけで運営操作はできません。
+
+認可済み運営入口から、Google ID tokenを単一のAuthorization Bearerに入れ、許可Origin・空body・queryなしでPOST /v1/operator/credentialsへ送ります。Edge keyは展示PCのloopback broker等のサーバー側だけが追加します。公式Google検証器でRS256署名、issuer、Web audience、sub、時刻、email_verified、必要なazpとGmail/Workspace所有権を確認し、200でoperatorToken・credentialId・expiresAt・role:"operator"を返します。
+
+運営資格は256bitの不透明Bearerで2分有効、Origin束縛です。DBには資格hash、安定したGoogle subject hash、正規化メールの照合hashだけを保存し、生メール・sub・Google tokenを保存/ログ出力しません。ブラウザはGoogle tokenと資格をメモリだけで保持し、URL・永続ストレージ・QRへ載せません。操作ごとに期限・失効・現在の独立許可リストを確認します。Google ID token自体、参加者/描画資格、旧発行署名ヘッダーは運営操作に使えません。
+
+DELETE /v1/operator/credentials/currentは現在の資格だけ、DELETE /v1/operator/credentialsは同じ操作者の保存中の全資格を失効し、成功は204です。commit後の要求は401。認証済みの処理中要求や、その後の新しいGoogleログインまで禁止する操作ではありません。アカウント禁止は許可リストから除いて新設定へ切り替えます。失効後の同資格による再送は401で、失効に失敗したUIは成功扱いしません。
+
+資格発行/失効・proof発行・skip/retry・受付/通知停止・fallbackを、個人actor・メール照合hash・時刻・短縮対象・結果と同じtransactionで24時間監査します。hashは匿名化を意味せず許可メールから照合可能です。履歴のarrival_issuer行には個人を後付けせず従来期限まで保持します。018_operator_credentials.sqlを明示適用して権限も再適用します。旧TRACE_ARRIVAL_ISSUER_KEYとHMAC運営経路は撤去済みで、旧設定が残る起動は拒否します。追加の長期運営署名鍵は不要です。
+
 ## 投影QRによる到着（既定無効）
 
-`TRACE_ARRIVAL_ENABLED=false`が既定です。有効化には`TRACE_ARRIVAL_VENUE`（会場ID）、`TRACE_ARRIVAL_CHECKPOINT_ID`（ブースID）、異なる32バイト以上の秘密値`TRACE_ARRIVAL_PROOF_KEY`（QR署名専用）、`TRACE_ARRIVAL_ISSUER_KEY`（運営発行API認証専用）が必須です。鍵を参加者サイト/QR/ログへ渡さず、Secret Manager等で配置してください。鍵の切替・失効は設定の更新と稼働revision切替で行い、旧proofと旧運営署名を即時失効させます。複数revisionを同時公開すると鍵・キューの一貫性が失われるため、切替前に受付停止し単一APIインスタンスを維持してください。大学の審査と運営導線が整うまでフラグは有効化しないでください。
+TRACE_ARRIVAL_ENABLED=falseが既定です。有効化にはTRACE_ARRIVAL_VENUE、TRACE_ARRIVAL_CHECKPOINT_ID、独立した32バイト以上のTRACE_ARRIVAL_PROOF_KEYと公開のTRACE_ARRIVAL_PROOF_KEY_ID（既定arrival-proof-v1）を設定します。発行は独立した個人運営資格で認可します。秘密鍵はSecret Manager等のBackend側だけへ配置します。鍵/key ID切替後は旧proofの新規到着を拒否しますが、到着済み本人の状態回復・閲覧・削除は維持します。複数revisionを同時公開せず、公開承認まではflagを無効にします。
 
-運営専用の`POST /v1/operator/arrival-proofs`へ空bodyでHTTPSアクセスします。認証ヘッダー`X-Trace-Issuer-Timestamp`には現在のUnix秒を十進表記、`X-Trace-Issuer-Signature`には`base64url(HMAC-SHA256(TRACE_ARRIVAL_ISSUER_KEY, "POST\n/v1/operator/arrival-proofs\n" + timestamp))`（paddingなし）を設定します。有効期間は前後15秒です。固定鍵自体を送信せず、署名を短命の運営資格として使います。投影機が取得した`checkpointToken`という**文字列だけ**をWeb URLではなくQRにエンコードし、例えば15秒ごとに交換します。`expiresAt`（UTC）到達後は掲示しません。端末はWeb App内のカメラで読み、既存Memoryセッションのまま送信します。会場用機器からのみ運営経路に到達できるよう、リバースプロキシ/Workerにも運営APIのアクセス制御を設定してください。ブラウザのOriginを伴う運営API要求は拒否します。参加用Bearer tokenやEdge共有シークレットだけでは発行できません。
+POST /v1/operator/arrival-proofsへ許可Origin・個人operator Bearer・空body・queryなしでアクセスします。認証付きloopback brokerがEdge keyをサーバー側で追加し、ブラウザへ渡しません。checkpointTokenはWeb URLではなくQRへエンコードし、例えば15秒ごとに交換、expiresAt後は掲示しません。参加端末はWeb App内のカメラで読み、既存Memoryのまま送信します。認証なしの常時発行や共有QRキャッシュはありません。
 
-配置先が`TRACE_EDGE_SHARED_SECRET`を要求する場合、運営用プライベート経路も`X-Trace-Edge-Secret`を同時に送ります。サイトWorkerは参加者用経路から`/v1/operator/*`への転送を拒否し、運営用の認可済みプライベート入口を別に用意してください。現行運営監査は個人操作者ではなく資格情報を保有する`arrival_issuer`サービス名、操作時刻、到着IDのハッシュ短縮値、結果を24時間保持します。個人別の監査・運営権限分離は運営UIを構築する際に別途必要です。
+参加者用サイトWorkerは/v1/operator/*を転送しません。個人資格の発行・失効・QR発行は認可済み運営入口だけを使い、描画WSSは引き続きブラウザからGoへ直接接続します。Origin許可は認証の代わりではなく、Edge keyだけでも運営操作できません。
 
-発行されるproofは`base64url(JSON).base64url(HMAC-SHA256(TRACE_ARRIVAL_PROOF_KEY, base64url(JSON)))`です。JSONには`checkpointId`、`venue`、`issuedAt`/`expiresAt`（Unix秒）、ランダム`nonce`を含み、有効期間は25秒です。参加端末は`POST /v1/memory-sessions/{memorySessionId}/arrival`へMemory Bearer、`Idempotency-Key`（ランダム値）、JSON `{"checkpointToken":"...","experienceLinkToken":"...","clientTime":"..."}`を送ります。`clientTime`は判定に使わずサーバー時刻を正とします。改変・他会場・期限切れ・未来発行は403、別トークンによる別セッションへの操作は認証で拒否します。投影QRは複数来場者が読むため同一proofを**別Memory間では共有可能**です。同一Memoryへの二重到着は1件のArrivalEventとなり、24時間の同一キー/同一内容の再送は期限切れQRでも元の結果を返します。同一キー/別内容は409、Memory削除と同時に到着・再送記録も消えます。
+proofはbase64url(JSON).base64url(HMAC-SHA256(proof key, base64url(JSON)))で、purpose:"arrival"、keyId、checkpointId、venue、issuedAt/expiresAt（Unix秒）、ランダムnonceを含み25秒有効です。参加者はMemory BearerとIdempotency-Key、{"checkpointToken":"...","clientTime":"..."}を到着APIへ送ります。clientTimeでなくサーバー時刻を正とし、用途・鍵ID・署名・会場・地点・時刻の不正は初回到着を400 INVALID_ARRIVAL_PROOFで拒否します。同一QRは有効期間内に別Memoryからも利用でき、一回限りの物理来場保証ではありません。
 
-到着済みMemorySessionへ別のキーと新しい有効なQRで再送した場合は新たな到着を作らず、現在の演出状態を返します。30秒待機による`timeout`は行いません。初回receiptと状態が異なる場合もあるため、最新状態は本人`GET /v1/experiences/{experienceId}`から取得します。同一キーの元応答再現は維持し、本人閲覧・削除は演出skip後も維持します。
+同じMemoryの到着はArrivalEventを一度だけ作ります。同じキー/同じ内容、または別キーでの本人再送は、QR期限切れ・鍵切替後も同じ到着IDと現在のstatusを返し、過去のqueued応答に固定しません。同じキーの異なる内容は409 IDEMPOTENCY_CONFLICT。Memory削除時は到着/receiptも消え、演出skipで本人照会・削除期限を短縮しません。
 
-有効なExperienceLinkを持つ旧MemorySessionでは当該link tokenを照合し、到着イベントと追跡中・来場前の対応Liveセッションの`arrived`更新を同一トランザクションで確定します。Liveを本人が既に停止していてもMemoryの到着は記録し、停止済み追跡は再開しません。位置書込みと`on_site`継続は廃止済みで、旧Liveでも明示的な停止・本人削除はできます。新規MemorySessionはLiveとのlinkなしで写真0枚でも到着できます。`GET /v1/experiences/{experienceId}`には`replayStatus`（未到着なら空文字、到着後`queued`/`playing`/`completed`/`skipped`）だけを追加し、待ち順、推定待ち時間、表示aliasの待機通知は返しません。人の列が待ち順です。
+旧Memoryの有効なExperienceLinkは照合し、到着と追跡中・来場前の対応Liveのarrived更新を同じtransactionで確定します。停止済みLiveは再開しません。旧位置書込み・on-site継続は廃止済みで本人照会・停止・削除は保持します。新Memoryはlinkなし・写真0枚でも到着できます。本人GETのreplayStatusは未到着null、到着後queued/playing/completed/skipped。待ち順・推定待ち時間・aliasは返しません。
 
-到着は写真機能無効でも有効で、0枚・1枚でもキューに残ります。pending写真があれば最大15秒だけ開始を遅らせ、後から来た到着が追い越さないようにします。永続FIFOの安全上限は有効なMemorySessionの待機50件（`playing`は含まない）。通常待機には再生開始期限を設けず、30秒を過ぎても順番を待ちます。51件目の新規到着は`503 ARRIVAL_QUEUE_FULL`と`Retry-After: 5`を返し、到着・再送記録・Push停止・旧Liveの到着更新を一切確定しません。空きができた後は同じキーと内容で再試行できますが、初回到着には受信時点で有効なQRが必要です。QRが期限切れなら読み直して新しい内容とキーで送ります。MemorySessionの期限切れ・削除時は待機と描画対象から除外し、無期限に個人データを保持しません。本人`POST .../arrival/skip`は未再生の演出だけをスキップします。
+写真0枚でも到着を受け付け、1枚なら写真地点からShibaLabまでの経路を返します。pending写真があれば最大15秒だけ開始を遅らせ、後続は追い越しません。FIFO上限は有効なMemoryの待機50件（playingを除く）で、通常待機30秒ではskipしません。満杯時は503 ARRIVAL_QUEUE_FULLとRetry-After: 5を返し、到着・receipt・Push停止・旧Live更新を確定しません。空き回復後に再試行でき、初回には有効QRが必要です。Memoryの停止・失効・削除は待機/描画から除外します。本人arrival/skipは未再生だけを対象とします。
 
-運営側`GET /v1/operator/arrivals`は同じ署名方式（`GET\n/v1/operator/arrivals\n`）でFIFOの再生候補IDとready写真**件数**を返します。`POST /v1/operator/arrivals/{arrivalId}/skip`は当該パスで署名してスキップできます。既存の明示`retry`は描画機障害によるskipに限り、MemorySessionが有効で待機枠がある場合に再投入します。通常待機の30秒期限は再試行にも適用しません。本人GETにキュー順は出しません。主描画機は通常の開始要求を自動送信し、Backendが先頭の有効な到着であること、pending写真待機条件、他の再生がないことを検証して`playing`を確定します。後続の先行開始・重複再生は`renderer.rejected`です。終了画面4秒の維持とQRの表示制御はFrontendの責務で、Backendの到着状態やタイマーは追加しません。
+運営候補GET・skip/retryも個人operator Bearerを使います。候補はFIFOのIDと写真件数だけです。retryは描画障害skipに限り、有効・未停止Memoryと空き枠が必要です。主描画機が先頭の開始を自動要求し、Backendはlease・先頭・写真待機・単一playingを検証します。先行開始や重複はrenderer.rejected。終了画面4秒とQR非表示はFrontendの責務です。失敗理由は固定分類renderer_failureで記録し、任意の例外文や個人情報は受け付けません。
 
 `013_arrival_fifo_queue.sql`で`replay_deadline`と関連制約・indexを撤去し、`playing`が全体で最大1件となる部分一意indexを追加します。既存の複数`playing`は自動修復せずmigrationを拒否するため、切替前に運営操作で整理してください。**受付停止→既存の待機・再生を処理/明示skipしてキューを空にする→旧API/清掃revisionを停止→バックアップ→明示migration→実行権限再適用→新revisionのready確認**の順に切り替えます。`012`は変更しない履歴であり、未適用環境ではその10件/30秒skipが`013`より先に実行されます。既存待機を残したまま更新しないでください。既にskipされた演出は`013`でも復活させません。schema非互換のため旧バイナリへ直接ロールバックしないでください。旧Live/位置APIの移行方針は冒頭のBackend #26を参照してください。
 
-適用済みschemaが`012`の環境から本版へ更新する場合、`013`〜`016`を番号順に全て適用し、`runtime-grants.sql`も再適用してください。FIFOの変更だけでなく、受付・通知・fallbackの永続制御行も必要です。schema移行はアプリ起動と分離し、旧版API・清掃を停止してから実行します。既存Session・写真の保存Graph版、本人資格、同意、`deleteAfter`を新版に書き換えず、Graph更新後も本人照会・削除を維持します。ローカル移行確認は実staging配備・Googleログイン・Frontend表示・公開承認の代わりではありません（[Backend #41](https://github.com/Mino829/TRACE_B/issues/41)、[配備手順](docs/google-cloud.md#3-dbユーザーと秘密情報)）。
+旧schemaからは018まで欠番なく明示適用しruntime-grants.sqlを再適用します。013のFIFO移行、014～016の運営制御、017の参加停止/receipt所有、018の個人資格/監査が必要です。旧API・清掃revisionを停止してから適用し、旧Session/写真のGraph版・本人資格・同意・deleteAfterを書き換えません。ローカル検証を実staging・実Googleログイン・公開承認の代わりにしません（[配備手順](docs/google-cloud.md#3-dbユーザーと秘密情報)）。
 
 ### 運営状態照会
 
-`GET /v1/operator/status`は、到着proof発行と同じ非公開運営経路・資格を使います。`X-Trace-Issuer-Timestamp`と`X-Trace-Issuer-Signature`に、`GET\n/v1/operator/status\n<timestamp>`へのHMAC署名を送ってください。有効期間は前後15秒、ブラウザOrigin付き要求・参加者Bearer・描画token・Edge共有シークレット単独では取得できません。Edge認証が有効な配置では`X-Trace-Edge-Secret`も必要です。既存の到着運営認証に従い、到着機能が無効なら503、運営操作共通のレート制限超過なら429です。鍵の失効・ローテーションも到着運営資格と共通です。
+GET /v1/operator/statusは同じ非公開運営経路・個人operator Bearer・許可Origin・Edge保護を使います。参加者/描画資格、Google ID token自体、Edge keyだけでは取得できません。運営無効は503、資格不正/失効は401、Origin不許可は403、制限超過は429。状態照会・受付停止・全通知停止はArrivalEnabledと独立して使えます。
 
 | 応答フィールド | 意味 |
 |---|---|
@@ -164,21 +193,21 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 キュー・lease・fallbackは一つのSQLスナップショットで読み、接続数は別途プロセス内から取得するため全項目の同時刻性は保証しません。照会は状態を変更せず、失効leaseの清掃前は`playing`が残っていても`primaryLeaseActive:false`になり得ます。接続数は複数APIプロセスの合計ではありません。既定の単一インスタンス運用を維持してください。参加者・到着・描画機のID、lease資格、写真・地点・画像URLは返さず、応答は`Cache-Control: no-store`です。
 
-状態照会・受付停止・全撮影通知停止・fallback切替は既存の`arrival_issuer`サービス資格を使用します。個人別の運営資格・権限分離と一般公開の運営画面は対象外であり、現地運用全体の完了とは扱いません。
+これらの操作には個人別の独立運営資格と監査を使います。実Googleアカウント、運営入口の配備、機材リハーサル、大学・責任者の公開承認は別で、本実装だけで現地運用完了とはしません。
 
 ### 新規参加受付の停止
 
-`POST /v1/operator/registration/close`へ**空body**で送信します。運営状態照会と同じ非公開経路・認証条件で、署名対象は`POST\n/v1/operator/registration/close\n<timestamp>`です。参加者Bearer、描画資格、Edge共有シークレット単独、ブラウザOrigin付き要求は拒否します。到着機能が無効なら503です。これは既存サービス資格で利用できる限定実装であり、個人別運営認証や一般公開の承認ではありません。
+POST /v1/operator/registration/closeへ個人operator Bearer・許可Origin・空bodyで送ります。Edge keyはサーバー側だけが追加します。参加者/描画資格やGoogle ID token自体では実行できません。運営認証は必要ですが到着機能が無効でも使えます。
 
 成功応答は200 `{"registrationOpen":false}`。停止状態はDBの`registration_control.closed_at`へ永続化し、`TRACE_REGISTRATION_OPEN=true`でも再起動・再デプロイでは再開しません。再送も200で、最初の停止日時を保持します。公開設定と運営statusの`registrationOpen`は、環境設定とこの停止状態の両方を反映します。新規参加は503 `REGISTRATION_CLOSED`となり、MemorySessionやExperienceを作成しません。既に処理中の参加作成と停止はDB行ロックで順序付けられ、停止が成功した後に新しい参加作成を確定しません。
 
-停止は**新規参加だけ**が対象です。既存参加者の写真登録、到着、本人照会・削除、通知・期限清掃には変更を加えません。停止と監査記録を同一トランザクションで確定し、監査失敗時は停止もロールバックします。既存の24時間監査テーブルへサービス名`arrival_issuer`、操作`registration.close`、固定対象`registration`、結果`closed`/`already_closed`、時刻だけを記録します。写真・地点・参加者tokenは含みません。
+停止は新規参加だけが対象で、既存参加者の写真・到着・本人照会/削除・通知/期限清掃を停止しません。停止と個人actor/メール照合hash、registration.close、固定対象registration、結果closed/already_closed、時刻の24時間監査を同じtransactionで確定し、失敗時はロールバックします。写真・地点・参加者tokenは記録しません。
 
-展開時は環境設定で受付を閉じ、旧API/清掃revisionを停止してバックアップ後、`014_registration_control.sql`を明示適用し、`deploy/gcp/runtime-grants.sql`を再適用して新API/清掃を起動します。実行ユーザーには新テーブルのSELECT/UPDATEだけを付与します。`/health/ready`、非公開status、公開設定を確認してから、承認済みの場合だけ環境設定の受付を有効にします。運営停止済みのDBは環境設定だけでは再開しません。再開APIは対象外であり、再開が必要な場合は別途承認されたDB変更手順を用意してください。旧schemaのバイナリへ直接ロールバックしません。
+展開時は受付を閉じ、旧API/清掃を停止してバックアップ後、014の制御表を含む018までの連続migrationとruntime-grantsを明示適用します。実行ユーザーでready・非公開status・公開設定を確認し、承認後だけ受付を有効にします。DBで運営停止済みなら環境設定だけでは再開せず、再開APIは対象外です。旧schemaのバイナリへ直接ロールバックしません。
 
 ### 全撮影通知の停止
 
-`POST /v1/operator/notifications/stop`へ**空body**で送信します。運営状態照会と同じ非公開経路・認証条件で、署名対象は`POST\n/v1/operator/notifications/stop\n<timestamp>`です。参加者Bearer、Google IDトークン、描画token、Edge共有シークレット単独、ブラウザOrigin付き要求では実行できません。到着運営機能が無効なら503ですが、Push機能が無効でも有効な運営資格で残存購読を消去できます。個人別運営認証や本番運営入口の承認は含みません。
+POST /v1/operator/notifications/stopへ個人operator Bearer・許可Origin・空bodyで送ります。Edge keyはサーバー側だけが追加します。参加者/描画資格、Google ID token自体、Edge key単独では実行できません。到着やPushが無効でも、有効な運営資格で残存購読を消去できます。
 
 成功応答は200 `{"notificationsStopped":true}`。`notification_control.stopped_at`へ停止状態を永続化し、active/pausedを問わず全購読の暗号化endpoint・鍵・送信予定を削除します。同じ操作の再送は200で、最初の停止日時を保持します。`TRACE_PUSH_ENABLED=true`のまま再起動・再デプロイしても停止は解除されません。通知再開APIは対象外で、再開には別途承認済みのDB変更手順と参加者による再購読が必要です。
 
@@ -186,14 +215,14 @@ Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscripti
 
 購読・変更・送信は同じ制御行の共有ロックを、運営停止は排他ロックを取得します。停止は送信中のprovider要求が終わるまで待ち、抽出済みの送信候補も送信直前に停止状態を再確認します。ロック待ち失敗では成功を返さず、成功はDB commit後だけです。既にproviderが受理した通知や端末へ届いた通知は取り消せず、停止成功後に端末へ届く場合があります。
 
-停止状態・全購読削除・監査を同じトランザクションで確定し、監査失敗時は停止と削除をロールバックします。既存の24時間監査テーブルへサービス名`arrival_issuer`、操作`notifications.stop`、固定対象`notifications`、結果`stopped`/`already_stopped`、時刻だけを保存し、endpoint・鍵・参加者tokenは記録しません。
+停止・全購読削除・個人actor/メール照合hash、notifications.stop、固定対象notifications、結果stopped/already_stopped、時刻の24時間監査を同じtransactionで確定し、失敗時はロールバックします。endpoint・鍵・参加者tokenは記録しません。
 
-展開時は環境設定で参加受付とPushを無効化し、旧API/清掃revision停止→バックアップ→`015_notification_control.sql`明示適用→`runtime-grants.sql`再適用→新API/清掃起動の順に更新します。実行ユーザーには新テーブルのSELECT/UPDATEだけを付与します。ready・公開設定・非公開statusを実行ユーザーで確認し、承認済みの場合だけ環境設定を有効にしてください。運営停止の有無にかかわらず、旧schemaのバイナリへ直接ロールバックしません。
+展開時は受付/Pushを無効にし、旧API/清掃停止→バックアップ→015の通知制御を含む018までの連続migration→runtime-grants→新API/清掃の順に更新します。実行ユーザーでready・公開設定・非公開statusを確認し、承認後だけ有効化します。旧schemaのバイナリへ直接ロールバックしません。
 
 
 ### 運営によるfallback切替と復帰
 
-`POST /v1/operator/fallback`でfallbackへの切替、`DELETE /v1/operator/fallback`で通常運転への復帰を要求します。どちらも**空body**と非公開運営資格が必要で、署名対象はそれぞれ`POST\n/v1/operator/fallback\n<timestamp>` / `DELETE\n/v1/operator/fallback\n<timestamp>`です。既存の到着運営認証・Edge保護・レート制限を使用し、Googleログイン済みの展示ブラウザにも運営HMAC鍵を配布しません。到着運営または描画機能・必要設定が無効なら503、制限内の非空bodyは400、上限超過は413です。成功応答例は200 `{"fallback":{"mode":"fallback","switchAt":null,"changedAt":"2026-10-28T10:00:00Z"}}`で、`pending`では`switchAt`にUTC時刻が入ります。
+POST /v1/operator/fallbackで切替、DELETEで通常運転へ復帰します。個人operator Bearer・許可Origin・空bodyと、サーバー側運営入口のEdge保護を使います。運営認証または描画機能・必要設定が無効なら503、非空bodyは400、上限超過は413。成功は200 {"fallback":{"mode":"fallback","switchAt":null,"changedAt":"2026-10-28T10:00:00Z"}}で、pendingだけが切替期限を持ちます。
 
 - `normal`: 通常のFIFO再生を許可します。切替要求時に再生中がなければ直ちに`fallback`へ移ります。
 - `pending`: 切替要求時に再生中だった1件だけの終了を待ち、新しい`arrival.replay.started`は拒否します。現在の再生が完了・失敗・切断・削除等で終われば直ちに`fallback`へ移り、終了しなければ要求時刻から30秒の固定期限で当該1件だけを`skipped`（`skip_reason=operator`）にします。再送は期限を延長しません。
@@ -205,9 +234,9 @@ mode・固定期限・変更時刻は`display_fallback_control`に保存しま�
 
 Backendは保持中の参加者経路を認証済み描画WSへ引き続き配信しますが、**参加者の実データをfallbackのデモ素材には使いません**。Frontend側で`pending`中の新規開始を止め、期限を扱い、`fallback`中の参加者演出を停止して合成表示へ切り替える実装が必要です。合成映像の生成・実機の表示切替は本Backend変更に含みません。期限確定は描画WSの250msポーリング／サーバーの1秒清掃で処理し、DB停止やFrontend未対応時の実機切替は保証しません。
 
-有効な操作と再送は既存の24時間監査へ`arrival_issuer`、`fallback.enable` / `fallback.disable`、固定対象`fallback`、結果、時刻だけを保存します。参加者ID・写真・地点・資格は記録せず、監査・イベント保存に失敗すれば当該トランザクションのmodeとskipもロールバックします。実切替の時刻は制御行と永続イベントに残ります。
+有効な操作/再送は個人actor/メール照合hash、fallback.enable/fallback.disable、固定対象fallback、結果、時刻だけを24時間監査します。参加者ID・写真・地点・資格は記録せず、監査/イベント保存失敗時はmode/skipもロールバックします。切替時刻は制御行と永続イベントに残ります。
 
-展開時は受付と描画を無効化し、旧API/清掃revision停止→バックアップ→`014_registration_control.sql`・`015_notification_control.sql`・`016_display_fallback.sql`の番号順の明示適用→`runtime-grants.sql`再適用→新API/清掃起動の順に更新します。新制御テーブルへの実行権限はSELECT/UPDATEのみです。実行ユーザーでready・非公開statusを確認し、対応済みFrontendと接続して切替/復帰・待機保持を検証してから描画を有効にしてください。旧schemaのバイナリへ直接ロールバックしません。
+展開時は受付/描画/運営flagを無効にし、旧API/清掃停止→バックアップ→014～016の制御表と017/018を含む連続migration→runtime-grants→新API/清掃の順に更新します。実行権限・readyを確認し、対応Frontendとの切替/復帰・待機保持を承認済み環境で検証してから個別flagを有効にします。旧schemaへ直接ロールバックしません。
 
 ## 描画WebSocket（既定無効）
 
@@ -331,7 +360,7 @@ APIと清掃ジョブは起動時、APIは`/health/ready`と各`/v1/`・`/v2/`�
 
 APIは起動時と稼働中30秒ごとにDBの期限データを清掃し、旧本人向け位置キャッシュは稼働中毎秒プロセスメモリから消去します。期限切れ位置は清掃前でも本人照会で読み出せません。別途5分ごとのDB清掃ジョブはAPIプロセスの位置メモリを消去できません。Cloud RunのAPIは最大1インスタンス・CPU常時割当とし、スケールアウト・再起動・新旧revision並存で旧本人向け位置キャッシュが失われたり分岐したりするため、追跡中の切替を避けます。
 
-`002_remove_live_positions.sql`で旧表示位置テーブルは破棄し、移行前の位置点は持ち越しません。既存のExperienceLinkは認証トークンの旧期限を`token_expires_at`へ移し、関連付けの保持期限を両セッションの早い`delete_after`へ更新します。再配備時はDBのschema版が非互換となるため、旧revisionを停止してからmigrationを実施します。旧本人向け位置キャッシュは再起動後に復元されません。データ保護承認（設計Issue #9）と到着proofの暫定期限・運営導線の最終仕様（設計Issue #11）は未確定です。
+002_remove_live_positions.sqlは旧表示位置を除去した履歴です。以後の移行でも本人の旧Session・画像の照会/削除と各deleteAfterを維持し、新しいGPS入力・旧アップロードを再開しません。schema変更前は旧revisionを停止します。データ保護承認と実会場の運営経路・Google設定・公開判定は本実装とは別に必要です。
 
 ## テスト
 
@@ -363,12 +392,12 @@ GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合�
 既存PostgreSQLテストの成功後だけ、mainの変更をCloud Runへ反映できます。初期状態は無効で、WIF・必要なIAM権限とGitHub変数の設定後に有効化します。
 DB構造変更は手動確認が必要です。自動更新では現在の環境設定を保持し、一般公開・参加受付開始を行いません。
 
-- 閉鎖staging API：Cloud Run東京、previewのみ、service-level最小0/最大1・request-based CPU。受付・写真・Push・到着・描画は全てfalse
+- 閉鎖staging API：Cloud Run東京、previewのみ、service-level最小0/最大1・request-based CPU。受付・写真・Push・到着・描画・個人運営は全てfalse
 - DB：Cloud SQL for PostgreSQL 17（東京）
 - 接続秘密：Secret Manager、実行用サービスアカウント
 - イメージ：Artifact Registry、Cloud Build
 - 期限削除：Cloud Run Job＋Cloud Scheduler
 
-`bash deploy/gcp/deploy.sh check`と`python3 deploy/gcp/ci_staging.py check-maintenance`は管理APIを書き換えない検証です。実更新は承認後、`quiesce`→停止後backup→003から004〜016の`migrate`→`runtime-grants`→`serve`→清掃確認→`schedule`の順です。immutable image・停止反映・タグ・backup鮮度・SA/秘密の分離・権限を検証し、失敗時に旧private/GPS writerを再開しません。詳しい前提・Edgeの秘匿入力・復旧条件は配備手順に記載しています。
+deploy.sh checkとci_staging.py check-maintenanceは管理APIを変更しません。実更新は承認後にquiesce→停止後backup→003から004～018のmigrate→runtime-grants→serve→清掃→scheduleの順です。閉鎖profileは受付・写真・Push・到着・描画・個人運営flagを全てfalseに強制します。本機能実装では実配備やGoogle設定変更を行っていません。
 
 このリポジトリだけではクラウドリソースは作成・公開されません。課金先プロジェクトとDBの性能・可用性・保持期間を決めてから手順を実行します。

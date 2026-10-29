@@ -32,6 +32,9 @@ func (s *Store) lockPushControl(ctx context.Context) error {
 // StopNotifications serializes with subscription changes and in-flight sends,
 // then commits the durable stop, credential removal and audit record together.
 func (s *Store) StopNotifications(ctx context.Context, now time.Time) error {
+	if OperatorActor(ctx) == "" {
+		return ErrConflict
+	}
 	return s.Transaction(ctx, "", func(tx *Store) error {
 		var stoppedAt sql.NullTime
 		if err := tx.q.QueryRowContext(ctx, `SELECT stopped_at FROM notification_control WHERE singleton=TRUE FOR UPDATE`).Scan(&stoppedAt); err != nil {
@@ -47,8 +50,6 @@ func (s *Store) StopNotifications(ctx context.Context, now time.Time) error {
 		if err := tx.ClearPush(ctx); err != nil {
 			return err
 		}
-		_, err := tx.q.ExecContext(ctx, `INSERT INTO arrival_operator_audit
- (operator_id,action,target_id_short,result,created_at) VALUES ('arrival_issuer','notifications.stop','notifications',$1,$2)`, outcome, now)
-		return err
+		return tx.auditOperator(ctx, "notifications.stop", "notifications", outcome, now)
 	})
 }
