@@ -113,7 +113,7 @@ IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`�
 `TRACE_PUSH_ENABLED=false`が既定です。承認済みの通知文面・別途のブラウザ通知許可・stagingでの実Push確認後だけ有効化してください。MemorySession作成・写真撮影・位置共有には通知が不要です。通知を無効化した場合、新規PUT/PATCHは`503 PUSH_UNAVAILABLE`、DELETEは本人認証後に購読を消去します。無効化して起動すると残存購読を全消去し、外部送信は開始しません。公開設定`notification`は`enabled`、`defaultIntervalMinutes:30`、`allowedIntervalsMinutes:[30]`、`exactDeliveryGuaranteed:false`と、有効化時のみ`vapidPublicKey`を返します。
 
 `TRACE_PUSH_VAPID_PUBLIC_KEY`は非圧縮P-256公開鍵（65 byteのbase64url）、`TRACE_PUSH_VAPID_PRIVATE_KEY`は対応する32 byteの秘密scalar、`TRACE_PUSH_VAPID_SUBJECT`は有効な運営先の`mailto:`、`TRACE_PUSH_ENCRYPTION_KEY`は**VAPIDとは別の**ランダムな32 byte AES-GCM鍵（base64url）です。鍵はSecret ManagerからAPIとworkerへ同一の値を渡し、ソース・通常ログ・運営画面・描画へ出さないでください。古い暗号化鍵を失うと既存購読は復号できません。鍵を変更する場合は購読を一旦消去し、端末に再同意・再購読を求めてください。`005_push_subscriptions.sql`の適用後、`deploy/gcp/runtime-grants.sql`を再適用してからAPIを入れ替えます。
-Cloud Runの`deploy/gcp/runtime.env.yaml`には公開鍵と`mailto:`だけを記載し、秘密鍵と暗号化鍵は置かないでください。`deploy/gcp/deploy.sh serve`には別々のSecret Manager参照`GCP_PUSH_VAPID_PRIVATE_SECRET`と`GCP_PUSH_ENCRYPTION_SECRET`を渡すと、APIと清掃ジョブの両方へ秘密環境変数として配布します。実行サービスアカウントのSecret Accessor権限を両secretに限定してください。常駐ディスパッチャはCloud Runの`--min=1 --no-cpu-throttling`に依存します。スケール・revision並存時の重複と配信時刻、外部プロバイダへの実到達性はstagingで確認してください。
+公開鍵と`mailto:`は通常設定、秘密鍵と暗号化鍵は別々のSecret Manager参照で配置し、実行SAのAccessorを対象secretへ限定します。現行`deploy/gcp/deploy.sh`は受付停止staging専用でPushを含む全featureを無効にし、旧任意`GCP_PUSH_*_SECRET`は拒否します。通知を有効化する別の承認済み配備では、API/workerへの必要鍵、最小1/CPU常時割当、重複・配信時刻・provider到達性・費用を検証してください。閉鎖previewのmin0/request-based CPUでは常駐dispatcherを保証しません。
 
 Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscription`へ`{"consent":true,"subscription":{"endpoint":"https://...","keys":{"p256dh":"base64url","auth":"base64url"}},"intervalMinutes":30}`を送ります。許可・説明後の参加者操作だけで`consent:true`を送信してください。endpointは許可したHTTPS Push serviceだけを受け付け、外部URLを無条件にフェッチしません。`PATCH`は`{"intervalMinutes":30}`または`{"status":"paused"}` / `{"status":"active"}`を受け付け、`DELETE`（空body）は204で未送信予定と鍵を消去します。PUT/PATCHは`status`、`intervalMinutes`、`nextSendAt`、`expiresAt`だけを返し、endpointや鍵は返しません。
 
@@ -355,17 +355,18 @@ GitHub Actionsの設定では専用PostgreSQLサービスを起動して統合�
 
 ## Google Cloudへ配置
 
-[Google Cloud構築・公開手順](docs/google-cloud.md)を参照してください。
-[Cloudflare参加者サイトからの接続条件](docs/cloudflare-origin.md)には、公開経路を有効化する前の条件をまとめています。現在のstagingはIAM保護されたままです。
+[Google Cloud staging更新・公開判定](docs/google-cloud.md)と[Cloudflare接続条件](docs/cloudflare-origin.md)を参照してください。対象は`trace-staging-async5855`です。既存previewのpublic-invoker＋Edge認証を保持し、更新後はpreviewだけを稼働系、旧private `trace-backend`をmanual 0・タグなしの停止系とします。これは配備準備であり、既存環境を停止・更新したという記録ではありません。
 
 初回デプロイ後の自動更新は[検証環境のCI/CD手順](docs/staging-cicd.md)を参照してください。
 既存PostgreSQLテストの成功後だけ、mainの変更をCloud Runへ反映できます。初期状態は無効で、WIF・必要なIAM権限とGitHub変数の設定後に有効化します。
 DB構造変更は手動確認が必要です。自動更新では現在の環境設定を保持し、一般公開・参加受付開始を行いません。
 
-- API：Cloud Run（東京、最小1・最大1インスタンス、CPU常時割当）
+- 閉鎖staging API：Cloud Run東京、previewのみ、service-level最小0/最大1・request-based CPU。受付・写真・Push・到着・描画は全てfalse
 - DB：Cloud SQL for PostgreSQL 17（東京）
 - 接続秘密：Secret Manager、実行用サービスアカウント
 - イメージ：Artifact Registry、Cloud Build
 - 期限削除：Cloud Run Job＋Cloud Scheduler
+
+`bash deploy/gcp/deploy.sh check`と`python3 deploy/gcp/ci_staging.py check-maintenance`は管理APIを書き換えない検証です。実更新は承認後、`quiesce`→停止後backup→003から004〜016の`migrate`→`runtime-grants`→`serve`→清掃確認→`schedule`の順です。immutable image・停止反映・タグ・backup鮮度・SA/秘密の分離・権限を検証し、失敗時に旧private/GPS writerを再開しません。詳しい前提・Edgeの秘匿入力・復旧条件は配備手順に記載しています。
 
 このリポジトリだけではクラウドリソースは作成・公開されません。課金先プロジェクトとDBの性能・可用性・保持期間を決めてから手順を実行します。

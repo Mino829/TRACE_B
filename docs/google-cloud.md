@@ -1,67 +1,68 @@
-# Google Cloud構築・公開手順
+# Google Cloud staging更新・公開判定
 
-対象：Go APIの限定検証MVP。APIの配置をCloud Run、DBをCloud SQL for PostgreSQL 17に統一します。
-この手順やスクリプトの追加だけでは、リソース作成・課金・公開は発生しません。
+対象は既存の`trace-staging-async5855`（東京）の停止受付stagingです。新規環境の構築・productionへの流用・一般公開の手順ではありません。配置方針は[設計PR #22](https://github.com/Mino829/trace-campus-installation/pull/22)、実環境の確認記録は[Backend #5](https://github.com/Mino829/TRACE_B/issues/5)を参照してください。
+
+**このPRは配備準備のみです。以下の変更コマンドは次の実配備承認後に限って実行します。既存サービス停止、migration、Secret/IAM変更、CI有効化を実施済みとは扱いません。**
 
 ## 1. 構成と前提
 
-参加端末 → Cloud RunのHTTPS → Go API → Cloud SQLのPostgreSQL。
+更新後の目標は次のとおりです。
 
-Cloud RunのファイルシステムへDBを置きません。TLS証明書はCloud Runが管理します。Cloud SQL接続は第2世代実行環境の組み込みAuth ProxyとUnixソケットを使います。
+| リソース | 役割・境界 |
+|---|---|
+| Cloudflare `trace-staging-preview` Worker | 同一originの`/api/backend/*`を許可リスト経由で中継し、Edge secretを追加 |
+| `trace-backend-preview` | 稼働系。既存の`allUsers:roles/run.invoker`とGoのEdge認証を維持。受付・写真・Push・到着・描画は全て無効 |
+| `trace-backend` | 停止系。IAM非公開を維持し、明示的なmanual scaling 0・タグなし。旧URLは利用不可 |
+| Cloud SQL `trace-postgres` | `trace-staging-async5855:asia-northeast1:trace-postgres`、PostgreSQL 17、DB `trace` |
+| `trace-cleanup` Job / Scheduler | アプリ権限で期限削除。移行中はSchedulerを止め、実行中Jobの終了を待つ |
+| `trace-migrate` Job | 所有者権限で明示migration。API起動ではDDLを実行しない |
 
-- リージョン：API、DB、Artifact Registryを原則`asia-northeast1`へ揃える。
-- Cloud SQL：PostgreSQL 17、DB名`trace`。検証用の最小構成と展示本番のHA構成は別に判断する。
-- Cloud Run：1 vCPU、512MiB、同時リクエスト40、最小1・最大1、CPU常時割当を初期値とする。描画WS有効時も量子化済み最新位置とレート制限は単一APIプロセスのメモリだけに保持し、PostgreSQLには到着・再生イベントと主描画機leaseだけを保存する。API/WSを同じインスタンスへ接続し、新旧revisionを並存させない。60セッション・8時間の負荷試験で調整する。
-- 接続プール：API1台あたり5接続。通常は最大5接続＋ジョブ分。リビジョン更新中の余裕、管理接続も含めてDB接続上限を確認する。
-- 最小1＋CPU常時割当、Cloud SQL、バックアップ等には待機中も費用が発生する。無料運用前提ではない。予算アラートは支出の強制停止機能ではない。
+停止受付profileは1 vCPU・512MiB・service-level最小0/最大1・request-based CPUです。既存previewの課金方式を維持し、常時CPU・最小1を勝手に追加しません。これは常駐タイマー、Push、描画WSの継続稼働を保証する構成ではありません。これらを有効にする配備と費用・最小1/CPU常時割当の判断は別途必要です。補助清掃は5分ごとなので、無通信時の30秒清掃は保証しません。
 
-Cloud Runのインスタンスは入れ替わるため、常駐タイマーだけに期限削除を任せず、補助のCloud Run JobをSchedulerから起動します。通常の30秒清掃が停止した場合の補助間隔は5分です。期限超過アラートと復旧手順も必要です。
+APIごとのレート制限・接続数はプロセスメモリです。2サービスを同じDBへ接続して各max1にしても単一Backendにはなりません。privateを停止したままにします。タグ付きrevisionは通常trafficが0でも起動し得るため、manual 0だけで停止を判定せず、未知のタグも拒否します。タグの用途を確認せず削除しません。
+
+APIの接続プールは最大5。実DBの`max_connections=25`に対し、Job・候補revision・管理接続の余裕も確認してください。Cloud SQL、バックアップ、ビルド、Job、APIの実行には料金が発生します。Cloudflareの処理、D1/KV、Cloud Runのrequest logまで東京保存と確認済みとは扱いません。
+
+### 2026-10-28の配備前確認
+
+- 2 APIは旧`manual-20261021-1311-144cc03`。mainのmergeだけでは更新されていません。
+- 実DBは連続した`001`〜`003`。アプリ用7テーブルは全て0件、`schema_migrations`は3件でした。必要なのは**004〜016**です。
+- `trace_app`は非superuser、CREATEDB/CREATEROLEなし、publicへのCREATEなし、migration表はSELECTのみ。
+- 既存バックアップは1世代、PITR無効、保存先`asia`。保持・処理地域・復元後消去の承認を省略できません。既存ポリシーを自動変更しません。
+- `trace-build`、preview/cleanup/migration/Schedulerの実行SAは存在します。GitHub用deploy SAは未作成、Actions variables/secretsは未設定です。
+
+これらは確認時点の事実です。別環境のデータやCloudflare D1/KV、未知のストレージが空だという証拠ではありません。
 
 ## 2. 管理者が先に用意するもの
 
-Google CloudのコンソールまたはCloud Shellで、対象プロジェクトを明示して作業します。開発・本番は別プロジェクトまたは別DB・別サービス・別Secretにしてください。
+既存リソースを再作成しません。対象project/region、同名リソースの用途、Cloud SQL接続名、Secretの数値版を照合してください。長期サービスアカウント鍵JSONは不要です。
 
-1. 課金を有効化したプロジェクト、予算アラート。
-2. Cloud Run、Cloud SQL Admin、Artifact Registry、Cloud Build、Secret Manager、Cloud SchedulerのAPI。
-3. 東京リージョンのCloud SQL PostgreSQL 17とDB `trace`。
-4. Docker形式のArtifact Registryリポジトリ `trace`。
-5. 下記3つのサービスアカウント。ユーザー管理鍵のJSONは作らず、実行サービスに割り当てる。
-6. DBパスワード2つをSecret Managerへ登録（`trace-owner-db-password`、`trace-app-db-password`）。
-
-| アカウント | 権限 |
+| アカウント | 用途・必要な境界 |
 |---|---|
-| trace-runtime | Cloud SQL Client。アプリ用パスワードSecretだけのSecret Accessor |
-| trace-migration | Cloud SQL Client。所有者用パスワードSecretだけのSecret Accessor |
-| trace-scheduler | trace-cleanupジョブだけのCloud Run Invoker |
+| `trace-preview-runtime` | preview API。Cloud SQL Client、app-passwordと既存preview Edge secretのAccessor |
+| `trace-runtime` | cleanup。Cloud SQL Client、app-passwordのAccessor。API専用Edge/描画/到着鍵は渡さない |
+| `trace-migration` | migration/grants。Cloud SQL Client、owner-passwordのAccessor。APIには使用しない |
+| `trace-scheduler` | 既存`trace-cleanup` JobだけのInvoker |
 
-デプロイ担当者にはCloud Run作成・更新、対象サービスアカウントを使用する権限、Cloud Build起動等が別途必要です。Cloud Buildの実行アカウントには対象Artifact Registryへの書き込み権限等を付けます。プロジェクト全体のOwnerを実行アカウントへ付けないでください。
-
-今回のソケット構成ではCloud SQLのPublic IP＋Auth Proxy経由を使用します。DBのAuthorized networksに`0.0.0.0/0`を登録しません。Private IP限定にする場合はDirect VPC egress等を別途構成してください。`/cloudsql/接続名/.s.PGSQL.5432`がUnixソケットのパス長制限内になるようにします。
+将来の更新担当者には対象SAのactAs、既存Runリソース更新、Scheduler pause/resume、バックアップ作成・確認、ビルドの権限が必要です。SQL確認/grants用には一時Jobのcreate/execute/get/deleteも使います。既存SAへの追加権限が必要なら別途承認し、Owner/Editorやproject全体のSecret Accessorを実行SAへ与えません。CI用WIF/IAMの設定は[CI/CD手順](staging-cicd.md)に分離します。
 
 ## 3. DBユーザーと秘密情報
 
-Cloud SQL Auth Proxy等を使った管理者のpsql接続で、新しい`trace` DBに対して以下を実行します。既存ロールがある場合は無条件に上書きせず状態を確認してください。
+既存の`trace_owner` / `trace_app`とパスワードを変更・再作成しません。migrationとgrantsはowner、API/cleanupはappで実行します。
 
-```sql
-CREATE ROLE trace_owner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
-CREATE ROLE trace_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
-ALTER DATABASE trace OWNER TO trace_owner;
-```
+- `GCP_APP_PASSWORD_SECRET=trace-app-db-password:1`
+- `GCP_OWNER_PASSWORD_SECRET=trace-owner-db-password:1`
+- `GCP_EDGE_SHARED_SECRET=trace-preview-edge-secret:2`（API専用、必須）
 
-psqlの`\password trace_owner`と`\password trace_app`でパスワードを対話入力し、同じ値をそれぞれSecret Managerへ登録します。パスワードをSQLファイル、シェル履歴、Git、チャットへ書かないでください。
+上記は参照名です。値を設定ファイル・コマンド引数・Git・チャット・ログへ入れません。`latest`は使いません。
 
-マイグレーションは所有者ユーザー、API・清掃ジョブはアプリユーザーで実行します。初回と以降のschema migration後には`trace_owner`として`deploy/gcp/runtime-grants.sql`を実行してください。新しいruntimeテーブルを追加した場合は、このファイルへ必要なテーブル権限を個別に追記し、`trace_app`でアクセスを確認してから新アプリを配信します。
-アプリユーザーにDDL権限がなくても、API・清掃・readinessは動作します。readinessはDBへの接続だけでなく、埋め込みmigrationと適用済み連番の一致も確認します（個別テーブルの権限試験は別途必要）。
+`runtime-grants`はレビュー済みの`deploy/gcp/runtime-grants.sql`を所有者として再適用します。新制御表は必要なSELECT/UPDATEのみです。`serve`前にappとしてmanifestの全権限、連続schema、public/database CREATE不可、migration表書込み不可を実SQLで検証します。readyだけでは個別テーブルの権限を証明できません。
 
-`014_registration_control.sql`は運営による新規参加停止を永続化します。環境設定で受付停止→旧API/清掃revision停止→バックアップ→明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順に更新し、実行ユーザーで公開設定と非公開`GET /v1/operator/status`を確認してください。`POST /v1/operator/registration/close`の署名・応答・監査は[Backend README](../README.md#新規参加受付の停止)を参照してください。停止は再起動で解除されず、既存参加者の写真・到着・削除や期限清掃は維持します。個人別運営権限・再開API・本番運営入口の承認はこの追加に含みません。
-
-`015_notification_control.sql`は運営による全撮影通知停止を永続化します。参加受付とPushを環境設定で無効化し、旧API/清掃revision停止→バックアップ→明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順に更新します。実行ユーザーでready・公開設定・非公開statusを確認してください。停止APIの認証・監査・送信中要求との順序付けは[全撮影通知の停止](../README.md#全撮影通知の停止)を参照してください。停止は全購読のendpoint・鍵・予定を削除し、再起動後も購読・送信を禁止します。既にproviderが受理した通知は取り消せません。通知再開APIと個人別運営権限は対象外です。
-
-`016_display_fallback.sql`は運営の通常/切替待ち/fallbackモードと30秒の固定期限を永続化します。受付・描画を無効化し、旧API/清掃revision停止→バックアップ→未適用の013〜016を番号順に明示migration→`runtime-grants.sql`再適用→新API/清掃起動の順で更新してください。schema012からの更新では013の待機/再生整理も[READMEのFIFO移行手順](../README.md#投影qrによる到着既定無効)に従います。`trace_app`には制御行のSELECT/UPDATEだけを付与し、readyと非公開statusを確認します。対応するFrontendの合成表示とsnapshot全置換を結合し、再生中30秒期限・待機保持・明示復帰・再起動で解除されないことをstagingで確認するまで描画を公開しません。認証・API・イベントは[運営によるfallback切替と復帰](../README.md#運営によるfallback切替と復帰)を参照してください。
+ローカルからのCloud SQL Proxy接続は3307 timeoutで実SQLまで到達できませんでした。`gcloud sql connect`でAuthorized networksを変更する回避はしません。SQL確認/grantsには、digest固定した公式PostgreSQL 17クライアントの一時Cloud Run Jobと既存のUnixソケット接続を使用します。DBサーバーは起動せず、DBパスワードはSecret参照で渡します。UUID名と所有labelを照合して終了時に削除し、削除確認不能も失敗にします。Job実行と通常のCloud Logging保管は発生します。
 
 ## 4. 設定とビルド
 
-リポジトリルートで次のテンプレートをコピーして値を埋めます。
+Python 3標準ライブラリとgcloudを使います。`deploy.sh`が`manual_staging.py`を起動し、CIと同じreadonly guardを利用します。gcloud 591.0.0でreadonlyコマンドとmanual scalingのSDK仕様を確認しています。リポジトリルートで準備します。
 
 ```sh
 cp deploy/gcp/settings.env.example deploy/gcp/settings.env
@@ -71,125 +72,119 @@ set -a
 set +a
 ```
 
-`settings.env`はプロジェクトID、SQL接続名、イメージのリリースタグ、サービスアカウント、Secretの数値バージョンです。DBパスワード自体は含めません。Workerとの接続検証でedge secretを使う場合だけ`GCP_EDGE_SHARED_SECRET=trace-edge-shared-secret:1`のように数値版参照を設定し、実行アカウントにそのSecretのSecret Accessorを付与します。値そのものはファイル・コマンド引数・ログに置かず、GitHubの`STAGING_EDGE_SHARED_SECRET`と同期してください。未指定のまま`serve`を再実行するとAPIからedge secret参照が外れます。公開経路で使用する場合は再実行前に必ず設定を確認してください。
-`runtime.env.yaml`はDB名、CORSの参加画面URL、現地の境界・座標原点、承認済み同意文等です。`DB_HOST`のSQL接続名をsettingsと一致させてください。`TRACE_EDGE_SHARED_SECRET`はここに書かず、`settings.env`の数値版参照からSecret Manager経由でAPIにだけ注入します。清掃ジョブには不要です。`TRACE_REGISTRATION_OPEN`は最初はfalseにします。
-到着受付を有効化する場合、`runtime.env.yaml`の`TRACE_ARRIVAL_ENABLED`、会場/ブースIDを設定し、`settings.env`に互いに異なる数値版`GCP_ARRIVAL_ISSUER_SECRET`/`GCP_ARRIVAL_PROOF_SECRET`を指定します。`deploy.sh serve`は秘密値をAPIのみに注入し、清掃ジョブや参加者サイトへ渡しません。運営用APIのネットワーク分離・同意と受付停止手順を承認するまで無効のままにしてください。
+旧`GCP_RUNTIME_SA`は`GCP_API_RUNTIME_SA` / `GCP_CLEANUP_RUNTIME_SA`へ分離しました。旧任意`GCP_PUSH_*_SECRET` / `GCP_ARRIVAL_*_SECRET` / `GCP_DISPLAY_TOKEN_SECRET`もこの閉鎖profileでは拒否します。値を指定しても黙って無視する互換動作はありません。
 
-ローカルで`make integration`と`go vet ./...`を通した後、Cloud BuildでLinux/amd64イメージを作成します。
+runtime例の参加者originは既存preview Workerです。同意版は未承認の現行draft、本文は受付停止noticeであり、承認済み参加同意ではありません。旧GPS版`2026-memory-01`は無効です。新GPS入力は廃止済みなので未確認のキャンパス境界を作らず、未使用の旧geofence/originはConfig.Defaultを維持します。全feature falseをscriptでも強制し、この例から参加受付を開きません。
+
+3つの空間版はFrontend #61と同じ固定bundleです。データを別Graphへ読み替えません。runtime YAMLは重複キーのないトップレベルのquoted stringだけを受け付け、秘密値、DB URL override、未置換値を拒否します。旧画像やPUT fenceが残る環境では、旧bucket/signerをAPI/cleanupの双方に残す必要があります。今回の空DB確認を他環境へ一般化しません。
+
+実ビルドも次回承認後です。リリース固有タグで作り、返された不変digestを`GCP_IMAGE`へ設定します。
 
 ```sh
-gcloud builds submit --project="$GCP_PROJECT_ID" \
-  --config=cloudbuild.yaml --substitutions="_IMAGE=$GCP_IMAGE" .
+export RELEASE_TAG="manual-$(date -u +%Y%m%d-%H%M%S)-$(git rev-parse --short=12 HEAD)"
+export RELEASE_IMAGE="asia-northeast1-docker.pkg.dev/${GCP_PROJECT_ID}/trace/backend:${RELEASE_TAG}"
+gcloud meta list-files-for-upload
+gcloud builds submit --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+  --config=cloudbuild.yaml --substitutions="_IMAGE=$RELEASE_IMAGE" .
+RELEASE_DIGEST="$(gcloud artifacts docker images describe "$RELEASE_IMAGE" \
+  --project="$GCP_PROJECT_ID" --format='value(image_summary.digest)')"
+export GCP_IMAGE="asia-northeast1-docker.pkg.dev/${GCP_PROJECT_ID}/trace/backend@${RELEASE_DIGEST}"
 ```
 
-このコマンドはソースをGoogle Cloudへアップロードします。`.gcloudignore`は環境設定・DB・Git情報を除外しますが、初回は必ずアップロード対象を確認してください。Cloud Buildはイメージ作成だけを行い、デプロイやDB更新はしません。タグはリリースごとに変え、同じタグを別内容で上書きしないでください。
-
-### 任意の写真用Cloud Storage
-
-写真は既定で無効です。設計Issue #9/#10の承認前に実参加者データを保存したり、ここに記載しただけでbucket作成・権限付与済みと扱ったりしないでください。写真を使わない最初の非公開Backend配備は`TRACE_PHOTO_ENABLED=false`、写真保存先未設定で進められます。
-
-有効にする場合は承認済みの専用bucketを東京`ASIA-NORTHEAST1`に配置し、Uniform bucket-level access、Public access preventionを有効にします。versioning、soft delete、retention/hold、object retention、独立したlifecycleルールを無効にします。soft deleteは新規bucketで既定有効となる場合があるため、明示的に確認してください。アプリはこれらを起動時に検査し、不一致なら停止します。稼働中に変更しないでください。
-
-API・清掃ジョブの両方へ`TRACE_PHOTO_BUCKET`と`TRACE_PHOTO_SIGNER_EMAIL`を設定し、新規写真を許可する段階だけ`TRACE_PHOTO_ENABLED=true`にします。無効化後も既存写真の本人閲覧・削除・清掃に同じ保存先が必要です。写真や短期アップロードフェンスが残る間は保存先を外さないでください。
-
-ADCを使う実行アカウントには、対象bucketだけの`storage.buckets.get`と、必要なobjectのget/create/delete/update/dropContexts権限を付けます。世代を固定した昇格コピーでは、クライアント由来metadata/contextを引き継がないため`storage.objects.dropContexts`も必要です。署名用アカウントにはURL対象のobjectのcreate/get権限、実行アカウントからその署名用アカウントへ`iam.serviceAccounts.signBlob`が必要です。同じ実行アカウントを署名用にする場合も自己署名のIAM権限を確認してください。Secretの読み取り権限とは別であり、Owner/Editorや長期秘密鍵ファイルを使いません。権限付与は管理者のレビュー・承認後に行います。
-
-bucket CORSは承認済み参加画面のoriginと`PUT`/`GET`に限定し、実ブラウザで`Content-Type`、自動設定される`Content-Length`、`x-goog-if-generation-match`、`Cache-Control`を含む署名付きPUTのプリフライトを確認します。`uploadHeaders`は変更せず、5分以内のURLを使用します。画像アクセスログ・監査ログの保持と削除、署名URLの非記録も個人情報責任者と確認してください。SDK独自のclient metricsは無効化しています。
-
-DBは`003_photos.sql`を追加します。自動デプロイを止め、移行窓で手動migration・`runtime-grants.sql`・実行ユーザー権限・readyを確認し、APIと清掃ジョブを同じschema対応版へ更新してからbaselineを進めます。写真の完了・削除・フェンス清掃は承認済みMVP例外として外部I/O中もDB lockを保持するため、10秒のAPI/定期清掃deadlineと接続プールへの影響を実負荷で確認してください。写真の消去成功前にMemorySessionを削除せず、失敗時は`deleting`から再試行します。独立lifecycleでフェンスを早く消すと削除後のPUT再作成を許すため禁止します。
-
-ローカルでは専用PostgreSQLと一時object emulatorによる実HTTP導線、公式SDKのHTTP fixtureで検証しています。実GCSのIAM signBlob・世代条件・CORS・物理消去・清掃ジョブ・負荷/復旧は未検証であり、承認済みstagingで合格するまで写真機能を公開しません。
+レビュー済みcommitの作業ツリーからビルドし、タグを別内容で上書きしません。`GCP_IMAGE`のテンプレートを残したまま変更操作はできません。ソース送信前に`.gcloudignore`で設定・認証ファイルが除外されていることを確認します。
 
 ## 5. マイグレーション → 権限付与 → API
 
+以下は**停止・課金・DB変更を伴う次回承認後の操作**です。CIを無効のままにし、進行中の配信を終了させてから実施します。schema012等の環境では、既存の待機・再生を処理/明示skipしてキューを空にする必要があります。今回のschema003には到着表自体がありません（[FIFO移行契約](../README.md#投影qrによる到着既定無効)）。
+
 ```sh
+bash deploy/gcp/deploy.sh quiesce
+```
+
+Schedulerをpause、private/previewをmanual 0とし、両APIの反映完了・タグなし・cleanupの非terminal実行なしを確認します。Jobが実行中なら終了まで待ち、guardを再実行します。どこかで失敗したら以降へ進みません。
+
+manual 0の反映は、既存requestが全て終了したという実測ではありません。Cloud Runは処理中requestの完了を許容します。実配備では旧revisionのtimeout・終了猶予と、停止後の新しいMonitoring値による実インスタンス数0、実行中request/DB処理・清掃の終了を確認してください。本PRでは実停止、0のままのrevision更新、activationのprovider動作を実行検証していません。このdrain確認が取れてから停止時刻を記録します。
+
+```sh
+export GCP_QUIESCED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+停止完了後に、承認した保存場所で明示バックアップを作ります。東京指定の例です。既存の`asia`バックアップや保持/PITR設定は変更しません。
+
+```sh
+gcloud sql backups create --instance=trace-postgres --project="$GCP_PROJECT_ID" \
+  --location=asia-northeast1 --description="reviewed schema003-to016 maintenance"
+gcloud sql backups list --instance=trace-postgres --project="$GCP_PROJECT_ID" \
+  --format='table(id,type,status,startTime,endTime,location)'
+# Select the completed backup from THIS maintenance, never an old scheduled backup.
+export GCP_BACKUP_ID=RETURNED_NUMERIC_BACKUP_ID
 bash deploy/gcp/deploy.sh migrate
+bash deploy/gcp/deploy.sh runtime-grants
 ```
 
-所有者用Secretを使う`trace-migrate`ジョブを作成・更新し、成功まで待ちます。初回と新規migration適用後はこの後、前述の`runtime-grants.sql`を実行し、`trace_app`で必要なテーブル操作と`schema_migrations`の参照を確認してください。失敗したらAPIを更新せずログを確認します。
+backup ID、対象instance、ON_DEMAND/SUCCESSFUL、停止記録以後の開始・完了時刻を検証します。`migrate`は連続003または既に適用した現行版から実行し、owner Jobで004〜016を適用、事後に連続001〜016を確認します。成功後の再実行は適用済み版を飛ばします。001/002や想定外の履歴をこの手順で自動処理しません。
 
-```sh
+次に既存Edge keyを、画面非表示入力でこのシェルの環境だけへ読み込みます。ファイルや引数へ渡しません。
+
+```bash
+IFS= read -r -s -p 'Existing preview Edge key: ' TRACE_STAGING_EDGE_SHARED_SECRET
+printf '\n'
+export TRACE_STAGING_EDGE_SHARED_SECRET
 bash deploy/gcp/deploy.sh serve
+unset TRACE_STAGING_EDGE_SHARED_SECRET
 ```
 
-清掃ジョブとAPIを作成・更新します。最初はGoogle IAM認証必須の限定公開にします。このスクリプトの再実行もIAM必須に戻すため、一般公開後の更新時には公開設定を別途確認してください。
-設定ファイルの更新は該当サービス・ジョブの環境変数を置き換えます。設定はファイル側に集約してください。
-
-`/health/ready`を起動確認、`/health/live`を死活確認に使用します。DB障害だけでAPIを再起動し続けないよう、livenessはDBへ問い合わせません。
-
-任意の描画WSは`TRACE_DISPLAY_ENABLED=false`のまま配備し、承認後に最新migration、`runtime-grants.sql`、ブラウザから直接到達できる専用HTTPS/WSS入口を用意します。Google OAuth WebクライアントID、許可するGmail/Workspaceメール、展示ページOriginを`TRACE_DISPLAY_GOOGLE_CLIENT_ID`/`TRACE_DISPLAY_OPERATOR_EMAILS`/`TRACE_DISPLAY_ALLOWED_ORIGINS`へ設定します。Google OAuthの許可JavaScript Originにも同じ展示Originを登録してください。到着・Edgeとは独立した32バイト以上の署名鍵をSecret Managerに置き、`settings.env`の`GCP_DISPLAY_TOKEN_SECRET`に数値版参照だけを書いてAPIへ注入します。旧描画issuer鍵は不要です。実行サービスアカウントのAccessor権限は対象Secretだけに限定します。発行はGoogle IDトークン、WSは最初の`renderer.authenticate`で描画資格と版を検証します。仕様・失効の制約は[README](../README.md#描画websocket既定無効)を参照してください。該当2経路だけEdge secretを免除しますが、IAM保護を迂回するものではありません。実Googleログイン・許可外資格拒否・Frontend再接続・承認済み公開経路の検証後にのみ有効化を検討し、参加者Workerへ描画/運営経路や鍵を渡さないでください。
+`serve`はapp権限を実SQLで確認し、両API停止・Scheduler pauseのまま既存cleanupとpreviewのimage/configを更新します。APIはDB+Edge、cleanupはDB秘密だけです。image/環境/Secret参照/SAと既存IAMが一致してからpreviewだけをauto min0/max1へ戻し、Edge拒否・ready・受付停止・bundleを確認します。失敗時はpreviewをmanual 0へ戻し、privateを復活させません。Schedulerはまだpauseのままです。
 
 ### PR #37の展示ブラウザ接続設定
 
-以下は[PR #37のコメント](https://github.com/Mino829/TRACE_B/pull/37#issuecomment-6461440141)への配置手順です。依頼者からWebクライアントIDと運営メールの指定を受け、`.env.example`と`runtime.env.yaml.example`へ反映済みです。描画フラグは無効を維持しており、staging適用・Frontendビルドへの反映・実Googleログインを完了済みとは扱いません。
+指定済みのWeb client ID、運営メール、`https://trace-log.async5855.workers.dev`はruntime例に保持しています。[PR #37のコメント](https://github.com/Mino829/TRACE_B/pull/37#issuecomment-6461440141)と[描画契約](../README.md#描画websocket既定無効)を参照してください。Googleの承認済みJavaScript originには`/display`を含めません。
 
-1. 対象プロジェクトの[Google Auth Platform > Clients](https://console.cloud.google.com/auth/clients?project=trace-staging-507216)で、種類「ウェブアプリケーション」のOAuthクライアントを作成または既存クライアントを確認します。承認済みJavaScript生成元には`https://trace-log.async5855.workers.dev`を登録します。画面のパス`/display`は付けません。OAuth同意画面・対象ユーザー・必要なテストユーザーも運営方針に沿って設定します。
-2. [runtime.env.yaml.example](../deploy/gcp/runtime.env.yaml.example)の`TRACE_DISPLAY_GOOGLE_CLIENT_ID`をFrontend #49の`NEXT_PUBLIC_GOOGLE_CLIENT_ID`へ同じ値で渡し、`NEXT_PUBLIC_DISPLAY_API_URL`も設定してFrontendをビルドし直します。どちらかが未設定ならFrontendはテスト再生のままです。Google Identity ServicesのIDトークンcallback方式であり、クライアントsecretをBackendやFrontendへ渡す処理はありません。
-3. 明示的に許可したGmail/Workspaceメールだけを`TRACE_DISPLAY_OPERATOR_EMAILS`へカンマ区切りで設定します。GitHub名や例示メールから推定しません。`TRACE_DISPLAY_ALLOWED_ORIGINS`には手順1と同じOriginを設定します。現在の設定例と異なるURLへ展示を配置する場合はGoogleとBackendを同時に更新します。
-4. [runtime.env.yaml.example](../deploy/gcp/runtime.env.yaml.example)の3つの空間版をそのまま使用し、Backendの固定Graph・Frontend #61と同じbundleにします。到着・写真・再生中のデータを別Graphへ読み替えず、受付を閉じた移行窓で旧revisionを停止してから切り替えます。
-5. `TRACE_DISPLAY_ENABLED=false`のまま必要な設定・独立した署名secret・承認済みブラウザ到達経路を用意し、実行ユーザーでreadyと公開設定の`spatial`を確認します。承認後に描画を有効化し、実Googleログイン→描画token発行→初回snapshot→主lease→到着→started/completedのackを確認します。旧版の4409、許可外アカウントの401、許可外Originの403も確認します。実Googleログインと長時間再接続が未確認なら公開完了にしません。
-
-`deploy.sh serve`は描画有効/無効にかかわらずCloud Runリクエスト上限を3600秒へ設定します。WS本体は50分で終了、10秒ping/pong、30秒無応答切断。HTTP 10秒middleware期限はWS upgradeへ適用しません。Cloud Run timeout/instance replacement後はrendererが短期資格を再取得し、指数バックオフで新snapshotへ再接続します。上限の長い接続は請求とconcurrency枠を消費するため、現場60人規模の実負荷で検証してください。WebSocket経路をCloudflare Workerの参加者用proxyへ流さず、HTTPS upgrade透過・権限・秘密ヘッダー非記録を運営経路で確認してください。変更しても既存stagingへのデプロイを意味しません。
+この閉鎖profileは描画鍵を配布せず、`TRACE_DISPLAY_ENABLED=false`を強制します。Google Auth Platformの設定、Frontendの同じclient ID/API URLでのビルド、直接HTTPS/WSS入口、独立署名鍵の配備・Accessor権限、実Googleログイン・再接続は別の承認された有効化作業です。Googleログインは描画資格だけを発行し、運営HMAC権限にはなりません。ブラウザに運営鍵やEdge keyを渡しません。
 
 ## 6. 期限削除の補助ジョブ
 
-まずScheduler用サービスアカウントへ、清掃ジョブだけの実行権限を付与します。
+ready/configと権限確認後、同じEdge入力を用意して以下を明示実行します。
 
-```sh
-gcloud run jobs add-iam-policy-binding trace-cleanup \
-  --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
-  --member="serviceAccount:$GCP_SCHEDULER_SA" --role=roles/run.invoker
+```bash
+IFS= read -r -s -p 'Existing preview Edge key: ' TRACE_STAGING_EDGE_SHARED_SECRET
+printf '\n'
+export TRACE_STAGING_EDGE_SHARED_SECRET
+gcloud run jobs execute trace-cleanup --project="$GCP_PROJECT_ID" --region="$GCP_REGION" --wait
 bash deploy/gcp/deploy.sh schedule
-gcloud run jobs execute trace-cleanup \
-  --project="$GCP_PROJECT_ID" --region="$GCP_REGION" --wait
+unset TRACE_STAGING_EDGE_SHARED_SECRET
 ```
 
-Schedulerは5分ごとにGoogle APIへOAuth付きでPOSTし、清掃ジョブを起動します。公開APIに「秘密の清掃URL」は作りません。重複実行はDB内ロックで直列化します。
-ジョブ成功・失敗をCloud Loggingで確認し、失敗と未実行をCloud Monitoringで通知する設定を別途作ってください。Scheduler設定は構成例の同名ジョブを更新するため、既に別用途の`trace-cleanup`が存在するプロジェクトでは実行しないでください。
+`schedule`はprivate停止、API/cleanup同一reviewed digest、閉鎖profile、既存Schedulerのpause/5分間隔/UTC/対象URI/OAuth SAを確認してresumeするだけです。作成、IAM付与、対象の書換えはしません。清掃の失敗/未実行の監視は別途必要です。復元後は期限削除を成功させ、削除済み記録の扱いを確認してから受付再開を判断します。
 
 ## 7. 疎通・公開判定
 
-Cloud Runコンソールで発行URLを確認します。ローカルでIAM認証付きの試験を行うなら以下のプロキシを利用できます。
+変更しない事前確認は`bash deploy/gcp/deploy.sh check`、停止窓の確認は`python3 deploy/gcp/ci_staging.py check-maintenance`です。active確認には既存Edge keyの秘匿環境入力が必要です。管理APIへの更新、DB credentialの取得、Job作成は行いません。現状は2 API稼働なので、manual 0不足で拒否されるのが期待結果です。
 
-```sh
-gcloud run services proxy trace-backend --project="$GCP_PROJECT_ID" \
-  --region="$GCP_REGION" --port=8085
-```
+更新後は次を記録します。
 
-別ターミナルから`http://localhost:8085/health/ready`を確認します。参加者用トークンはAPIのAuthorizationヘッダーで使い、Google IAM認証と混同しないでください。両方を直送する場合、Cloud Run用IDトークンは`X-Serverless-Authorization`、参加者トークンは`Authorization`へ分離します。
+- privateはmanual 0・タグなし、previewは単一配信revision、API/cleanup同digest、最新連続schemaとapp権限。
+- Go直通のno-edge configは403、正しいEdgeでready/configは200。public healthの200は認証漏れではありません。
+- Worker configも同じbundle/受付停止/GPS無効/写真・Push無効。これだけでは参加者E2E合格ではありません。
+- 一般提供前に、設計Issue #23/#9/#10のGPSなし要件・同意/保持・処理地域/提供者・予算/責任者を承認。
+- 別途承認された試験導線で参加→本人メタデータ→到着/再生→停止/本人削除→期限清掃、実Googleログイン、Frontendのfallback/再接続、共有NAT/429、60セッション/8時間、DB再接続と復旧を検証。
 
-受付を開いて試験するときは、設計Issue #23/#9のGPSなし参加と同意文の承認後、管理者が設定ファイルの`TRACE_REGISTRATION_OPEN`をtrueへ変更して再デプロイします。Backend #25の写真地点契約とFrontendの新規受付が未整合の間は受付を開きません。一般参加者へ公開する前に以下を完了してください。
-
-写真地点の`selectable`対応には追加migrationやGraph版の書換えはありません。同じ固定bundleで新API/清掃を配布し、旧revisionとの並走を避けます。承認済みstagingでは、`selectable:true`のwaypointの登録、選択不可checkpointの400、旧Graph版Sessionへの追加409、非選択の到着地点までの経路、到着後に届いた撮影済みメタデータと削除による描画差分を確認してください。旧判定で受理済みの写真は前倒し削除せず、本人操作と既存の期限清掃を維持します。このローカル実装・検証だけで実データ受付や一般公開の承認とは扱いません。
-
-- [実装済みレート制限](../README.md#公開apiのレート制限)の共有IP・全体負荷検証と429監視。CORSだけでは悪用防止にならない。
-- 正しい参加画面URL、旧版と異なる承認済みのMemory同意版・文面、保存期間と問い合わせ先。
-- 実機Memoryのみの参加→写真GPS拒否→旧Liveの位置送信拒否・本人停止・削除→期限削除。
-- Secret・DB権限、HTTPS、ログの位置情報・トークン非記録。
-- 同時負荷、8時間稼働、DB再接続、清掃失敗通知。
-- バックアップ保持・PITR保持と削除説明の整合。復元後は期限削除を実行してから受付を再開する。
-
-IAMの一般公開許可と受付開始は別操作です。レート制限は実装済みですが、実経路の負荷・実機試験などの公開判定を省略できず、一般公開は自動化していません。公開判定を通した後、管理者がCloud Runの呼び出し権限を変更してください。
+公開IAMの存在と参加受付開始は別です。既存previewの境界を保持することは、新しい一般公開や実参加者データ利用の承認ではありません。
 
 ## 8. 更新・復旧・データ移行
 
-初回のAPI・DB接続・削除ジョブの検証後、[検証環境のCI/CD手順](staging-cicd.md)に沿ってGitHub Actionsの自動更新を有効化できます。
-手動ビルドは従来の`cloudbuild.yaml`、Actionsからのビルドは専用アカウント・Cloud Loggingを使う`cloudbuild.ci.yaml`に分けています。
-自動更新は既存リソースのイメージとAPI配信先のみを変更し、マイグレーションや環境設定の置き換えは行いません。
+[CI/CD手順](staging-cicd.md)を有効にするのは、今回の手動移行・権限・Edge/Worker疎通・清掃・復旧を実環境で検証し、mainの対応SHAをschema baselineへ登録した後だけです。mergeのみでbaselineを進めません。
 
-- 新しい不変イメージをビルド→互換マイグレーション→権限更新→サービス更新→疎通試験。
-- 写真PR #18より前のmainに含まれるmigrationはschema version 1・2。`002_remove_live_positions.sql` は旧API/清掃ジョブと非互換のため、受付を停止し、旧API/ジョブを停止してから適用し、対応するAPI・ジョブを起動する（[切替手順](staging-cicd.md#6-運用と復旧)）。写真無効の先行配備にはversion 3は不要。PR #18マージ後は写真の有効/無効を問わずmigration 003と権限確認が必須。適用済みSQLを書き換えない。
-- 到着ブランチ統合後は`006_arrivals.sql`を適用し、`runtime-grants.sql`を再適用する。旧revision/清掃ジョブを停止してからmigrationを行い、schema対応版へ切り替える。旧アプリへのイメージロールバックだけでは旧schemaを読めないため、切替前のDBバックアップと復旧手順を確認する。GPSの移行方針は[Backend #26](../README.md#gps受付廃止の移行backend-26)を参照する。
-- 描画ブランチ統合後は`007_display.sql`を適用し、`runtime-grants.sql`を再適用する。位置のメモリ保持と描画イベントのDBカーソルは単一Backendインスタンスを前提とするため、旧revisionとの並存を避け、受付停止・バックアップ/復旧準備の後に切り替える。
-- アプリ障害時は受付を閉じて修正版を配信する。旧GPS受付を再開する旧イメージへはロールバックしない。DBは自動ダウングレードしない。
-- 本MVPは空のPostgreSQLから開始する。SQLiteのファイル・既存記録は自動削除も転送もしない。
-- DB復元時も古い位置情報を配信しないよう、まず受付停止、清掃、削除済み記録の扱いの確認を行う。
-- 障害時は展示を合成データのフォールバックへ切り替える。別のDBを同時に正本として書き始めない。
+- 失敗時は受付停止を維持し、Schedulerをpause、旧privateを停止のままにする。schemaを扱えない旧003バイナリやGPS/画像受付を再開する版へ戻さない。
+- DBを自動downgradeせず、同schema対応の修正版でfix-forward。バックアップ復元は別の破壊的操作として、停止・削除/期限・失われる更新・復元後消去を確認し明示承認する。
+- migration/grants失敗、一時Jobの削除確認不能、外部IAM/config/traffic変更は成功扱いにせず、実状態を確認する。強制終了時の自動回収を保証しない。
+- 既存Session/写真のGraph版、本人資格、同意、`deleteAfter`を新版へ書き換えない。旧GPS/旧画像の保護・移行方針は[Backend #26](../README.md#gps受付廃止の移行backend-26)に従う。
+- 写真は端末内保存が新規方式。旧GCS画像/PUT fenceがある別環境ではbucket/signer・必要権限・期限清掃を残し、独立lifecycleや前倒し削除を追加しない。このPRでbucketの作成・削除・CORS/IAM変更をしない。
 
-## 公式資料（構成確認に使用）
+## 公式資料
 
-- [Cloud Runコンテナ契約：PORT、HTTPS、永続化制限](https://docs.cloud.google.com/run/docs/container-contract)
-- [Cloud RunからCloud SQLへ接続](https://docs.cloud.google.com/sql/docs/postgres/connect-run)
+- [Cloud Run manual scalingとタグ付きrevision](https://docs.cloud.google.com/run/docs/configuring/services/manual-scaling)
+- [Cloud RunからCloud SQL](https://docs.cloud.google.com/sql/docs/postgres/connect-run)
+- [Cloud SQLのオンデマンドbackup](https://docs.cloud.google.com/sql/docs/postgres/backup-recovery/backing-up)
 - [CPU割当・課金方式](https://docs.cloud.google.com/run/docs/configuring/billing-settings)
-- [Cloud Runジョブの定期実行](https://docs.cloud.google.com/run/docs/execute/jobs-on-schedule)
-- [Cloud Runデプロイ設定](https://docs.cloud.google.com/sdk/gcloud/reference/run/deploy)
+- [Cloud Run Jobの定期実行](https://docs.cloud.google.com/run/docs/execute/jobs-on-schedule)
