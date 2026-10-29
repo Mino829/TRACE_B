@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,14 +18,16 @@ import (
 	"github.com/Mino829/trace_Backend/internal/testdb"
 )
 
-func arrivalConfig() config.Config {
+func arrivalConfig(t *testing.T, f *testdb.Fixture) config.Config {
+	t.Helper()
 	cfg := config.Default()
 	cfg.RegistrationOpen = true
 	cfg.ArrivalEnabled = true
-	cfg.ArrivalIssuerKey = "issuer-secret-independent-of-participant-token-123"
-	cfg.ArrivalProofKey = "proof-secret-independent-of-issuer-456789"
+	cfg.ArrivalProofKey = "proof-secret-independent-of-operator-456789"
+	cfg.ArrivalProofKeyID = "arrival-proof-test-v1"
 	cfg.ArrivalVenue = "campus-booth"
 	cfg.ArrivalCheckpointID = "booth-01"
+	enableOperatorTest(t, f, &cfg)
 	return cfg
 }
 
@@ -36,16 +37,10 @@ func signMessage(key, data string) string {
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func issuerHeaders(cfg config.Config, method, path string) map[string]string {
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	return map[string]string{"X-Trace-Issuer-Timestamp": ts,
-		"X-Trace-Issuer-Signature": signMessage(cfg.ArrivalIssuerKey, method+"\n"+path+"\n"+ts)}
-}
-
-func projectedProof(t *testing.T, h http.Handler, cfg config.Config) string {
+func projectedProof(t *testing.T, h http.Handler) string {
 	t.Helper()
 	path := "/v1/operator/arrival-proofs"
-	r := request(t, h, "POST", path, "", issuerHeaders(cfg, "POST", path))
+	r := request(t, h, "POST", path, "", operatorTestHeaders())
 	if r.Code != http.StatusOK {
 		t.Fatalf("issuer returned %d: %s", r.Code, r.Body.String())
 	}
@@ -63,9 +58,32 @@ func projectedProof(t *testing.T, h http.Handler, cfg config.Config) string {
 
 func signProof(t *testing.T, cfg config.Config, venue string, issued, expires time.Time) string {
 	t.Helper()
-	payload, err := json.Marshal(map[string]any{"checkpointId": cfg.ArrivalCheckpointID,
-		"venue": venue, "issuedAt": issued.Unix(), "expiresAt": expires.Unix(),
+	payload, err := json.Marshal(map[string]any{"purpose": "arrival", "keyId": cfg.ArrivalProofKeyID,
+		"checkpointId": cfg.ArrivalCheckpointID, "venue": venue, "issuedAt": issued.Unix(), "expiresAt": expires.Unix(),
 		"nonce": base64.RawURLEncoding.EncodeToString([]byte("random-proof-nonce-123456"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	return encoded + "." + signMessage(cfg.ArrivalProofKey, encoded)
+}
+
+func alterProof(t *testing.T, cfg config.Config, proof, field string, value any) string {
+	t.Helper()
+	payload, err := base64.RawURLEncoding.DecodeString(strings.Split(proof, ".")[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if value == nil {
+		delete(fields, field)
+	} else {
+		fields[field] = value
+	}
+	payload, err = json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,44 +104,59 @@ type httpResult struct {
 	body string
 }
 
-func TestArrivalIssuerIsolationAndProofBoundaries(t *testing.T) {
+func TestArrivalOperatorIsolationAndProofBoundaries(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	c := seedLegacyExperience(t, f.Store, cfg)
 	path := "/v1/operator/arrival-proofs"
-	for name, headers := range map[string]map[string]string{
-		"participant bearer": {"Authorization": "Bearer " + c.Memory.ParticipantToken},
-		"browser origin": func() map[string]string {
-			v := issuerHeaders(cfg, "POST", path)
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		status  int
+	}{
+		{"participant bearer", map[string]string{"Origin": operatorTestHeaders()["Origin"], "Authorization": "Bearer " + c.Memory.ParticipantToken}, http.StatusUnauthorized},
+		{"participant origin", func() map[string]string {
+			v := operatorTestHeaders()
 			v["Origin"] = cfg.AllowedOrigins[0]
 			return v
-		}(),
-		"wrong signature": {"X-Trace-Issuer-Timestamp": strconv.FormatInt(time.Now().Unix(), 10), "X-Trace-Issuer-Signature": "bad"},
-		"stale signature": func() map[string]string {
-			ts := strconv.FormatInt(time.Now().Add(-time.Minute).Unix(), 10)
-			return map[string]string{"X-Trace-Issuer-Timestamp": ts,
-				"X-Trace-Issuer-Signature": signMessage(cfg.ArrivalIssuerKey, "POST\n"+path+"\n"+ts)}
-		}(),
+		}(), http.StatusForbidden},
+		{"obsolete issuer signature", map[string]string{"Origin": operatorTestHeaders()["Origin"], "X-Trace-Issuer-Timestamp": "1", "X-Trace-Issuer-Signature": "bad"}, http.StatusUnauthorized},
+		{"missing bearer", map[string]string{"Origin": operatorTestHeaders()["Origin"]}, http.StatusUnauthorized},
 	} {
-		if r := request(t, h, "POST", path, "", headers); r.Code != 403 {
-			t.Errorf("%s: %d", name, r.Code)
+		if r := request(t, h, "POST", path, "", tc.headers); r.Code != tc.status {
+			t.Errorf("%s: got %d, want %d", tc.name, r.Code, tc.status)
 		}
 	}
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	if !strings.Contains(proof, ".") || strings.Contains(proof, c.Memory.ParticipantToken) {
 		t.Fatal("proof leaked credentials")
+	}
+	var proofActor, proofEmailHash, proofTarget, proofResult string
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT operator_id,operator_email_hash,target_id_short,result
+ FROM arrival_operator_audit WHERE action='arrival.proof.issue'`).Scan(&proofActor, &proofEmailHash, &proofTarget, &proofResult); err != nil ||
+		proofActor != operatorTestActor || proofEmailHash != operatorTestHash("operator.email\x00operator@gmail.com") ||
+		proofTarget == cfg.ArrivalCheckpointID || proofResult != "issued" {
+		t.Fatalf("proof identity audit: %s %s %s %s %v", proofActor, proofEmailHash, proofTarget, proofResult, err)
 	}
 	now := time.Now().UTC()
 	for name, candidate := range map[string]string{
 		"tamper":              proof[:len(proof)-1] + "!",
+		"missing purpose":     alterProof(t, cfg, proof, "purpose", nil),
+		"wrong purpose":       alterProof(t, cfg, proof, "purpose", "display.ws"),
+		"missing key ID":      alterProof(t, cfg, proof, "keyId", nil),
+		"wrong key ID":        alterProof(t, cfg, proof, "keyId", "retired-proof-v0"),
+		"missing nonce":       alterProof(t, cfg, proof, "nonce", nil),
+		"short nonce":         alterProof(t, cfg, proof, "nonce", "c2hvcnQ"),
+		"wrong checkpoint":    alterProof(t, cfg, proof, "checkpointId", "another-checkpoint"),
+		"empty proof":         "",
 		"foreign venue":       signProof(t, cfg, "another-booth", now, now.Add(20*time.Second)),
 		"expired":             signProof(t, cfg, cfg.ArrivalVenue, now.Add(-31*time.Second), now.Add(-5*time.Second)),
 		"expires exactly now": signProof(t, cfg, cfg.ArrivalVenue, now.Add(-20*time.Second), now),
 		"overlong proof":      signProof(t, cfg, cfg.ArrivalVenue, now, now.Add(30*time.Second)),
 		"future":              signProof(t, cfg, cfg.ArrivalVenue, now.Add(time.Minute), now.Add(time.Minute+20*time.Second)),
 	} {
-		if r := arriveRequest(t, h, c, candidate, name); r.code != 403 {
+		if r := arriveRequest(t, h, c, candidate, name); r.code != http.StatusBadRequest || !strings.Contains(r.body, `"code":"INVALID_ARRIVAL_PROOF"`) {
 			t.Errorf("%s accepted: %d %s", name, r.code, r.body)
 		}
 	}
@@ -146,8 +179,8 @@ func TestArrivalIssuerIsolationAndProofBoundaries(t *testing.T) {
 	if r := arriveRequest(t, h, c, proof, "valid"); r.code != 200 {
 		t.Fatalf("retry: %d %s", r.code, r.body)
 	}
-	if r := arriveRequest(t, h, c, signProof(t, cfg, cfg.ArrivalVenue, now, now.Add(20*time.Second)), "valid"); r.code != 409 {
-		t.Fatalf("same key different body: %d", r.code)
+	if r := arriveRequest(t, h, c, signProof(t, cfg, cfg.ArrivalVenue, now, now.Add(20*time.Second)), "valid"); r.code != 409 || !strings.Contains(r.body, `"code":"IDEMPOTENCY_CONFLICT"`) {
+		t.Fatalf("same key different body: %d %s", r.code, r.body)
 	}
 	if r := arriveRequest(t, h, c, proof, "other-key"); r.code != 200 {
 		t.Fatalf("duplicate arrival: %d %s", r.code, r.body)
@@ -180,7 +213,7 @@ func TestArrivalStopsPushAtomicallyForLiveAndMemoryOnly(t *testing.T) {
 	for _, live := range []bool{true, false} {
 		t.Run(fmt.Sprintf("live=%t", live), func(t *testing.T) {
 			f := testdb.Open(t)
-			cfg := arrivalConfig()
+			cfg := arrivalConfig(t, f)
 			h := api.New(cfg, f.Store, nil)
 			var memoryID, memoryToken, linkToken, experienceID string
 			if live {
@@ -204,7 +237,7 @@ func TestArrivalStopsPushAtomicallyForLiveAndMemoryOnly(t *testing.T) {
 			if _, err := f.Store.PutPush(t.Context(), sub, time.Now().UTC()); err != nil {
 				t.Fatal(err)
 			}
-			proof := projectedProof(t, h, cfg)
+			proof := projectedProof(t, h)
 			body := fmt.Sprintf(`{"checkpointToken":%q,"experienceLinkToken":%q}`, proof, linkToken)
 			path := "/v1/memory-sessions/" + memoryID + "/arrival"
 			headers := map[string]string{"Authorization": "Bearer " + memoryToken, "Idempotency-Key": "arrival-stops-push"}
@@ -238,7 +271,7 @@ func TestArrivalStopsPushAtomicallyForLiveAndMemoryOnly(t *testing.T) {
 
 func TestArrivalWithStoppedLiveStillRecordsMemoryEvent(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	c := seedLegacyExperience(t, f.Store, cfg)
 	stopPath := "/v1/live-presence-sessions/" + c.Live.SessionID + "/stop"
@@ -247,7 +280,7 @@ func TestArrivalWithStoppedLiveStillRecordsMemoryEvent(t *testing.T) {
 	if stopped.Code != http.StatusOK {
 		t.Fatalf("stop: %d %s", stopped.Code, stopped.Body.String())
 	}
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	if r := arriveRequest(t, h, c, proof, "after-stop"); r.code != http.StatusOK {
 		t.Fatalf("memory arrival after stop: %d %s", r.code, r.body)
 	}
@@ -261,7 +294,7 @@ func TestArrivalWithStoppedLiveStillRecordsMemoryEvent(t *testing.T) {
 
 func TestArrivalQueuePendingPhotoWaitAndDeletion(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	c := createExperience(t, h, cfg)
 	now := time.Now().UTC()
@@ -273,12 +306,12 @@ func TestArrivalQueuePendingPhotoWaitAndDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	if r := arriveRequest(t, h, c, proof, "photo-pending"); r.code != 200 {
 		t.Fatalf("pending photo should not block arrival: %d %s", r.code, r.body)
 	}
 	path := "/v1/operator/arrivals"
-	list := request(t, h, "GET", path, "", issuerHeaders(cfg, "GET", path))
+	list := request(t, h, "GET", path, "", operatorTestHeaders())
 	if list.Code != 200 || strings.Contains(list.Body.String(), `"arrivalId"`) {
 		t.Fatalf("pending photo wait: %d %s", list.Code, list.Body.String())
 	}
@@ -286,21 +319,21 @@ func TestArrivalQueuePendingPhotoWaitAndDeletion(t *testing.T) {
 		c.Memory.SessionID, now.Add(-20*time.Second), now.Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	list = request(t, h, "GET", path, "", issuerHeaders(cfg, "GET", path))
+	list = request(t, h, "GET", path, "", operatorTestHeaders())
 	if list.Code != 200 || !strings.Contains(list.Body.String(), `"readyPhotoCount":0`) {
 		t.Fatalf("wait cap with pending photo: %d %s", list.Code, list.Body.String())
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE photos SET status='ready' WHERE memory_session_id=$1", c.Memory.SessionID); err != nil {
 		t.Fatal(err)
 	}
-	list = request(t, h, "GET", path, "", issuerHeaders(cfg, "GET", path))
+	list = request(t, h, "GET", path, "", operatorTestHeaders())
 	if list.Code != 200 || !strings.Contains(list.Body.String(), `"readyPhotoCount":1`) {
 		t.Fatalf("one ready photo: %d %s", list.Code, list.Body.String())
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), "UPDATE arrival_events SET arrived_at=$2,photo_wait_until=$2 WHERE memory_session_id=$1", c.Memory.SessionID, now.Add(-2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	list = request(t, h, "GET", path, "", issuerHeaders(cfg, "GET", path))
+	list = request(t, h, "GET", path, "", operatorTestHeaders())
 	if list.Code != 200 || !strings.Contains(list.Body.String(), `"readyPhotoCount":1`) {
 		t.Fatalf("long-waiting arrival disappeared: %d %s", list.Code, list.Body.String())
 	}
@@ -331,10 +364,10 @@ func TestArrivalQueuePendingPhotoWaitAndDeletion(t *testing.T) {
 
 func TestArrivalConcurrentDuplicateAndOperatorSkip(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	c := createExperience(t, h, cfg)
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	results := make(chan *httpResult, 4)
 	var wg sync.WaitGroup
 	for i := range 4 {
@@ -356,10 +389,10 @@ func TestArrivalConcurrentDuplicateAndOperatorSkip(t *testing.T) {
 	if r := request(t, h, "POST", path, "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken}); r.Code != 403 {
 		t.Fatalf("participant skipped via operator: %d", r.Code)
 	}
-	if r := request(t, h, "POST", path, "", issuerHeaders(cfg, "POST", path)); r.Code != 200 {
+	if r := request(t, h, "POST", path, "", operatorTestHeaders()); r.Code != 200 {
 		t.Fatalf("operator skip: %d %s", r.Code, r.Body.String())
 	}
-	if r := request(t, h, "POST", path, "", issuerHeaders(cfg, "POST", path)); r.Code != 200 {
+	if r := request(t, h, "POST", path, "", operatorTestHeaders()); r.Code != 200 {
 		t.Fatalf("operator retry skip: %d", r.Code)
 	}
 	var status string
@@ -394,10 +427,10 @@ func TestArrivalConcurrentDuplicateAndOperatorSkip(t *testing.T) {
 
 func TestArrivalDeletionRaceNeverLeavesQueueEntry(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	c := createExperience(t, h, cfg)
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	results := make(chan int, 2)
 	start := make(chan struct{})
 	go func() {
@@ -420,5 +453,80 @@ func TestArrivalDeletionRaceNeverLeavesQueueEntry(t *testing.T) {
 	if err := f.SQL.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM arrival_events WHERE memory_session_id=$1", c.Memory.SessionID).
 		Scan(&count); err != nil || count != 0 {
 		t.Fatalf("deleted arrival persisted: %d %v", count, err)
+	}
+}
+
+func TestArrivalRetryReturnsCurrentStateWithExpiredOrRetiredProof(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := arrivalConfig(t, f)
+	cfg.DisplayEnabled = true
+	h := api.New(cfg, f.Store, nil)
+	owner := createExperience(t, h, cfg)
+	proof := projectedProof(t, h)
+	first := arriveRequest(t, h, owner, proof, "original-arrival")
+	if first.code != http.StatusOK {
+		t.Fatalf("first arrival: %d %s", first.code, first.body)
+	}
+	var original struct {
+		ID string `json:"arrivalId"`
+	}
+	if err := json.Unmarshal([]byte(first.body), &original); err != nil || original.ID == "" {
+		t.Fatalf("arrival ID: %s %v", first.body, err)
+	}
+	if err := f.Store.SkipOwnArrival(t.Context(), owner.Memory.SessionID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM display_events`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	rotated := cfg
+	rotated.ArrivalProofKeyID = "arrival-proof-test-v2"
+	rotated.ArrivalProofKey = "new-proof-key-without-old-key-verification-123"
+	retiredProofHandler := api.New(rotated, f.Store, nil)
+	expired := signProof(t, cfg, cfg.ArrivalVenue, time.Now().Add(-time.Minute), time.Now().Add(-40*time.Second))
+	for _, retry := range []struct {
+		handler http.Handler
+		proof   string
+		key     string
+	}{
+		{retiredProofHandler, proof, "original-arrival"},
+		{h, expired, "new-key-after-proof-expiry"},
+	} {
+		result := arriveRequest(t, retry.handler, owner, retry.proof, retry.key)
+		var current struct {
+			ID     string `json:"arrivalId"`
+			Status string `json:"status"`
+		}
+		err := json.Unmarshal([]byte(result.body), &current)
+		if result.code != http.StatusOK || err != nil || current.ID != original.ID || current.Status != "skipped" ||
+			strings.Contains(result.body, "onSiteChoiceRequired") {
+			t.Fatalf("current arrival retry: %d %s %v", result.code, result.body, err)
+		}
+	}
+	if result := arriveRequest(t, h, owner, expired, "original-arrival"); result.code != http.StatusConflict || !strings.Contains(result.body, `"code":"IDEMPOTENCY_CONFLICT"`) {
+		t.Fatalf("changed expired request bypassed receipt conflict: %d %s", result.code, result.body)
+	}
+	newOwner := createExperience(t, h, cfg)
+	if result := arriveRequest(t, h, newOwner, expired, "new-arrival-expired-proof"); result.code != http.StatusBadRequest || !strings.Contains(result.body, `"code":"INVALID_ARRIVAL_PROOF"`) {
+		t.Fatalf("expired proof authorized new arrival: %d %s", result.code, result.body)
+	}
+	var after int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM display_events`).Scan(&after); err != nil || before != after {
+		t.Fatalf("arrival recovery emitted duplicate events: before=%d after=%d err=%v", before, after, err)
+	}
+}
+
+func TestArrivalProofIssuanceRequiresSuccessfulAudit(t *testing.T) {
+	f := testdb.Open(t)
+	cfg := arrivalConfig(t, f)
+	h := api.New(cfg, f.Store, nil)
+	if _, err := f.SQL.ExecContext(t.Context(), `ALTER TABLE arrival_operator_audit
+ ADD CONSTRAINT reject_arrival_proof_audit CHECK (action<>'arrival.proof.issue')`); err != nil {
+		t.Fatal(err)
+	}
+	response := request(t, h, "POST", "/v1/operator/arrival-proofs", "", operatorTestHeaders())
+	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "checkpointToken") {
+		t.Fatalf("unaudited proof issued: %d %s", response.Code, response.Body.String())
 	}
 }

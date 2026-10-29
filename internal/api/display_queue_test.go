@@ -15,7 +15,7 @@ import (
 
 func TestArrivalQueueFullHTTPIsRetryableWithoutPartialArrival(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	for i := range 50 {
@@ -32,7 +32,7 @@ func TestArrivalQueueFullHTTPIsRetryableWithoutPartialArrival(t *testing.T) {
 		}
 	}
 	owner := createExperience(t, h, cfg)
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	path := "/v1/memory-sessions/" + owner.Memory.SessionID + "/arrival"
 	body := fmt.Sprintf(`{"checkpointToken":%q,"experienceLinkToken":%q,"clientTime":"2000-01-01T00:00:00Z"}`, proof, owner.LinkToken)
 	headers := map[string]string{"Authorization": "Bearer " + owner.Memory.ParticipantToken, "Idempotency-Key": "full-retry"}
@@ -50,7 +50,7 @@ func TestArrivalQueueFullHTTPIsRetryableWithoutPartialArrival(t *testing.T) {
 			t.Fatalf("partial %s: %d %v", table, count, err)
 		}
 	}
-	if err := f.Store.SkipArrival(t.Context(), "full-arrival-00", time.Now().UTC()); err != nil {
+	if err := f.Store.SkipArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), "full-arrival-00", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	retry := request(t, h, "POST", path, body, headers)
@@ -68,7 +68,7 @@ func TestArrivalQueueFullHTTPIsRetryableWithoutPartialArrival(t *testing.T) {
 
 func TestDisplayWebSocketWaitsAndReplaysInOrder(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	server := displayServer(t, h)
 	token := displayToken(t, cfg)
@@ -86,7 +86,7 @@ func TestDisplayWebSocketWaitsAndReplaysInOrder(t *testing.T) {
 	if err := json.Unmarshal(frame.Data, &lease); err != nil || lease.ID == "" {
 		t.Fatalf("lease: %s %v", frame.Data, err)
 	}
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	owners := []createdExperience{createExperience(t, h, cfg), createExperience(t, h, cfg)}
 	ids := make([]string, 2)
 	for i, owner := range owners {

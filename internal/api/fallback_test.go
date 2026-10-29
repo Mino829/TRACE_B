@@ -18,7 +18,7 @@ const fallbackPath = "/v1/operator/fallback"
 
 func fallbackRequest(t *testing.T, h http.Handler, cfg config.Config, method string) store.FallbackState {
 	t.Helper()
-	headers := issuerHeaders(cfg, method, fallbackPath)
+	headers := operatorTestHeaders()
 	if cfg.EdgeSharedSecret != "" {
 		headers["X-Trace-Edge-Secret"] = cfg.EdgeSharedSecret
 	}
@@ -58,7 +58,7 @@ func seedFallbackPlaying(t *testing.T, f *testdb.Fixture, h http.Handler, cfg co
 
 func TestFallbackControlAndStatus(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	cfg.EdgeSharedSecret = "independent-edge-secret-1234567890"
 	h := api.New(cfg, f.Store, nil)
 	state := fallbackRequest(t, h, cfg, http.MethodPost)
@@ -69,7 +69,7 @@ func TestFallbackControlAndStatus(t *testing.T) {
 	if repeated.Mode != state.Mode || !repeated.ChangedAt.Equal(state.ChangedAt) {
 		t.Fatalf("repeated enable changed state: %+v -> %+v", state, repeated)
 	}
-	statusHeaders := issuerHeaders(cfg, http.MethodGet, operatorStatusPath)
+	statusHeaders := operatorTestHeaders()
 	statusHeaders["X-Trace-Edge-Secret"] = cfg.EdgeSharedSecret
 	status := fallbackResponse(t, request(t, h, http.MethodGet, operatorStatusPath, "", statusHeaders))
 	if status.Mode != state.Mode || !status.ChangedAt.Equal(state.ChangedAt) {
@@ -80,14 +80,14 @@ func TestFallbackControlAndStatus(t *testing.T) {
 		t.Fatalf("manual recovery: %+v", state)
 	}
 	var enabled, disabled int
-	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FILTER (WHERE action='fallback.enable'), COUNT(*) FILTER (WHERE action='fallback.disable') FROM arrival_operator_audit WHERE operator_id='arrival_issuer' AND target_id_short='fallback'`).Scan(&enabled, &disabled); err != nil || enabled < 1 || disabled != 1 {
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FILTER (WHERE action='fallback.enable'), COUNT(*) FILTER (WHERE action='fallback.disable') FROM arrival_operator_audit WHERE operator_id=$1 AND target_id_short='fallback'`, operatorTestActor).Scan(&enabled, &disabled); err != nil || enabled < 1 || disabled != 1 {
 		t.Fatalf("fallback audits: enabled=%d disabled=%d err=%v", enabled, disabled, err)
 	}
 }
 
 func TestFallbackPendingDeadlineAndManualRecovery(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	seedFallbackPlaying(t, f, h, cfg)
 	before := time.Now().UTC()
@@ -113,7 +113,7 @@ func TestFallbackPendingDeadlineAndManualRecovery(t *testing.T) {
 	if err := f.Store.RefreshDisplay(t.Context(), pending.SwitchAt.Add(time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	state := fallbackResponse(t, request(t, h, http.MethodGet, operatorStatusPath, "", issuerHeaders(cfg, http.MethodGet, operatorStatusPath)))
+	state := fallbackResponse(t, request(t, h, http.MethodGet, operatorStatusPath, "", operatorTestHeaders()))
 	if state.Mode != "fallback" {
 		t.Fatalf("elapsed pending: %+v", state)
 	}
@@ -124,13 +124,13 @@ func TestFallbackPendingDeadlineAndManualRecovery(t *testing.T) {
 
 func TestFallbackRejectsUnauthorizedAndNonemptyRequests(t *testing.T) {
 	for _, method := range []string{http.MethodPost, http.MethodDelete} {
-		for _, name := range []string{"missing edge", "wrong edge", "edge only", "participant", "display", "browser", "expired", "cross path", "cross method", "body", "oversized body"} {
+		for _, name := range []string{"missing edge", "wrong edge", "edge only", "participant", "display", "browser", "expired", "legacy signature", "body", "oversized body"} {
 			t.Run(method+"/"+name, func(t *testing.T) {
 				f := testdb.Open(t)
-				cfg := displayConfig()
+				cfg := displayConfig(t, f)
 				cfg.EdgeSharedSecret = "independent-edge-secret-1234567890"
 				h := api.New(cfg, f.Store, nil)
-				initial, err := f.Store.SetFallback(t.Context(), method == http.MethodDelete, time.Now().UTC())
+				initial, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), operatorTestActor), method == http.MethodDelete, time.Now().UTC())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -138,7 +138,7 @@ func TestFallbackRejectsUnauthorizedAndNonemptyRequests(t *testing.T) {
 				if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM arrival_operator_audit`).Scan(&auditsBefore); err != nil {
 					t.Fatal(err)
 				}
-				headers := issuerHeaders(cfg, method, fallbackPath)
+				headers := operatorTestHeaders()
 				headers["X-Trace-Edge-Secret"] = cfg.EdgeSharedSecret
 				body, want := "", http.StatusForbidden
 				switch name {
@@ -147,7 +147,8 @@ func TestFallbackRejectsUnauthorizedAndNonemptyRequests(t *testing.T) {
 				case "wrong edge":
 					headers["X-Trace-Edge-Secret"] = "wrong"
 				case "edge only", "participant", "display":
-					delete(headers, "X-Trace-Issuer-Signature")
+					want = http.StatusUnauthorized
+					delete(headers, "Authorization")
 					if name == "participant" {
 						owner := seedLegacyExperience(t, f.Store, cfg)
 						headers["Authorization"] = "Bearer " + owner.Memory.ParticipantToken
@@ -157,16 +158,13 @@ func TestFallbackRejectsUnauthorizedAndNonemptyRequests(t *testing.T) {
 				case "browser":
 					headers["Origin"] = cfg.DisplayAllowedOrigins[0]
 				case "expired":
-					headers["X-Trace-Issuer-Timestamp"] = "1"
-					headers["X-Trace-Issuer-Signature"] = signMessage(cfg.ArrivalIssuerKey, method+"\n"+fallbackPath+"\n1")
-				case "cross path":
-					headers["X-Trace-Issuer-Signature"] = issuerHeaders(cfg, method, operatorStatusPath)["X-Trace-Issuer-Signature"]
-				case "cross method":
-					other := http.MethodPost
-					if method == other {
-						other = http.MethodDelete
+					want = http.StatusUnauthorized
+					if _, err := f.SQL.ExecContext(t.Context(), `UPDATE operator_credentials SET created_at=$1,expires_at=$2`, time.Now().Add(-3*time.Minute), time.Now().Add(-time.Minute)); err != nil {
+						t.Fatal(err)
 					}
-					headers["X-Trace-Issuer-Signature"] = issuerHeaders(cfg, other, fallbackPath)["X-Trace-Issuer-Signature"]
+				case "legacy signature":
+					want = http.StatusUnauthorized
+					headers["X-Trace-Issuer-Signature"] = "obsolete"
 				case "body":
 					body, want = `{}`, http.StatusBadRequest
 				case "oversized body":
@@ -190,23 +188,23 @@ func TestFallbackRejectsUnauthorizedAndNonemptyRequests(t *testing.T) {
 }
 
 func TestFallbackUnavailable(t *testing.T) {
-	for _, name := range []string{"display disabled", "display incomplete", "operator disabled", "operator key missing"} {
+	for _, name := range []string{"display disabled", "display incomplete", "operator disabled", "operator audience missing"} {
 		t.Run(name, func(t *testing.T) {
 			f := testdb.Open(t)
-			cfg := displayConfig()
+			cfg := displayConfig(t, f)
 			switch name {
 			case "display disabled":
 				cfg.DisplayEnabled = false
 			case "display incomplete":
 				cfg.DisplayGoogleClientID = ""
 			case "operator disabled":
-				cfg.ArrivalEnabled = false
-			case "operator key missing":
-				cfg.ArrivalIssuerKey = ""
+				cfg.OperatorEnabled = false
+			case "operator audience missing":
+				cfg.OperatorGoogleClientID = ""
 			}
 			h := api.New(cfg, f.Store, nil)
 			for _, method := range []string{http.MethodPost, http.MethodDelete} {
-				got := request(t, h, method, fallbackPath, "", issuerHeaders(cfg, method, fallbackPath))
+				got := request(t, h, method, fallbackPath, "", operatorTestHeaders())
 				if got.Code != http.StatusServiceUnavailable {
 					t.Fatalf("disabled %s: %d %s", method, got.Code, got.Body.String())
 				}
@@ -223,9 +221,9 @@ func TestFallbackAuditFailureRollsBack(t *testing.T) {
 	for _, method := range []string{http.MethodPost, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
 			f := testdb.Open(t)
-			cfg := displayConfig()
+			cfg := displayConfig(t, f)
 			h := api.New(cfg, f.Store, nil)
-			initial, err := f.Store.SetFallback(t.Context(), method == http.MethodDelete, time.Now().UTC())
+			initial, err := f.Store.SetFallback(store.WithOperatorActor(t.Context(), operatorTestActor), method == http.MethodDelete, time.Now().UTC())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -236,7 +234,7 @@ func TestFallbackAuditFailureRollsBack(t *testing.T) {
 			if _, err := f.SQL.ExecContext(t.Context(), `ALTER TABLE arrival_operator_audit ADD CONSTRAINT reject_fallback CHECK (action NOT IN ('fallback.enable','fallback.disable')) NOT VALID`); err != nil {
 				t.Fatal(err)
 			}
-			got := request(t, h, method, fallbackPath, "", issuerHeaders(cfg, method, fallbackPath))
+			got := request(t, h, method, fallbackPath, "", operatorTestHeaders())
 			if got.Code != http.StatusInternalServerError {
 				t.Fatalf("audit failure: %d %s", got.Code, got.Body.String())
 			}

@@ -3,9 +3,6 @@ package api
 import "net/http"
 
 func (s *Server) operatorStatus(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeIssuer(w, r) {
-		return
-	}
 	now := s.now().UTC()
 	status, err := s.store.ReadOperatorStatus(r.Context(), now)
 	if err != nil {

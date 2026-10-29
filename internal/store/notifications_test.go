@@ -47,7 +47,7 @@ func TestNotificationStopWaitsForInflightDeliveryAndFencesCachedCandidates(t *te
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
-	if err := other.StopNotifications(ctx, p.NextSendAt); err == nil {
+	if err := other.StopNotifications(store.WithOperatorActor(ctx, "verified-test-operator"), p.NextSendAt); err == nil {
 		t.Fatal("stop succeeded while provider request was still in flight")
 	}
 	if stopped, err := other.PushStopped(t.Context()); err != nil || stopped || countPush(t, f) != 1 {
@@ -57,7 +57,7 @@ func TestNotificationStopWaitsForInflightDeliveryAndFencesCachedCandidates(t *te
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if err := other.StopNotifications(t.Context(), p.NextSendAt); err != nil {
+	if err := other.StopNotifications(store.WithOperatorActor(t.Context(), "verified-test-operator"), p.NextSendAt); err != nil {
 		t.Fatal(err)
 	}
 	sent := false
@@ -83,7 +83,7 @@ func TestNotificationStopAuditFailureRollsBackStopAndCredentialRemoval(t *testin
 	if _, err := f.SQL.ExecContext(t.Context(), `ALTER TABLE arrival_operator_audit ADD CONSTRAINT reject_notification_stop CHECK (action<>'notifications.stop')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Store.StopNotifications(t.Context(), now); err == nil {
+	if err := f.Store.StopNotifications(store.WithOperatorActor(t.Context(), "verified-test-operator"), now); err == nil {
 		t.Fatal("audit failure reported success")
 	}
 	if stopped, err := f.Store.PushStopped(t.Context()); err != nil || stopped || countPush(t, f) != 1 {

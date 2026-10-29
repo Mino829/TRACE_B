@@ -30,7 +30,7 @@ func (s *Store) ReadOperatorStatus(ctx context.Context, now time.Time) (Operator
  (SELECT switch_at FROM display_fallback_control WHERE singleton=TRUE),
  (SELECT changed_at FROM display_fallback_control WHERE singleton=TRUE)
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
- WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$1`, now).
+ WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$1`, now).
 		Scan(&status.Queued, &status.Playing, &status.PrimaryLeaseActive, &status.RegistrationClosed, &status.NotificationsStopped,
 			&status.Fallback.Mode, &status.Fallback.SwitchAt, &status.Fallback.ChangedAt)
 	return status, err

@@ -13,7 +13,7 @@ import (
 
 func TestDisplayFallbackSnapshotsPreserveQueueAcrossReconnect(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	server := displayServer(t, h)
 	conn, _, err := dialDisplay(t, server.URL, displayToken(t, cfg), cfg)
@@ -29,7 +29,7 @@ func TestDisplayFallbackSnapshotsPreserveQueueAcrossReconnect(t *testing.T) {
 	if frame := nextDisplay(t, conn, "renderer.primary.granted"); json.Unmarshal(frame.Data, &lease) != nil || lease.ID == "" {
 		t.Fatalf("missing primary lease: %s", frame.Data)
 	}
-	proof := projectedProof(t, h, cfg)
+	proof := projectedProof(t, h)
 	arrive := func(index int) string {
 		t.Helper()
 		result := arriveRequest(t, h, createExperience(t, h, cfg), proof, fmt.Sprintf("fallback-ws-arrival-%d", index))
@@ -49,7 +49,7 @@ func TestDisplayFallbackSnapshotsPreserveQueueAcrossReconnect(t *testing.T) {
 	path := "/v1/operator/fallback"
 	control := func(method string) {
 		t.Helper()
-		if response := request(t, h, method, path, "", issuerHeaders(cfg, method, path)); response.Code != http.StatusOK {
+		if response := request(t, h, method, path, "", operatorTestHeaders()); response.Code != http.StatusOK {
 			t.Fatalf("%s fallback: %d %s", method, response.Code, response.Body.String())
 		}
 	}

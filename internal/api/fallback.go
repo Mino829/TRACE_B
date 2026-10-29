@@ -3,9 +3,6 @@ package api
 import "net/http"
 
 func (s *Server) setFallback(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeIssuer(w, r) {
-		return
-	}
 	if !s.displayAvailable() {
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "display is disabled", Status: http.StatusServiceUnavailable})
 		return

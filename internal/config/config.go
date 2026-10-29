@@ -23,8 +23,12 @@ type Config struct {
 	PhotoEnabled               bool
 	PhotoMetadataEnabled       bool
 	ArrivalEnabled             bool
-	ArrivalIssuerKey           string
+	OperatorEnabled            bool
+	OperatorGoogleClientID     string
+	OperatorEmails             []string
+	OperatorAllowedOrigins     []string
 	ArrivalProofKey            string
+	ArrivalProofKeyID          string
 	ArrivalVenue               string
 	ArrivalCheckpointID        string
 	DisplayEnabled             bool
@@ -124,16 +128,34 @@ func FromEnv() (Config, error) {
 	if cfg.ArrivalEnabled, err = boolEnv("TRACE_ARRIVAL_ENABLED", false); err != nil {
 		return Config{}, err
 	}
-	cfg.ArrivalIssuerKey = os.Getenv("TRACE_ARRIVAL_ISSUER_KEY")
+	if os.Getenv("TRACE_ARRIVAL_ISSUER_KEY") != "" {
+		return Config{}, fmt.Errorf("TRACE_ARRIVAL_ISSUER_KEY is obsolete; configure personal operator credentials")
+	}
 	cfg.ArrivalProofKey = os.Getenv("TRACE_ARRIVAL_PROOF_KEY")
+	cfg.ArrivalProofKeyID = os.Getenv("TRACE_ARRIVAL_PROOF_KEY_ID")
 	cfg.ArrivalVenue = os.Getenv("TRACE_ARRIVAL_VENUE")
 	cfg.ArrivalCheckpointID = os.Getenv("TRACE_ARRIVAL_CHECKPOINT_ID")
-	if cfg.ArrivalEnabled && (len(cfg.ArrivalIssuerKey) < 32 || len(cfg.ArrivalProofKey) < 32 ||
-		cfg.ArrivalIssuerKey == cfg.ArrivalProofKey ||
-		(cfg.EdgeSharedSecret != "" && (cfg.EdgeSharedSecret == cfg.ArrivalIssuerKey || cfg.EdgeSharedSecret == cfg.ArrivalProofKey)) ||
+	if cfg.ArrivalEnabled && (len(cfg.ArrivalProofKey) < 32 ||
+		cfg.ArrivalProofKey == cfg.EdgeSharedSecret || !arrivalProofKeyIDPattern.MatchString(cfg.ArrivalProofKeyID) ||
 		cfg.ArrivalVenue == "" || cfg.ArrivalCheckpointID == "" ||
 		strings.ContainsAny(cfg.ArrivalVenue+cfg.ArrivalCheckpointID, " \t\r\n")) {
-		return Config{}, fmt.Errorf("arrival requires distinct 32-byte issuer/proof keys and venue/checkpoint identifiers")
+		return Config{}, fmt.Errorf("arrival requires an independent 32-byte proof key, safe key ID and venue/checkpoint identifiers")
+	}
+	if cfg.OperatorEnabled, err = boolEnv("TRACE_OPERATOR_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	cfg.OperatorGoogleClientID = os.Getenv("TRACE_OPERATOR_GOOGLE_CLIENT_ID")
+	for _, email := range splitNonEmpty(os.Getenv("TRACE_OPERATOR_EMAILS")) {
+		cfg.OperatorEmails = append(cfg.OperatorEmails, strings.ToLower(email))
+	}
+	cfg.OperatorAllowedOrigins = splitNonEmpty(os.Getenv("TRACE_OPERATOR_ALLOWED_ORIGINS"))
+	if cfg.OperatorEnabled {
+		if len(cfg.EdgeSharedSecret) < 32 {
+			return Config{}, fmt.Errorf("operator access requires a server-side Edge shared secret")
+		}
+		if err := cfg.ValidateOperator(); err != nil {
+			return Config{}, err
+		}
 	}
 	if cfg.DisplayEnabled, err = boolEnv("TRACE_DISPLAY_ENABLED", false); err != nil {
 		return Config{}, err
@@ -241,20 +263,30 @@ func FromEnv() (Config, error) {
 var displayClientIDPattern = regexp.MustCompile(`^[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$`)
 var displayEmailLocalPattern = regexp.MustCompile("^[a-z0-9.!#$%&'+/=?^_`{|}~-]+$")
 var displayHostLabelPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$`)
+var arrivalProofKeyIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// ValidateOperator validates a separate, explicitly configured operator entitlement.
+func (cfg Config) ValidateOperator() error {
+	return validateGoogleAccess(cfg.OperatorGoogleClientID, cfg.OperatorEmails, cfg.OperatorAllowedOrigins)
+}
 
 // ValidateDisplay checks the settings required to enable browser display access.
 func (cfg Config) ValidateDisplay() error {
-	if len(cfg.DisplayTokenKey) < 32 || cfg.DisplayTokenKey == cfg.ArrivalIssuerKey ||
+	if len(cfg.DisplayTokenKey) < 32 ||
 		cfg.DisplayTokenKey == cfg.ArrivalProofKey || cfg.DisplayTokenKey == cfg.EdgeSharedSecret {
 		return fmt.Errorf("display requires an independent 32-byte token signing key")
 	}
-	if !displayClientIDPattern.MatchString(cfg.DisplayGoogleClientID) {
-		return fmt.Errorf("display requires a Google OAuth Web client ID")
+	return validateGoogleAccess(cfg.DisplayGoogleClientID, cfg.DisplayOperatorEmails, cfg.DisplayAllowedOrigins)
+}
+
+func validateGoogleAccess(clientID string, emails, origins []string) error {
+	if !displayClientIDPattern.MatchString(clientID) {
+		return fmt.Errorf("Google access requires a Google OAuth Web client ID")
 	}
-	if len(cfg.DisplayOperatorEmails) == 0 || len(cfg.DisplayAllowedOrigins) == 0 {
-		return fmt.Errorf("display requires operator emails and allowed origins")
+	if len(emails) == 0 || len(origins) == 0 {
+		return fmt.Errorf("Google access requires explicit emails and allowed origins")
 	}
-	for _, email := range cfg.DisplayOperatorEmails {
+	for _, email := range emails {
 		address, err := mail.ParseAddress(email)
 		local, domain, ok := strings.Cut(email, "@")
 		if err != nil || address.Name != "" || address.Address != email || !ok ||
@@ -265,7 +297,7 @@ func (cfg Config) ValidateDisplay() error {
 			return fmt.Errorf("display operator emails must be exact valid email addresses without wildcards")
 		}
 	}
-	for _, origin := range cfg.DisplayAllowedOrigins {
+	for _, origin := range origins {
 		u, err := url.Parse(origin)
 		if err != nil || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" ||
 			u.ForceQuery || u.Fragment != "" || strings.ContainsAny(origin, "*\\ \t\r\n?#") ||

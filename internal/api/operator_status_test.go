@@ -29,7 +29,7 @@ type operatorStatusResponse struct {
 
 func TestOperatorStatusAuthorization(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	cfg.EdgeSharedSecret = "independent-edge-secret-1234567890"
 	h := api.New(cfg, f.Store, nil)
 	for _, tc := range []struct {
@@ -38,23 +38,15 @@ func TestOperatorStatusAuthorization(t *testing.T) {
 		want   int
 	}{
 		{"missing edge", func(h map[string]string) { delete(h, "X-Trace-Edge-Secret") }, 403},
-		{"edge alone", func(h map[string]string) { delete(h, "X-Trace-Issuer-Signature") }, 403},
-		{"participant", func(h map[string]string) {
-			delete(h, "X-Trace-Issuer-Signature")
-			h["Authorization"] = "Bearer participant-token"
-		}, 403},
-		{"display", func(h map[string]string) {
-			delete(h, "X-Trace-Issuer-Signature")
-			h["Authorization"] = "Bearer " + displayToken(t, cfg)
-		}, 403},
-		{"browser", func(h map[string]string) { h["Origin"] = cfg.DisplayAllowedOrigins[0] }, 403},
-		{"other path signature", func(h map[string]string) {
-			h["X-Trace-Issuer-Signature"] = issuerHeaders(cfg, "GET", "/v1/operator/arrivals")["X-Trace-Issuer-Signature"]
-		}, 403},
-		{"expired signature", func(h map[string]string) { h["X-Trace-Issuer-Timestamp"] = "1" }, 403},
+		{"edge alone", func(h map[string]string) { delete(h, "Authorization") }, 401},
+		{"participant", func(h map[string]string) { h["Authorization"] = "Bearer participant-token" }, 401},
+		{"display", func(h map[string]string) { h["Authorization"] = "Bearer " + displayToken(t, cfg) }, 401},
+		{"renderer origin", func(h map[string]string) { h["Origin"] = cfg.DisplayAllowedOrigins[0] }, 403},
+		{"legacy signature", func(h map[string]string) { h["X-Trace-Issuer-Signature"] = "obsolete" }, 401},
+		{"legacy timestamp", func(h map[string]string) { h["X-Trace-Issuer-Timestamp"] = "1" }, 401},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			headers := issuerHeaders(cfg, "GET", operatorStatusPath)
+			headers := operatorTestHeaders()
 			headers["X-Trace-Edge-Secret"] = cfg.EdgeSharedSecret
 			tc.change(headers)
 			got := request(t, h, "GET", operatorStatusPath, "", headers)
@@ -63,16 +55,16 @@ func TestOperatorStatusAuthorization(t *testing.T) {
 			}
 		})
 	}
-	cfg.ArrivalEnabled = false
+	cfg.OperatorEnabled = false
 	got := request(t, api.New(cfg, f.Store, nil), "GET", operatorStatusPath, "", map[string]string{"X-Trace-Edge-Secret": cfg.EdgeSharedSecret})
 	if got.Code != http.StatusServiceUnavailable {
-		t.Fatalf("disabled issuer status = %d", got.Code)
+		t.Fatalf("disabled operator status = %d", got.Code)
 	}
 }
 
 func TestOperatorStatusQueueAndLeaseExpiry(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	for _, state := range []string{"queued", "playing", "completed", "skipped", "expired", "deleting"} {
 		c := seedLegacyExperience(t, f.Store, cfg)
@@ -97,7 +89,7 @@ func TestOperatorStatusQueueAndLeaseExpiry(t *testing.T) {
 	}
 	read := func() operatorStatusResponse {
 		t.Helper()
-		got := request(t, h, "GET", operatorStatusPath, "", issuerHeaders(cfg, "GET", operatorStatusPath))
+		got := request(t, h, "GET", operatorStatusPath, "", operatorTestHeaders())
 		if got.Code != 200 {
 			t.Fatalf("status: %d %s", got.Code, got.Body.String())
 		}
@@ -134,12 +126,12 @@ func TestOperatorStatusQueueAndLeaseExpiry(t *testing.T) {
 
 func TestOperatorStatusAuthenticatedDisplayLifecycle(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	server := displayServer(t, h)
 	read := func() operatorStatusResponse {
 		t.Helper()
-		got := request(t, h, "GET", operatorStatusPath, "", issuerHeaders(cfg, "GET", operatorStatusPath))
+		got := request(t, h, "GET", operatorStatusPath, "", operatorTestHeaders())
 		if got.Code != 200 {
 			t.Fatalf("status: %d %s", got.Code, got.Body.String())
 		}
@@ -150,7 +142,7 @@ func TestOperatorStatusAuthenticatedDisplayLifecycle(t *testing.T) {
 		if status.ObservedAt.IsZero() || !status.Display.Enabled {
 			t.Fatalf("missing observation: %+v", status)
 		}
-		for _, secret := range []string{cfg.ArrivalIssuerKey, cfg.DisplayTokenKey, "leaseId", "holderId", "memorySessionId", "photoCheckpoints"} {
+		for _, secret := range []string{operatorTestToken, cfg.DisplayTokenKey, "leaseId", "holderId", "memorySessionId", "photoCheckpoints"} {
 			if strings.Contains(got.Body.String(), secret) {
 				t.Fatalf("private data in status: %s", got.Body.String())
 			}

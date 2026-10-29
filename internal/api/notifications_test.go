@@ -18,10 +18,11 @@ const notificationsStopPath = "/v1/operator/notifications/stop"
 func TestNotificationStopPersistsClearsAllSubscriptionsAndBlocksResubscribe(t *testing.T) {
 	f := testdb.Open(t)
 	cfg, sender, public, auth := testPushConfig(t)
-	operator := arrivalConfig()
+	operator := arrivalConfig(t, f)
 	cfg.ArrivalEnabled = true
-	cfg.ArrivalIssuerKey, cfg.ArrivalProofKey = operator.ArrivalIssuerKey, operator.ArrivalProofKey
+	cfg.ArrivalProofKey, cfg.ArrivalProofKeyID = operator.ArrivalProofKey, operator.ArrivalProofKeyID
 	cfg.ArrivalVenue, cfg.ArrivalCheckpointID = operator.ArrivalVenue, operator.ArrivalCheckpointID
+	enableOperatorTest(t, f, &cfg)
 	h := api.New(cfg, f.Store, nil, sender)
 	checkState := func(handler http.Handler, enabled, stopped bool) {
 		t.Helper()
@@ -39,7 +40,7 @@ func TestNotificationStopPersistsClearsAllSubscriptionsAndBlocksResubscribe(t *t
 		if enabled && publicState.Notification.VAPIDPublicKey != cfg.PushVAPIDPublicKey || !enabled && publicState.Notification.VAPIDPublicKey != "" {
 			t.Fatalf("incorrect public notification key: %+v", publicState.Notification)
 		}
-		got = request(t, handler, "GET", operatorStatusPath, "", issuerHeaders(cfg, "GET", operatorStatusPath))
+		got = request(t, handler, "GET", operatorStatusPath, "", operatorTestHeaders())
 		var status struct {
 			Notification struct {
 				Enabled         bool `json:"enabled"`
@@ -69,7 +70,7 @@ func TestNotificationStopPersistsClearsAllSubscriptionsAndBlocksResubscribe(t *t
 	checkState(h, true, false)
 	var firstStop time.Time
 	for attempt := range 2 {
-		got := request(t, h, "POST", notificationsStopPath, "", issuerHeaders(cfg, "POST", notificationsStopPath))
+		got := request(t, h, "POST", notificationsStopPath, "", operatorTestHeaders())
 		if got.Code != 200 || !strings.Contains(got.Body.String(), `"notificationsStopped":true`) {
 			t.Fatalf("stop: %d %s", got.Code, got.Body.String())
 		}
@@ -114,14 +115,14 @@ func TestNotificationStopPersistsClearsAllSubscriptionsAndBlocksResubscribe(t *t
 		t.Fatalf("arrival after notification stop: %d %s", got.code, got.body)
 	}
 	var stopped, repeated int
-	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FILTER (WHERE result='stopped'),COUNT(*) FILTER (WHERE result='already_stopped') FROM arrival_operator_audit WHERE action='notifications.stop' AND operator_id='arrival_issuer' AND target_id_short='notifications'`).Scan(&stopped, &repeated); err != nil || stopped != 1 || repeated != 1 {
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FILTER (WHERE result='stopped'),COUNT(*) FILTER (WHERE result='already_stopped') FROM arrival_operator_audit WHERE action='notifications.stop' AND operator_id=$1 AND target_id_short='notifications'`, operatorTestActor).Scan(&stopped, &repeated); err != nil || stopped != 1 || repeated != 1 {
 		t.Fatalf("stop audit: %d %d %v", stopped, repeated, err)
 	}
 }
 
 func TestNotificationStopAuthorizationAndBodyValidation(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := displayConfig()
+	cfg := displayConfig(t, f)
 	cfg.EdgeSharedSecret = "independent-edge-secret-1234567890"
 	h := api.New(cfg, f.Store, nil)
 	for _, tc := range []struct {
@@ -130,24 +131,16 @@ func TestNotificationStopAuthorizationAndBodyValidation(t *testing.T) {
 		want       int
 	}{
 		{"missing edge", "", func(h map[string]string) { delete(h, "X-Trace-Edge-Secret") }, 403},
-		{"edge only", "", func(h map[string]string) { delete(h, "X-Trace-Issuer-Signature") }, 403},
-		{"participant", "", func(h map[string]string) {
-			delete(h, "X-Trace-Issuer-Signature")
-			h["Authorization"] = "Bearer participant"
-		}, 403},
-		{"display", "", func(h map[string]string) {
-			delete(h, "X-Trace-Issuer-Signature")
-			h["Authorization"] = "Bearer " + displayToken(t, cfg)
-		}, 403},
-		{"browser", "", func(h map[string]string) { h["Origin"] = cfg.DisplayAllowedOrigins[0] }, 403},
-		{"other path", "", func(h map[string]string) {
-			h["X-Trace-Issuer-Signature"] = issuerHeaders(cfg, "POST", "/v1/operator/arrival-proofs")["X-Trace-Issuer-Signature"]
-		}, 403},
-		{"expired", "", func(h map[string]string) { h["X-Trace-Issuer-Timestamp"] = "1" }, 403},
+		{"edge only", "", func(h map[string]string) { delete(h, "Authorization") }, 401},
+		{"participant", "", func(h map[string]string) { h["Authorization"] = "Bearer participant" }, 401},
+		{"display", "", func(h map[string]string) { h["Authorization"] = "Bearer " + displayToken(t, cfg) }, 401},
+		{"renderer origin", "", func(h map[string]string) { h["Origin"] = cfg.DisplayAllowedOrigins[0] }, 403},
+		{"legacy signature", "", func(h map[string]string) { h["X-Trace-Issuer-Signature"] = "obsolete" }, 401},
+		{"legacy timestamp", "", func(h map[string]string) { h["X-Trace-Issuer-Timestamp"] = "1" }, 401},
 		{"body", `{}`, func(map[string]string) {}, 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			headers := issuerHeaders(cfg, "POST", notificationsStopPath)
+			headers := operatorTestHeaders()
 			headers["X-Trace-Edge-Secret"] = cfg.EdgeSharedSecret
 			tc.change(headers)
 			got := request(t, h, "POST", notificationsStopPath, tc.body, headers)
@@ -159,7 +152,7 @@ func TestNotificationStopAuthorizationAndBodyValidation(t *testing.T) {
 	if stopped, err := f.Store.PushStopped(t.Context()); err != nil || stopped {
 		t.Fatalf("rejected request changed stop: %t %v", stopped, err)
 	}
-	cfg.ArrivalEnabled = false
+	cfg.OperatorEnabled = false
 	if got := request(t, api.New(cfg, f.Store, nil), "POST", notificationsStopPath, "", map[string]string{"X-Trace-Edge-Secret": cfg.EdgeSharedSecret}); got.Code != http.StatusServiceUnavailable {
 		t.Fatalf("disabled operator: %d %s", got.Code, got.Body.String())
 	}
@@ -167,13 +160,13 @@ func TestNotificationStopAuthorizationAndBodyValidation(t *testing.T) {
 
 func TestNotificationStopWorksWithPushDisabled(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	owner := createExperience(t, h, cfg)
 	if _, err := f.Store.PutPush(t.Context(), store.PushSubscription{MemorySessionID: owner.Memory.SessionID, EndpointEncrypted: []byte("encrypted-endpoint"), KeysEncrypted: []byte("encrypted-keys"), IntervalMinutes: 30}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	got := request(t, h, "POST", notificationsStopPath, "", issuerHeaders(cfg, "POST", notificationsStopPath))
+	got := request(t, h, "POST", notificationsStopPath, "", operatorTestHeaders())
 	var retained int
 	if got.Code != 200 {
 		t.Fatalf("stop disabled Push: %d %s", got.Code, got.Body.String())

@@ -14,6 +14,7 @@ func baseEnv(t *testing.T) {
 	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_METADATA_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
 		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY",
 		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID",
+		"TRACE_ARRIVAL_PROOF_KEY_ID", "TRACE_OPERATOR_ENABLED", "TRACE_OPERATOR_GOOGLE_CLIENT_ID", "TRACE_OPERATOR_EMAILS", "TRACE_OPERATOR_ALLOWED_ORIGINS",
 		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_GOOGLE_CLIENT_ID", "TRACE_DISPLAY_OPERATOR_EMAILS", "TRACE_DISPLAY_ALLOWED_ORIGINS", "TRACE_DISPLAY_TOKEN_KEY"} {
 		t.Setenv(key, "")
 	}
@@ -168,33 +169,31 @@ func TestPushRequiresExplicitEnableAndAllSecrets(t *testing.T) {
 	}
 }
 
-func TestArrivalIssuerAndProofKeysStaySeparateAndDisabledByDefault(t *testing.T) {
+func TestArrivalProofConfigurationRejectsUnsafeKeysAndIDs(t *testing.T) {
 	baseEnv(t)
-	cfg, err := FromEnv()
-	if err != nil || cfg.ArrivalEnabled {
-		t.Fatalf("arrival must default off: %v", err)
-	}
 	t.Setenv("TRACE_ARRIVAL_ENABLED", "true")
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("enabled arrival without keys accepted")
-	}
-	issuer := "an-issuer-secret-unique-to-operator-1234"
-	proof := "proof-secret-unique-to-projector-4567"
-	t.Setenv("TRACE_ARRIVAL_ISSUER_KEY", issuer)
-	t.Setenv("TRACE_ARRIVAL_PROOF_KEY", issuer)
+	t.Setenv("TRACE_ARRIVAL_PROOF_KEY", "proof-secret-unique-to-projector-4567")
+	t.Setenv("TRACE_ARRIVAL_PROOF_KEY_ID", "arrival-proof-v1")
 	t.Setenv("TRACE_ARRIVAL_VENUE", "booth")
 	t.Setenv("TRACE_ARRIVAL_CHECKPOINT_ID", "entrance")
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("shared issuer and QR key accepted")
+	if _, err := FromEnv(); err != nil {
+		t.Fatal(err)
 	}
-	t.Setenv("TRACE_ARRIVAL_PROOF_KEY", proof)
-	cfg, err = FromEnv()
-	if err != nil || !cfg.ArrivalEnabled {
-		t.Fatalf("valid arrival config rejected: %v", err)
+	for _, id := range []string{"", "bad key", "../key", strings.Repeat("x", 65)} {
+		t.Setenv("TRACE_ARRIVAL_PROOF_KEY_ID", id)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("unsafe key ID accepted: %q", id)
+		}
 	}
-	t.Setenv("TRACE_EDGE_SHARED_SECRET", issuer)
+	t.Setenv("TRACE_ARRIVAL_PROOF_KEY_ID", "arrival-proof-v1")
+	t.Setenv("TRACE_EDGE_SHARED_SECRET", "proof-secret-unique-to-projector-4567")
 	if _, err := FromEnv(); err == nil {
-		t.Fatal("issuer key reused as participant edge secret")
+		t.Fatal("shared edge/proof key accepted")
+	}
+	t.Setenv("TRACE_EDGE_SHARED_SECRET", "")
+	t.Setenv("TRACE_ARRIVAL_ISSUER_KEY", "obsolete-key")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("obsolete service issuer config accepted")
 	}
 }
 
@@ -223,7 +222,7 @@ func TestDisplayGoogleConfigurationIsExplicitAndKeysStaySeparate(t *testing.T) {
 		len(cfg.DisplayAllowedOrigins) != 3 || cfg.DisplayAllowedOrigins[1] != "http://localhost:3000" {
 		t.Fatalf("display configuration was not normalized: %+v", cfg.DisplayOperatorEmails)
 	}
-	for _, key := range []string{"TRACE_EDGE_SHARED_SECRET", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY"} {
+	for _, key := range []string{"TRACE_EDGE_SHARED_SECRET", "TRACE_ARRIVAL_PROOF_KEY"} {
 		t.Run(key, func(t *testing.T) {
 			displayEnv(t)
 			t.Setenv(key, cfg.DisplayTokenKey)
@@ -266,6 +265,47 @@ func TestDisplayRejectsMissingOrInvalidGoogleConfiguration(t *testing.T) {
 			t.Setenv(tt.key, tt.value)
 			if _, err := FromEnv(); err == nil {
 				t.Fatal("invalid display configuration accepted")
+			}
+		})
+	}
+}
+
+func operatorEnv(t *testing.T) {
+	t.Helper()
+	baseEnv(t)
+	t.Setenv("TRACE_OPERATOR_ENABLED", "true")
+	t.Setenv("TRACE_OPERATOR_GOOGLE_CLIENT_ID", "123456789-operatorweb.apps.googleusercontent.com")
+	t.Setenv("TRACE_OPERATOR_EMAILS", " Operator@Gmail.com ")
+	t.Setenv("TRACE_OPERATOR_ALLOWED_ORIGINS", "https://operator.example.com,http://localhost:3000")
+	t.Setenv("TRACE_EDGE_SHARED_SECRET", "server-side-edge-secret-independent-12345")
+}
+
+func TestOperatorConfigurationRequiresIndependentExplicitEntitlement(t *testing.T) {
+	operatorEnv(t)
+	cfg, err := FromEnv()
+	if err != nil || !cfg.OperatorEnabled || cfg.OperatorEmails[0] != "operator@gmail.com" {
+		t.Fatalf("valid operator entitlement rejected: %v", err)
+	}
+	for _, tc := range []struct{ key, value string }{
+		{"TRACE_OPERATOR_GOOGLE_CLIENT_ID", ""},
+		{"TRACE_OPERATOR_GOOGLE_CLIENT_ID", "not-google"},
+		{"TRACE_OPERATOR_EMAILS", ""},
+		{"TRACE_OPERATOR_EMAILS", "*@gmail.com"},
+		{"TRACE_OPERATOR_EMAILS", "Person <person@gmail.com>"},
+		{"TRACE_OPERATOR_ALLOWED_ORIGINS", ""},
+		{"TRACE_OPERATOR_ALLOWED_ORIGINS", "https://*.example.com"},
+		{"TRACE_OPERATOR_ALLOWED_ORIGINS", "https://operator.example.com/path"},
+		{"TRACE_OPERATOR_ALLOWED_ORIGINS", "http://operator.example.com"},
+		{"TRACE_EDGE_SHARED_SECRET", ""},
+	} {
+		t.Run(tc.key+"/"+tc.value, func(t *testing.T) {
+			operatorEnv(t)
+			t.Setenv("TRACE_DISPLAY_GOOGLE_CLIENT_ID", "123456789-renderer.apps.googleusercontent.com")
+			t.Setenv("TRACE_DISPLAY_OPERATOR_EMAILS", "operator@gmail.com")
+			t.Setenv("TRACE_DISPLAY_ALLOWED_ORIGINS", "https://operator.example.com")
+			t.Setenv(tc.key, tc.value)
+			if _, err := FromEnv(); err == nil {
+				t.Fatal("renderer entitlement or unsafe config enabled operator access")
 			}
 		})
 	}

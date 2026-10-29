@@ -7,7 +7,7 @@
 
 ## 認証境界
 
-サイトWorkerは許可した`/api/backend/*`だけをGoの`/v1/*`や新`/v2/*`へ転送し、`X-Trace-Edge-Secret`を追加する。Goは`TRACE_EDGE_SHARED_SECRET`が設定されている場合、参加者APIと運営APIで一致を要求する。例外は直接ブラウザ認証を行う`/v1/operator/display-tokens`と`/v1/display/ws`の2経路だけで、専用Origin許可リストとGoogle/描画資格を別途検証する（[描画契約](../README.md#描画websocket既定無効)）。値が未設定なら既存のAPI動作を維持するため、**公開用Cloud RunではSecret Managerから設定することが必須**。32バイト未満の値では起動を拒否する。Worker側で`/v2`を許可・転送する改修はこのBackend PRに含まれず、Frontend側の接続まで一般公開できない。
+サイトWorkerは許可した/api/backend/*だけをGoの/v1・/v2へ転送し、サーバー側Edge keyを追加します。本人Bearerは別途必要です。Frontend側の許可対象は/v2の写真metadata作成/照会/削除、Memory参加停止、旧Live照会と旧本人写真read/deleteまで拡張し、運営/描画/旧upload/GPS書込は転送しません。GoのEdge例外は既存のdisplay-tokensとdisplay/wsだけで、Google/描画資格と独立Originを検証します。個人operator資格発行もEdge保護対象で、展示PCの認証付きloopback broker等の運営入口が固定経路を中継します。Edge keyはブラウザへ渡さず、OperatorEnabled時は32バイト以上の設定が必須です。
 
 これはWorkerとGoの間のアクセス制限であり、参加者のBearer token、CORS、受付停止、レート制限の代わりにはならない。WorkerはCloudflareが付与した`CF-Connecting-IP`の有効なIPだけを`X-Trace-Client-IP`としてGoへ送り、ブラウザからの`X-Forwarded-For`や同名ヘッダーは破棄する。Goは共有シークレット一致時だけ単一のIPv4/IPv6を制限単位に使い、欠落・不正・複数の同名ヘッダー・IPv6 zone付きなら接続元IPへ戻す。シークレットを設定しない直接到達モードでは転送ヘッダーを一切信用しない。`/health/live`と`/health/ready`はこのヘッダーを要求しない。Workerのsecretをブラウザへ渡さず、Goもヘッダー値をログへ出さない。
 
@@ -20,8 +20,8 @@ Cloudflare Web＋Google Cloud東京は[設計PR #22](https://github.com/Mino829/
 1. stagingとproductionのCloud Run、Cloud SQL、Secret Manager、Worker、ドメイン、データを分離する。
 2. Web側の`TRACE_BACKEND_URL`とGo側のsecretを揃え、Worker configとEdge付きGo configは成功、EdgeなしのGo configは403を確認する。healthと描画認証の専用例外を混同しない。
 3. `TRACE_REGISTRATION_OPEN=false`で起動し、写真の端末内保存とサーバーメタデータ、旧写真の各`deleteAfter`までの閲覧を含むMemory同意版・文面、連絡先、保存期間を設計Issue #23/#9で承認する。既定の旧クラウド写真草案を再利用しない。
-4. 旧両API・Schedulerを停止し、実行中清掃とタグ付き経路を残さず、停止後backup→現在の003から004〜016→runtime権限→同一digestの新preview/cleanupへ切り替える。既存待機・再生はFIFO移行前に整理する。旧写真/fenceがある環境はbucket/signerと各`deleteAfter`の本人閲覧・清掃を維持し、旧upload版を復活させない。
-5. Frontend/Workerの実配備で`/v2`許可・転送、本人GET/POST/DELETEと旧本人閲覧・削除を実機結合確認する。旧Live停止・GPS受付拒否・写真0枚の到着も確認する。IndexedDB保存/消去・画像消失表示はFrontendの責務で、Backendで保証しない。
+4. 旧両API/Schedulerを停止し、清掃とタグ付き経路を残さず、停止後backup→003から004～018→runtime権限→同一digestのpreview/cleanupへ切り替える。FIFO移行前に待機/再生を整理し、旧写真/fenceのbucket/signerと各deleteAfterの本人閲覧・清掃を維持する。旧upload版を復活させない。
+5. Frontend/Workerの実配備で/v2とMemory停止、旧本人read/delete・Live照会/停止を確認する。写真0枚と1枚の到着区間、用途/key IDの不正拒否、期限後の同一到着ID/最新状態回復、個人運営の権限分離/資格失効も確認する。ローカルの実Workerポリシー→Go HTTPと合成Googleのブラウザ検証は済んでいるが、Cloudflare TLS/IAM・実Google・機材の確認は別とする。端末画像の存在/消去をBackendで保証しない。
 6. 期限削除ジョブ、DB接続上限、共有NATと429、障害時の受付停止、旧GPS/旧画像受付を復活させない修正版への復旧手順を確認する。
 
 Cloud RunのWebSocketにはリクエスト時間の上限がある。描画用APIを追加するときは、会場クライアントの再接続と状態再同期を検証する。

@@ -17,7 +17,7 @@ const registrationClosePath = "/v1/operator/registration/close"
 
 func TestRegistrationClosePersistsAndPreservesExistingParticipant(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	cfg.PhotoMetadataEnabled = true
 	photoGraphFixture(t, f, &cfg)
 	h := api.New(cfg, f.Store, nil)
@@ -26,7 +26,7 @@ func TestRegistrationClosePersistsAndPreservesExistingParticipant(t *testing.T) 
 		t.Helper()
 		headers := map[string]string(nil)
 		if path == operatorStatusPath {
-			headers = issuerHeaders(cfg, "GET", path)
+			headers = operatorTestHeaders()
 		}
 		got := request(t, handler, "GET", path, "", headers)
 		var status struct {
@@ -39,7 +39,7 @@ func TestRegistrationClosePersistsAndPreservesExistingParticipant(t *testing.T) 
 	checkOpen(h, "/v1/public/config", true)
 	checkOpen(h, operatorStatusPath, true)
 	for range 2 {
-		got := request(t, h, "POST", registrationClosePath, "", issuerHeaders(cfg, "POST", registrationClosePath))
+		got := request(t, h, "POST", registrationClosePath, "", operatorTestHeaders())
 		if got.Code != 200 {
 			t.Fatalf("close: %d %s", got.Code, got.Body.String())
 		}
@@ -78,14 +78,14 @@ func TestRegistrationClosePersistsAndPreservesExistingParticipant(t *testing.T) 
 		t.Fatalf("existing deletion: %d %s", got.Code, got.Body.String())
 	}
 	var closed, repeated int
-	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FILTER (WHERE result='closed'), COUNT(*) FILTER (WHERE result='already_closed') FROM arrival_operator_audit WHERE action='registration.close' AND operator_id='arrival_issuer' AND target_id_short='registration'`).Scan(&closed, &repeated); err != nil || closed != 1 || repeated != 1 {
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FILTER (WHERE result='closed'), COUNT(*) FILTER (WHERE result='already_closed') FROM arrival_operator_audit WHERE action='registration.close' AND operator_id=$1 AND target_id_short='registration'`, operatorTestActor).Scan(&closed, &repeated); err != nil || closed != 1 || repeated != 1 {
 		t.Fatalf("closure audit: %d %d %v", closed, repeated, err)
 	}
 }
 
 func TestRegistrationCloseRejectsUnauthorizedAndInvalidRequests(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	cfg.EdgeSharedSecret = "independent-edge-secret-1234567890"
 	h := api.New(cfg, f.Store, nil)
 	for _, tc := range []struct {
@@ -94,20 +94,15 @@ func TestRegistrationCloseRejectsUnauthorizedAndInvalidRequests(t *testing.T) {
 		want       int
 	}{
 		{"missing edge", "", func(h map[string]string) { delete(h, "X-Trace-Edge-Secret") }, 403},
-		{"edge only", "", func(h map[string]string) { delete(h, "X-Trace-Issuer-Signature") }, 403},
-		{"participant", "", func(h map[string]string) {
-			delete(h, "X-Trace-Issuer-Signature")
-			h["Authorization"] = "Bearer participant"
-		}, 403},
+		{"edge only", "", func(h map[string]string) { delete(h, "Authorization") }, 401},
+		{"participant", "", func(h map[string]string) { h["Authorization"] = "Bearer participant" }, 401},
 		{"browser", "", func(h map[string]string) { h["Origin"] = "https://operator.example" }, 403},
-		{"other path", "", func(h map[string]string) {
-			h["X-Trace-Issuer-Signature"] = issuerHeaders(cfg, "POST", "/v1/operator/arrival-proofs")["X-Trace-Issuer-Signature"]
-		}, 403},
-		{"expired", "", func(h map[string]string) { h["X-Trace-Issuer-Timestamp"] = "1" }, 403},
+		{"legacy signature", "", func(h map[string]string) { h["X-Trace-Issuer-Signature"] = "obsolete" }, 401},
+		{"legacy timestamp", "", func(h map[string]string) { h["X-Trace-Issuer-Timestamp"] = "1" }, 401},
 		{"body", `{}`, func(map[string]string) {}, 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			headers := issuerHeaders(cfg, "POST", registrationClosePath)
+			headers := operatorTestHeaders()
 			headers["X-Trace-Edge-Secret"] = cfg.EdgeSharedSecret
 			tc.change(headers)
 			got := request(t, h, "POST", registrationClosePath, tc.body, headers)
@@ -127,12 +122,12 @@ func TestRegistrationCloseRejectsUnauthorizedAndInvalidRequests(t *testing.T) {
 
 func TestRegistrationCloseAuditFailureRollsBackStop(t *testing.T) {
 	f := testdb.Open(t)
-	cfg := arrivalConfig()
+	cfg := arrivalConfig(t, f)
 	h := api.New(cfg, f.Store, nil)
 	if _, err := f.SQL.ExecContext(t.Context(), `ALTER TABLE arrival_operator_audit ADD CONSTRAINT reject_close CHECK (action<>'registration.close')`); err != nil {
 		t.Fatal(err)
 	}
-	got := request(t, h, "POST", registrationClosePath, "", issuerHeaders(cfg, "POST", registrationClosePath))
+	got := request(t, h, "POST", registrationClosePath, "", operatorTestHeaders())
 	if got.Code != 500 {
 		t.Fatalf("audit failure: %d %s", got.Code, got.Body.String())
 	}

@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrConflict = errors.New("conflict")
+	ErrNotFound            = errors.New("not found")
+	ErrConflict            = errors.New("conflict")
+	ErrIdempotencyConflict = errors.New("idempotency conflict")
 )
 
 type executor interface {
@@ -63,15 +64,15 @@ type NewExperience struct {
 	LivePresence                                         bool
 }
 type ExperienceState struct {
-	ExperienceID, MemorySessionID, LiveSessionID               string
-	TrackingStatus, PresencePhase, DisplayColor, DisplaySymbol string
-	MemoryExpiresAt, MemoryDeleteAfter                         time.Time
-	LiveExpiresAt, LiveDeleteAfter                             time.Time
-	ReplayStatus                                               string
+	ExperienceID, MemorySessionID, LiveSessionID string
+	TrackingStatus, PresencePhase, MemoryStatus  string
+	MemoryExpiresAt, MemoryDeleteAfter           time.Time
+	LiveExpiresAt, LiveDeleteAfter               time.Time
+	ReplayStatus                                 *string
 }
 type LiveSession struct {
 	ID, TrackingStatus, PresencePhase, DisplayColor, DisplaySymbol string
-	ExpiresAt                                                      time.Time
+	ExpiresAt, DeleteAfter                                         time.Time
 }
 type Position struct {
 	X, Z, AccuracyM                   float64
@@ -224,14 +225,14 @@ func (s *Store) CreateExperience(ctx context.Context, v NewExperience) error {
 func (s *Store) ExperienceByMemoryToken(ctx context.Context, id, token string, now time.Time) (ExperienceState, error) {
 	var v ExperienceState
 	var stored string
-	var liveExpires, liveDelete sql.NullTime
+	var liveExpires, liveDelete, stopped sql.NullTime
 	err := s.q.QueryRowContext(ctx, `SELECT e.id,e.memory_session_id,COALESCE(e.live_session_id,''),m.token_hash,
- COALESCE(lp.tracking_status,''),COALESCE(lp.presence_phase,''),e.display_color,e.display_symbol,
- m.expires_at,m.delete_after,lp.expires_at,lp.delete_after
+ COALESCE(lp.tracking_status,''),COALESCE(lp.presence_phase,''),
+ m.expires_at,m.delete_after,lp.expires_at,lp.delete_after,m.stopped_at
  FROM experiences e JOIN memory_sessions m ON m.id=e.memory_session_id LEFT JOIN live_presence_sessions lp ON lp.id=e.live_session_id
  WHERE e.id=$1 AND m.delete_after>$2`, id, now).Scan(&v.ExperienceID, &v.MemorySessionID, &v.LiveSessionID, &stored,
-		&v.TrackingStatus, &v.PresencePhase, &v.DisplayColor, &v.DisplaySymbol,
-		&v.MemoryExpiresAt, &v.MemoryDeleteAfter, &liveExpires, &liveDelete)
+		&v.TrackingStatus, &v.PresencePhase,
+		&v.MemoryExpiresAt, &v.MemoryDeleteAfter, &liveExpires, &liveDelete, &stopped)
 	if errors.Is(err, sql.ErrNoRows) {
 		return v, ErrNotFound
 	}
@@ -249,12 +250,20 @@ func (s *Store) ExperienceByMemoryToken(ctx context.Context, id, token string, n
 			v.PresencePhase = "ended"
 		}
 	}
+	v.MemoryStatus = "main"
+	if stopped.Valid || !now.Before(v.MemoryExpiresAt) {
+		v.MemoryStatus = "ended"
+	}
 	arrival, err := s.arrivalForMemory(ctx, v.MemorySessionID)
 	if err == nil {
-		v.ReplayStatus = arrival.Status
-		if arrival.Status == "queued" && !now.Before(v.MemoryExpiresAt) {
-			v.ReplayStatus = "skipped"
+		if v.MemoryStatus != "ended" {
+			v.MemoryStatus = "arrived"
 		}
+		status := arrival.Status
+		if (arrival.Status == "queued" || arrival.Status == "playing") && v.MemoryStatus == "ended" {
+			status = "skipped"
+		}
+		v.ReplayStatus = &status
 	} else if !errors.Is(err, ErrNotFound) {
 		return ExperienceState{}, err
 	}
@@ -286,8 +295,8 @@ func (s *Store) EnableDisplay() { s.displayEnabled = true }
 
 func (s *Store) LiveSession(ctx context.Context, id string) (LiveSession, *Position, error) {
 	var v LiveSession
-	err := s.q.QueryRowContext(ctx, "SELECT id,tracking_status,presence_phase,display_color,display_symbol,expires_at FROM live_presence_sessions WHERE id=$1", id).
-		Scan(&v.ID, &v.TrackingStatus, &v.PresencePhase, &v.DisplayColor, &v.DisplaySymbol, &v.ExpiresAt)
+	err := s.q.QueryRowContext(ctx, "SELECT id,tracking_status,presence_phase,display_color,display_symbol,expires_at,delete_after FROM live_presence_sessions WHERE id=$1", id).
+		Scan(&v.ID, &v.TrackingStatus, &v.PresencePhase, &v.DisplayColor, &v.DisplaySymbol, &v.ExpiresAt, &v.DeleteAfter)
 	if errors.Is(err, sql.ErrNoRows) {
 		return v, nil, ErrNotFound
 	}
@@ -341,20 +350,23 @@ func (s *Store) SavePosition(ctx context.Context, id string, p Position) error {
 	})
 }
 func (s *Store) StopLive(ctx context.Context, id, reason string, now time.Time) error {
-	return s.Transaction(ctx, id, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, id); err != nil {
+			return err
+		}
 		var status string
-		var expires time.Time
-		err := tx.q.QueryRowContext(ctx, "SELECT tracking_status,expires_at FROM live_presence_sessions WHERE id=$1 FOR UPDATE", id).Scan(&status, &expires)
+		var deleteAfter time.Time
+		err := tx.q.QueryRowContext(ctx, "SELECT tracking_status,delete_after FROM live_presence_sessions WHERE id=$1 FOR UPDATE", id).Scan(&status, &deleteAfter)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return err
 		}
+		if !now.Before(deleteAfter) {
+			return ErrNotFound
+		}
 		if status != "stopped" {
-			if status != "tracking" || !now.Before(expires) {
-				return ErrConflict
-			}
 			if _, err := tx.q.ExecContext(ctx, `UPDATE live_presence_sessions SET tracking_status='stopped',presence_phase='ended',
   stop_reason=$1,stopped_at=$2 WHERE id=$3`, reason, now, id); err != nil {
 				return err
@@ -368,7 +380,10 @@ func (s *Store) StopLive(ctx context.Context, id, reason string, now time.Time) 
 	})
 }
 func (s *Store) SetOnSite(ctx context.Context, id, consent string, continuing bool, now time.Time) error {
-	return s.Transaction(ctx, id, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, id); err != nil {
+			return err
+		}
 		var status, phase string
 		var expires time.Time
 		err := tx.q.QueryRowContext(ctx, "SELECT tracking_status,presence_phase,expires_at FROM live_presence_sessions WHERE id=$1 FOR UPDATE", id).
@@ -419,7 +434,10 @@ func (s *Store) DeleteMemory(ctx context.Context, id string) error {
 	})
 }
 func (s *Store) DeleteLive(ctx context.Context, id string) error {
-	return s.Transaction(ctx, id, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, id); err != nil {
+			return err
+		}
 		if err := tx.stopPushForLive(ctx, id); err != nil {
 			return err
 		}
@@ -435,7 +453,10 @@ func (s *Store) DeleteLive(ctx context.Context, id string) error {
 // transaction. The live half runs first so the memory row can still identify
 // the experience on retry; receipts bind both credentials to the request key.
 func (s *Store) DeleteExperiencePart(ctx context.Context, id, memoryHash, liveHash, receiptKey string, memory bool, now time.Time) error {
-	return s.Transaction(ctx, "delete:experience:"+id, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, "delete:experience:"+id); err != nil {
+			return err
+		}
 		requestHash := hashCredentials(memoryHash, liveHash)
 		liveScope := hashScope("delete:experience:live:" + id)
 		scope := liveScope
@@ -537,6 +558,9 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	}
 	return s.Transaction(ctx, "trace:cleanup", func(tx *Store) error {
 		if err := tx.queueExpiredPhotoMemories(ctx, now); err != nil {
+			return err
+		}
+		if err := tx.CleanupOperatorCredentials(ctx, now); err != nil {
 			return err
 		}
 		for _, query := range []string{

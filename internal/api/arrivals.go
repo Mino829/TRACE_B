@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -16,9 +15,10 @@ import (
 )
 
 const checkpointLifetime = 25 * time.Second
-const issuerSignatureLifetime = 15 * time.Second
 
 type checkpointProof struct {
+	Purpose      string `json:"purpose"`
+	KeyID        string `json:"keyId"`
 	CheckpointID string `json:"checkpointId"`
 	Venue        string `json:"venue"`
 	IssuedAt     int64  `json:"issuedAt"`
@@ -35,7 +35,8 @@ func mac(key, message string) []byte {
 // A projected proof is a signed JSON payload, not a navigable URL. It never
 // contains a participant token; the Web App camera retains its existing session.
 func (s *Server) issueArrivalProof(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeIssuer(w, r) {
+	if !s.cfg.ArrivalEnabled {
+		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "arrival is unavailable", Status: http.StatusServiceUnavailable})
 		return
 	}
 	body, bodyErr := readBody(w, r)
@@ -48,7 +49,8 @@ func (s *Server) issueArrivalProof(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.now().UTC()
-	proof := checkpointProof{CheckpointID: s.cfg.ArrivalCheckpointID, Venue: s.cfg.ArrivalVenue,
+	proof := checkpointProof{Purpose: "arrival", KeyID: s.cfg.ArrivalProofKeyID,
+		CheckpointID: s.cfg.ArrivalCheckpointID, Venue: s.cfg.ArrivalVenue,
 		IssuedAt: now.Unix(), ExpiresAt: now.Add(checkpointLifetime).Unix(), Nonce: randomSecret()}
 	payload, err := json.Marshal(proof)
 	if err != nil {
@@ -57,43 +59,11 @@ func (s *Server) issueArrivalProof(w http.ResponseWriter, r *http.Request) {
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	token := encoded + "." + base64.RawURLEncoding.EncodeToString(mac(s.cfg.ArrivalProofKey, encoded))
+	if err := s.store.RecordArrivalProofIssue(r.Context(), proof.CheckpointID, now); err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"checkpointToken": token, "expiresAt": time.Unix(proof.ExpiresAt, 0).UTC()})
-}
-
-// Operator HMAC authorization is entirely separate from participant Bearer auth
-// and from the QR signing key. Timestamp signatures expire in 15 seconds; key
-// rotation revokes all previously issued operator signatures immediately.
-func (s *Server) authorizeIssuer(w http.ResponseWriter, r *http.Request) bool {
-	if !s.cfg.ArrivalEnabled || len(s.cfg.ArrivalIssuerKey) < 32 || len(s.cfg.ArrivalProofKey) < 32 ||
-		s.cfg.ArrivalIssuerKey == s.cfg.ArrivalProofKey ||
-		(s.cfg.EdgeSharedSecret != "" && s.cfg.ArrivalIssuerKey == s.cfg.EdgeSharedSecret) {
-		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "arrival is unavailable", Status: http.StatusServiceUnavailable})
-		return false
-	}
-	if r.Header.Get("Origin") != "" || len(r.Header.Values("X-Trace-Issuer-Timestamp")) != 1 ||
-		len(r.Header.Values("X-Trace-Issuer-Signature")) != 1 {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "operator credentials required", Status: http.StatusForbidden})
-		return false
-	}
-	timestamp := r.Header.Get("X-Trace-Issuer-Timestamp")
-	value, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil || strconv.FormatInt(value, 10) != timestamp ||
-		s.now().UTC().Sub(time.Unix(value, 0)) > issuerSignatureLifetime ||
-		time.Unix(value, 0).Sub(s.now().UTC()) > issuerSignatureLifetime {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "operator credentials expired", Status: http.StatusForbidden})
-		return false
-	}
-	sig, err := base64.RawURLEncoding.DecodeString(r.Header.Get("X-Trace-Issuer-Signature"))
-	if err != nil || subtle.ConstantTimeCompare(sig, mac(s.cfg.ArrivalIssuerKey, r.Method+"\n"+r.URL.Path+"\n"+timestamp)) != 1 {
-		s.writeError(w, requestID(r), &apiError{Code: "FORBIDDEN", Message: "operator credentials required", Status: http.StatusForbidden})
-		return false
-	}
-	if wait := s.limiter.allow(s.now(), rateRule{key: "issuer/global", rate: 1, burst: 10},
-		rateRule{key: "api/global", rate: 100, burst: 100}); wait > 0 {
-		s.rateLimited(w, r, wait)
-		return false
-	}
-	return true
 }
 
 func (s *Server) verifyCheckpoint(value string, now time.Time) (string, bool) {
@@ -117,7 +87,8 @@ func (s *Server) verifyCheckpoint(value string, now time.Time) (string, bool) {
 		return "", false
 	}
 	nonce, err := base64.RawURLEncoding.DecodeString(proof.Nonce)
-	if err != nil || len(nonce) < 16 || proof.Venue != s.cfg.ArrivalVenue ||
+	if err != nil || len(nonce) < 16 || proof.Purpose != "arrival" || proof.KeyID == "" ||
+		proof.KeyID != s.cfg.ArrivalProofKeyID || proof.Venue != s.cfg.ArrivalVenue ||
 		proof.CheckpointID != s.cfg.ArrivalCheckpointID || proof.IssuedAt > now.Unix() ||
 		proof.ExpiresAt <= now.Unix() || proof.ExpiresAt <= proof.IssuedAt ||
 		proof.ExpiresAt-proof.IssuedAt > int64(checkpointLifetime.Seconds()) {
@@ -158,33 +129,18 @@ func (s *Server) arrive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.now().UTC()
-	// A receipt can be replayed even after its QR expires, but not after its
-	// MemorySession is deleted (authentication above fails then).
+	// The store resolves existing arrivals and receipts under the queue/session
+	// locks. Expired proofs cannot create an arrival but may recover current state.
 	token, _ := bearerToken(r)
 	receiptKey := hash(key + "\x00" + token)
-	record, err := s.store.GetArrivalReceipt(r.Context(), memoryID, receiptKey, now)
-	if err == nil {
-		if record.RequestHash != hashBytes(body) {
-			s.writeError(w, requestID(r), &apiError{Code: "IDEMPOTENCY_CONFLICT", Message: "the idempotency key was already used with different content", Status: http.StatusConflict})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(record.ResponseBody)
-		return
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		s.writeStoreError(w, r, err)
-		return
-	}
-	checkpointID, valid := s.verifyCheckpoint(input.CheckpointToken, now)
-	if !valid {
-		s.writeError(w, requestID(r), &apiError{Code: "INVALID_CHECKPOINT", Message: "checkpoint proof is invalid or expired", Status: http.StatusForbidden})
-		return
-	}
+	checkpointID, _ := s.verifyCheckpoint(input.CheckpointToken, now)
 	result, err := s.store.AcceptArrival(r.Context(), memoryID, hash(input.ExperienceLinkToken), randomID("arrival"), checkpointID,
 		receiptKey, hashBytes(body), now)
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidArrivalProof) {
+			s.writeError(w, requestID(r), &apiError{Code: "INVALID_ARRIVAL_PROOF", Message: "arrival proof is invalid or expired", Status: http.StatusBadRequest})
+			return
+		}
 		s.writeStoreError(w, r, err)
 		return
 	}
@@ -194,7 +150,8 @@ func (s *Server) arrive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) operatorArrivals(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeIssuer(w, r) {
+	if !s.cfg.ArrivalEnabled {
+		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "arrival is unavailable", Status: http.StatusServiceUnavailable})
 		return
 	}
 	candidates, err := s.store.ReplayCandidates(r.Context(), s.now().UTC())
@@ -209,7 +166,8 @@ func (s *Server) operatorArrivals(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) operatorSkipArrival(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeIssuer(w, r) {
+	if !s.cfg.ArrivalEnabled {
+		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "arrival is unavailable", Status: http.StatusServiceUnavailable})
 		return
 	}
 	if err := s.store.SkipArrival(r.Context(), r.PathValue("arrivalId"), s.now().UTC()); err != nil {
@@ -220,7 +178,8 @@ func (s *Server) operatorSkipArrival(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) operatorRetryArrival(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeIssuer(w, r) {
+	if !s.cfg.ArrivalEnabled {
+		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "arrival is unavailable", Status: http.StatusServiceUnavailable})
 		return
 	}
 	if !s.cfg.DisplayEnabled {

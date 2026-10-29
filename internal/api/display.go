@@ -30,8 +30,7 @@ func (s *Server) displayAvailable() bool {
 	cfg := s.cfg
 	return cfg.DisplayEnabled && cfg.DisplayGoogleClientID != "" && len(cfg.DisplayOperatorEmails) > 0 &&
 		len(cfg.DisplayAllowedOrigins) > 0 && len(cfg.DisplayTokenKey) >= 32 &&
-		cfg.DisplayTokenKey != cfg.EdgeSharedSecret && cfg.DisplayTokenKey != cfg.ArrivalIssuerKey &&
-		cfg.DisplayTokenKey != cfg.ArrivalProofKey
+		cfg.DisplayTokenKey != cfg.EdgeSharedSecret && cfg.DisplayTokenKey != cfg.ArrivalProofKey
 }
 
 func (s *Server) verifyDisplayToken(token, origin string, now time.Time) bool {

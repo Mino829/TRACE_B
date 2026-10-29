@@ -3,9 +3,6 @@ package api
 import "net/http"
 
 func (s *Server) stopNotifications(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeIssuer(w, r) {
-		return
-	}
 	body, err := readBody(w, r)
 	if err != nil {
 		s.writeError(w, requestID(r), err)

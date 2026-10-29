@@ -13,7 +13,10 @@ const (
 	ArrivalPhotoWait  = 15 * time.Second
 )
 
-var ErrArrivalQueueFull = errors.New("arrival queue is full")
+var (
+	ErrArrivalQueueFull    = errors.New("arrival queue is full")
+	ErrInvalidArrivalProof = errors.New("arrival proof is invalid or expired")
+)
 
 type Arrival struct {
 	ID, Status, CheckpointID, SkipReason string
@@ -64,23 +67,24 @@ func (s *Store) arrivalForMemory(ctx context.Context, memoryID string) (Arrival,
 // The queue lock bounds the number of durable queued entries under concurrency.
 func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arrivalID, checkpointID, receiptKey, requestHash string, now time.Time) ([]byte, error) {
 	var body []byte
-	err := s.Transaction(ctx, "arrival:queue", func(tx *Store) error {
+	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, "arrival:queue"); err != nil {
+			return err
+		}
 		return tx.Transaction(ctx, memoryID, func(tx *Store) error {
-			receipt, err := tx.GetArrivalReceipt(ctx, memoryID, receiptKey, now)
-			if err == nil {
-				if receipt.RequestHash != requestHash {
-					return ErrConflict
-				}
-				body = receipt.ResponseBody
-				return nil
+			savedRequestHash, receiptErr := tx.arrivalReceiptRequestHash(ctx, memoryID, receiptKey, now)
+			if receiptErr == nil && savedRequestHash != requestHash {
+				return ErrIdempotencyConflict
 			}
-			if !errors.Is(err, ErrNotFound) {
-				return err
+			if receiptErr != nil && !errors.Is(receiptErr, ErrNotFound) {
+				return receiptErr
 			}
 			var expires time.Time
+			var stopped sql.NullTime
 			var deleting bool
 			var photoMode, graphVersion string
-			err = tx.q.QueryRowContext(ctx, `SELECT expires_at,deleting,photo_mode,COALESCE(campus_graph_version,'') FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &deleting, &photoMode, &graphVersion)
+			err := tx.q.QueryRowContext(ctx, `SELECT expires_at,stopped_at,deleting,photo_mode,COALESCE(campus_graph_version,'')
+ FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &stopped, &deleting, &photoMode, &graphVersion)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -92,7 +96,10 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			}
 			a, err := tx.arrivalForMemory(ctx, memoryID)
 			if errors.Is(err, ErrNotFound) {
-				if !now.Before(expires) {
+				if checkpointID == "" {
+					return ErrInvalidArrivalProof
+				}
+				if stopped.Valid || !now.Before(expires) {
 					return ErrConflict
 				}
 				var stored string
@@ -121,7 +128,7 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				var count int
 				if err := tx.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM arrival_events a
  JOIN memory_sessions m ON m.id=a.memory_session_id
- WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$1`, now).Scan(&count); err != nil {
+ WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$1`, now).Scan(&count); err != nil {
 					return err
 				}
 				if count >= ArrivalQueueLimit {
@@ -171,16 +178,24 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				}
 			}
 			body, err = json.Marshal(struct {
-				ArrivalID            string `json:"arrivalId"`
-				Status               string `json:"status"`
-				LivePresencePhase    string `json:"livePresencePhase,omitempty"`
-				OnSiteChoiceRequired bool   `json:"onSiteChoiceRequired"`
-			}{a.ID, a.Status, a.LivePresencePhase, a.LivePresencePhase == "arrived"})
+				ArrivalID         string `json:"arrivalId"`
+				Status            string `json:"status"`
+				LivePresencePhase string `json:"livePresencePhase,omitempty"`
+			}{a.ID, a.Status, a.LivePresencePhase})
 			if err != nil {
 				return err
 			}
 			body = append(body, '\n')
-			return tx.SaveArrivalReceipt(ctx, memoryID, receiptKey, requestHash, body, now.Add(24*time.Hour), now)
+			if receiptErr == nil {
+				return nil
+			}
+			locator, err := json.Marshal(struct {
+				ArrivalID string `json:"arrivalId"`
+			}{a.ID})
+			if err != nil {
+				return err
+			}
+			return tx.saveArrivalReceipt(ctx, memoryID, receiptKey, requestHash, locator, now.Add(24*time.Hour), now)
 		})
 	})
 	return body, err
@@ -196,18 +211,17 @@ func (s *Store) linkedPhase(ctx context.Context, memoryID string) (string, error
 	return phase, err
 }
 
-func (s *Store) GetArrivalReceipt(ctx context.Context, memoryID, key string, now time.Time) (IdempotencyRecord, error) {
-	var record IdempotencyRecord
-	err := s.q.QueryRowContext(ctx, `SELECT request_hash,response_body FROM arrival_receipts
- WHERE memory_session_id=$1 AND key_hash=$2 AND expires_at>$3`, memoryID, key, now).
-		Scan(&record.RequestHash, &record.ResponseBody)
+func (s *Store) arrivalReceiptRequestHash(ctx context.Context, memoryID, key string, now time.Time) (string, error) {
+	var requestHash string
+	err := s.q.QueryRowContext(ctx, `SELECT request_hash FROM arrival_receipts
+ WHERE memory_session_id=$1 AND key_hash=$2 AND expires_at>$3`, memoryID, key, now).Scan(&requestHash)
 	if errors.Is(err, sql.ErrNoRows) {
-		return record, ErrNotFound
+		return "", ErrNotFound
 	}
-	return record, err
+	return requestHash, err
 }
 
-func (s *Store) SaveArrivalReceipt(ctx context.Context, memoryID, key, requestHash string, body []byte, expires, now time.Time) error {
+func (s *Store) saveArrivalReceipt(ctx context.Context, memoryID, key, requestHash string, body []byte, expires, now time.Time) error {
 	_, err := s.q.ExecContext(ctx, `INSERT INTO arrival_receipts (memory_session_id,key_hash,request_hash,response_body,expires_at)
  VALUES ($1,$2,$3,$4,$5) ON CONFLICT(memory_session_id,key_hash) DO UPDATE
  SET request_hash=EXCLUDED.request_hash,response_body=EXCLUDED.response_body,expires_at=EXCLUDED.expires_at
@@ -226,13 +240,13 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
  (SELECT COUNT(*) FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='ready')
  + (SELECT COUNT(*) FROM photo_moments p WHERE p.memory_session_id=a.memory_session_id)
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
- WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$1
+ WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$1
  AND (SELECT mode='normal' FROM display_fallback_control WHERE singleton=TRUE)
  AND (a.photo_wait_until<=$1 OR NOT EXISTS (
  SELECT 1 FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='pending'))
  AND NOT EXISTS (
  SELECT 1 FROM arrival_events earlier JOIN memory_sessions em ON em.id=earlier.memory_session_id
- WHERE earlier.replay_status='queued' AND em.deleting=FALSE AND em.expires_at>$1
+ WHERE earlier.replay_status='queued' AND em.deleting=FALSE AND em.stopped_at IS NULL AND em.expires_at>$1
  AND (earlier.arrived_at,earlier.id)<(a.arrived_at,a.id) AND earlier.photo_wait_until>$1
  AND EXISTS (SELECT 1 FROM photos p WHERE p.memory_session_id=earlier.memory_session_id AND p.status='pending'))
  ORDER BY a.arrived_at,a.id LIMIT $2`, now, ArrivalQueueLimit)
@@ -252,6 +266,9 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
 }
 
 func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error {
+	if OperatorActor(ctx) == "" {
+		return ErrConflict
+	}
 	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
 		if _, err := tx.advanceFallback(ctx, now); err != nil {
 			return err
@@ -285,15 +302,31 @@ func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error
 		if _, err := tx.advanceFallback(ctx, now); err != nil {
 			return err
 		}
-		_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_operator_audit
- (operator_id,action,target_id_short,result,created_at) VALUES ('arrival_issuer','arrival.skip',$1,$2,$3)`,
-			hashScope(id)[:12], outcome, now)
-		return err
+		return tx.auditOperator(ctx, "arrival.skip", hashScope(id)[:12], outcome, now)
 	})
 }
 
+// RecordArrivalProofIssue records a proof only for an authenticated operator.
+func (s *Store) RecordArrivalProofIssue(ctx context.Context, checkpointID string, now time.Time) error {
+	return s.auditOperator(ctx, "arrival.proof.issue", hashScope(checkpointID)[:12], "issued", now)
+}
+
+func (s *Store) auditOperator(ctx context.Context, action, target, result string, now time.Time) error {
+	actor := OperatorActor(ctx)
+	if actor == "" {
+		return ErrConflict
+	}
+	_, err := s.q.ExecContext(ctx, `INSERT INTO arrival_operator_audit
+ (operator_id,operator_email_hash,action,target_id_short,result,created_at) VALUES ($1,NULLIF($2,''),$3,$4,$5,$6)`,
+		actor, OperatorEmailHash(ctx), action, target, result, now)
+	return err
+}
+
 func (s *Store) SkipOwnArrival(ctx context.Context, memoryID string, now time.Time) error {
-	return s.Transaction(ctx, memoryID, func(tx *Store) error {
+	return s.Transaction(ctx, "display:lease", func(tx *Store) error {
+		if err := tx.lockTransaction(ctx, memoryID); err != nil {
+			return err
+		}
 		var id string
 		err := tx.q.QueryRowContext(ctx, `UPDATE arrival_events SET replay_status='skipped',
  skip_reason='participant_request',replay_finished_at=$2

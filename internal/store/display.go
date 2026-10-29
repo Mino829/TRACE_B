@@ -72,7 +72,7 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,
  a.memory_session_id,m.photo_mode,COALESCE(m.campus_graph_version,'') FROM arrival_events a
  JOIN memory_sessions m ON m.id=a.memory_session_id
- WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$1 ORDER BY a.arrived_at,a.id`, now)
+ WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$1 ORDER BY a.arrived_at,a.id`, now)
 		if err != nil {
 			return err
 		}
@@ -177,7 +177,7 @@ func (s *Store) appendDisplayPhotoChange(ctx context.Context, memoryID, kind str
 	var photoMode, graphVersion string
 	err := s.q.QueryRowContext(ctx, `SELECT a.id,a.replay_status,m.photo_mode,COALESCE(m.campus_graph_version,'')
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
- WHERE a.memory_session_id=$1 AND a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.expires_at>$2`,
+ WHERE a.memory_session_id=$1 AND a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$2`,
 		memoryID, now).Scan(&a.ArrivalID, &a.ReplayStatus, &photoMode, &graphVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -388,10 +388,10 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
  WHERE id=$1 AND replay_status=$5 AND (renderer_lease_id IS NULL OR renderer_lease_id=$3)
  AND ($2<>'playing' OR (
  EXISTS (SELECT 1 FROM memory_sessions m WHERE m.id=arrival_events.memory_session_id
- AND m.deleting=FALSE AND m.expires_at>$4)
+ AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$4)
  AND NOT EXISTS (SELECT 1 FROM arrival_events playing WHERE playing.replay_status='playing')
  AND id=(SELECT head.id FROM arrival_events head JOIN memory_sessions m ON m.id=head.memory_session_id
- WHERE head.replay_status='queued' AND m.deleting=FALSE AND m.expires_at>$4
+ WHERE head.replay_status='queued' AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$4
  ORDER BY head.arrived_at,head.id LIMIT 1)
  AND (photo_wait_until<=$4 OR NOT EXISTS
  (SELECT 1 FROM photos p WHERE p.memory_session_id=arrival_events.memory_session_id AND p.status='pending'))))`
