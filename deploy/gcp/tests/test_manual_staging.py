@@ -175,10 +175,12 @@ class ManualSafetyTests(unittest.TestCase):
                 self.fail(f"Unexpected cloud operation: {operation}")
             return {}
 
-        with patch.dict(os.environ, {
-            "GCP_CLEANUP_RUNTIME_SA": manual.CLEANUP_SA,
-            "GCP_APP_PASSWORD_SECRET": "trace-app-db-password:1",
-        }), patch.object(manual, "cloud", side_effect=cloud):
+        # Credential lookup is unrelated to shell failure propagation.
+        with (
+            patch.dict(os.environ, {"GCP_CLEANUP_RUNTIME_SA": manual.CLEANUP_SA}),
+            patch.object(manual, "secret", return_value="unused"),
+            patch.object(manual, "cloud", side_effect=cloud),
+        ):
             with self.assertRaises(subprocess.CalledProcessError) as failure:
                 manual.remote_sql("SELECT 1;", owner=False)
         self.assertEqual(failure.exception.returncode, 65)
