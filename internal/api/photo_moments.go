@@ -256,12 +256,7 @@ func (s *Server) photoMomentMemory(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	moments, err := s.store.PhotoMoments(r.Context(), memory.ID)
-	if err != nil {
-		s.photoError(w, r, err)
-		return
-	}
-	segments, err := s.store.MomentRouteSegments(r.Context(), memory.ID)
+	moments, segments, err := s.store.PhotoMomentMemory(r.Context(), memory.ID)
 	if err != nil {
 		s.photoError(w, r, err)
 		return
