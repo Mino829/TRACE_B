@@ -33,6 +33,14 @@ APIの接続プールは最大5。実DBの`max_connections=25`に対し、Job・
 
 これらは確認時点の事実です。別環境のデータやCloudflare D1/KV、未知のストレージが空だという証拠ではありません。
 
+### 2026-10-29の再確認と反映準備
+
+- 承認済み一時Jobから`trace_app`・`READ ONLY`で実SQLを照会し、連続schema001～003、PostgreSQL 17.11、`max_connections=25`を再確認しました。publicのアプリ表7件はCRUD可能、`schema_migrations`はSELECTのみ、DB/publicへのCREATEとsuperuser/CREATEDB/CREATEROLEは不可です。今回、個人行やデータ件数は取得していないため、10月28日の「0件」を現在値として流用しません。
+- API2サービス、cleanup/migrate Job、Artifact RegistryのBackendイメージは旧`manual-20261021-1311-144cc03`のままです。新コードのイメージbuild・003→018のmigration・新表のruntime grants再適用は未実施です。private APIも最小1で稼働し、Schedulerは5分間隔で有効のため、停止窓の確保が必要です。
+- Cloudflareの実配信`trace-log`には`TRACE_BACKEND_URL`・`TRACE_EDGE_SHARED_SECRET`がどちらもなく、APIは503です。既存staging Workerは200ですが旧bundleを返しています。binding名・型は[読取専用Actions診断](https://github.com/Mino829/TRACE_F/actions/runs/40842529656)で確認しました。secret値は出力していません。
+- Frontend #75は機能ブランチへマージされただけでmainに未反映でした。[main取り込みPR #77](https://github.com/Mino829/TRACE_F/pull/77)は配備順を確定するまでDraftにします。mainへのマージは既存のD1 migration・trace-push・静的build・trace-log配備を自動起動するため、単なるソース整理として先にマージしません。
+- 診断用一時Jobは削除済みで、既存サービス・Job・DB設定・IAMは変更していません。これは配備・権限変更・公開承認を済ませた記録ではありません。
+
 ## 2. 管理者が先に用意するもの
 
 既存リソースを再作成しません。対象project/region、同名リソースの用途、Cloud SQL接続名、Secretの数値版を照合してください。長期サービスアカウント鍵JSONは不要です。
@@ -60,6 +68,8 @@ APIの接続プールは最大5。実DBの`max_connections=25`に対し、Job・
 
 ローカルからのCloud SQL Proxy接続は3307 timeoutで実SQLまで到達できませんでした。`gcloud sql connect`でAuthorized networksを変更する回避はしません。SQL確認/grantsには、digest固定した公式PostgreSQL 17クライアントの一時Cloud Run Jobと既存のUnixソケット接続を使用します。DBサーバーは起動せず、DBパスワードはSecret参照で渡します。UUID名と所有labelを照合して終了時に削除し、削除確認不能も失敗にします。Job実行と通常のCloud Logging保管は発生します。
 
+固定PostgreSQL imageの`base64`はBusyBoxです。SQL転送は`base64 -d`と`set -o pipefail`を使い、decoderが失敗してpsqlが空入力で成功してもJobを成功にしません。修正後の`remote_sql`を同じ固定image・実Cloud SQLでREAD ONLY実行し、実際のSQL結果と一時Job削除404を確認しました。これは`runtime-grants`やmigrationを実行した証拠ではありません。
+
 ## 4. 設定とビルド
 
 Python 3標準ライブラリとgcloudを使います。`deploy.sh`が`manual_staging.py`を起動し、CIと同じreadonly guardを利用します。gcloud 591.0.0でreadonlyコマンドとmanual scalingのSDK仕様を確認しています。リポジトリルートで準備します。
@@ -77,6 +87,16 @@ set +a
 runtime例の参加者originは既存preview Workerです。同意版は未承認の現行draft、本文は受付停止noticeであり、承認済み参加同意ではありません。旧GPS版`2026-memory-01`は無効です。新GPS入力は廃止済みなので未確認のキャンパス境界を作らず、未使用の旧geofence/originはConfig.Defaultを維持します。全feature falseをscriptでも強制し、この例から参加受付を開きません。
 
 3つの空間版はFrontend #61と同じ固定bundleです。データを別Graphへ読み替えません。runtime YAMLは重複キーのないトップレベルのquoted stringだけを受け付け、秘密値、DB URL override、未置換値を拒否します。旧画像やPUT fenceが残る環境では、旧bucket/signerをAPI/cleanupの双方に残す必要があります。今回の空DB確認を他環境へ一般化しません。
+
+### リポジトリ間の反映順と実施前条件
+
+1. SQL転送・失敗伝播の修正をレビューし、Backendのrelease commitを確定します。Frontend #77はまだマージしません。
+2. 対象を既存の閉鎖stagingと明示し、旧Session/写真/署名PUT fenceの現在値、必要なbucket/signer、稼働revision・タグ・実行中清掃を確認します。過去の空DB記録で省略しません。
+3. 次のbuildで得る不変digest、停止窓、復旧点、実行責任者と費用・変更承認を確定します。旧003イメージを018対応の候補やrollback先へ流用しません。
+4. 承認後だけ、以下の順で実施します：新イメージbuild → Scheduler/両API停止・drain確認 → 停止後の明示backup → 番号順migration → runtime grants/実SQL権限確認 → 同一digestのpreview/cleanup更新 → 閉鎖状態のready/config/清掃確認。詳細は第5～6節に従います。
+5. Workerの接続先・環境用途を承認してから既存Edge secretの数値版参照と安全に同期します。`trace-log`をstaging正本へ無断接続したり、IAM非公開APIを公開して解決したりしません。Front mainの自動配備を含めた切替順をレビューした後にだけ#77をマージし、Worker経由の閉鎖configと/v2・停止・本人権利を確認します。
+
+新しいイメージdigest・停止後backup ID・停止完了時刻は、実操作前には存在しません。設定の未置換値や古いbackupを埋めて「準備済み」にせず、取得・検証後にだけ変更コマンドへ渡します。実Google・描画/運営・実Push・一般参加受付の有効化は、この閉鎖staging更新とは別の承認・受入試験です。
 
 実ビルドも次回承認後です。リリース固有タグで作り、返された不変digestを`GCP_IMAGE`へ設定します。
 

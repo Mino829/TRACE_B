@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -141,6 +142,48 @@ class ManualSafetyTests(unittest.TestCase):
                     manual.latest_schema()
                 for path in directory.iterdir():
                     path.unlink()
+
+    def test_decoder_failure_cannot_be_reported_as_successful_sql(self):
+        tools = self.root / "bin"
+        tools.mkdir()
+        for name, body in {
+            "base64": "#!/bin/sh\nexit 65\n",
+            # Like psql, this succeeds on empty input. The shell must retain
+            # the earlier decoder failure instead of reporting this success.
+            "psql": "#!/bin/sh\n/bin/cat >/dev/null\nexit 0\n",
+        }.items():
+            executable = tools / name
+            executable.write_text(body)
+            executable.chmod(0o700)
+        job = {}
+
+        def cloud(*args, **kwargs):
+            operation = args[:3]
+            if operation == ("run", "jobs", "create"):
+                value = next(arg.split("=", 1)[1] for arg in args if arg.startswith("--args="))
+                delimiter, payload = value[1:].split("^", 1)
+                job["args"] = payload.split(delimiter, 1)
+                job["owner"] = next(arg.split("=", 2)[2] for arg in args if arg.startswith("--labels="))
+            elif operation == ("run", "jobs", "execute"):
+                # Run the emitted command in a real pipefail-capable shell,
+                # without gcloud, credentials, or a database.
+                subprocess.run(["/bin/bash", *job["args"]], env={"PATH": str(tools)},
+                               capture_output=True, text=True, check=True)
+            elif operation == ("run", "jobs", "describe"):
+                return {"metadata": {"labels": {"trace-preview-operation": job["owner"]}}}
+            elif operation != ("run", "jobs", "delete"):
+                self.fail(f"Unexpected cloud operation: {operation}")
+            return {}
+
+        # Credential lookup is unrelated to shell failure propagation.
+        with (
+            patch.dict(os.environ, {"GCP_CLEANUP_RUNTIME_SA": manual.CLEANUP_SA}),
+            patch.object(manual, "secret", return_value="unused"),
+            patch.object(manual, "cloud", side_effect=cloud),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                manual.remote_sql("SELECT 1;", owner=False)
+        self.assertEqual(failure.exception.returncode, 65)
 
 
 if __name__ == "__main__":

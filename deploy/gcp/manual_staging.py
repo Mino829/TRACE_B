@@ -188,7 +188,8 @@ def remote_sql(sql, *, owner):
     account = expected("GCP_MIGRATION_SA", MIGRATION_SA) if owner else expected("GCP_CLEANUP_RUNTIME_SA", CLEANUP_SA)
     password = secret("GCP_OWNER_PASSWORD_SECRET", "trace-owner-db-password") if owner else secret("GCP_APP_PASSWORD_SECRET", "trace-app-db-password")
     encoded = base64.b64encode(sql.encode()).decode()
-    script = f"printf %s {encoded} | base64 --decode | psql --no-psqlrc --no-password --set=ON_ERROR_STOP=1 --single-transaction --file=-"
+    # The pinned image uses BusyBox; propagate decoder failures past psql's empty-input success.
+    script = f"set -o pipefail; printf %s {encoded} | base64 -d | psql --no-psqlrc --no-password --set=ON_ERROR_STOP=1 --single-transaction --file=-"
     delimiter = f"__{operation}__"
     try:
         cloud("run", "jobs", "create", name, f"--image={PSQL_IMAGE}", f"--service-account={account}",
