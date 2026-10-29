@@ -159,7 +159,8 @@ func TestFallbackRejectsUnauthorizedAndNonemptyRequests(t *testing.T) {
 					headers["Origin"] = cfg.DisplayAllowedOrigins[0]
 				case "expired":
 					want = http.StatusUnauthorized
-					if _, err := f.SQL.ExecContext(t.Context(), `UPDATE operator_credentials SET created_at=$1,expires_at=$2`, time.Now().Add(-3*time.Minute), time.Now().Add(-time.Minute)); err != nil {
+					expiredAt := time.Now().UTC().Add(-time.Minute)
+					if _, err := f.SQL.ExecContext(t.Context(), `UPDATE operator_credentials SET created_at=$1,expires_at=$2`, expiredAt.Add(-time.Minute), expiredAt); err != nil {
 						t.Fatal(err)
 					}
 				case "legacy signature":

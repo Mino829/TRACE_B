@@ -22,6 +22,10 @@ func TestLegacyLiveStopAfterExpiryDoesNotExtendOwnerWindow(t *testing.T) {
 	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE live_presence_sessions SET expires_at=$2,tracking_status='expired',presence_phase='ended' WHERE id=$1`, owner.Live.SessionID, now.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
+	var beforeExpiresAt, beforeDeleteAfter time.Time
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT expires_at,delete_after FROM live_presence_sessions WHERE id=$1`, owner.Live.SessionID).Scan(&beforeExpiresAt, &beforeDeleteAfter); err != nil {
+		t.Fatal(err)
+	}
 	path := "/v1/live-presence-sessions/" + owner.Live.SessionID
 	headers := map[string]string{"Authorization": "Bearer " + owner.Live.ParticipantToken, "Idempotency-Key": "expired-live-stop"}
 	if response := request(t, h, "GET", path, "", headers); response.Code != 200 || !strings.Contains(response.Body.String(), `"trackingStatus":"expired"`) {
@@ -39,7 +43,7 @@ func TestLegacyLiveStopAfterExpiryDoesNotExtendOwnerWindow(t *testing.T) {
 		first = response.Body.String()
 	}
 	var expiresAt, deleteAfter time.Time
-	if err := f.SQL.QueryRowContext(t.Context(), `SELECT expires_at,delete_after FROM live_presence_sessions WHERE id=$1`, owner.Live.SessionID).Scan(&expiresAt, &deleteAfter); err != nil || !expiresAt.Equal(now.Add(-time.Minute)) || !deleteAfter.Equal(owner.Live.DeleteAfter.Truncate(time.Microsecond)) {
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT expires_at,delete_after FROM live_presence_sessions WHERE id=$1`, owner.Live.SessionID).Scan(&expiresAt, &deleteAfter); err != nil || !expiresAt.Equal(beforeExpiresAt) || !deleteAfter.Equal(beforeDeleteAfter) {
 		t.Fatalf("legacy stop changed deadlines: %v %v %v", expiresAt, deleteAfter, err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE live_presence_sessions SET delete_after=$2 WHERE id=$1`, owner.Live.SessionID, now.Add(-time.Microsecond)); err != nil {
