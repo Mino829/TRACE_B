@@ -254,8 +254,8 @@ PR #37の接続コメントに合わせ、設定例の展示Originは`https://tr
   "type": "renderer.authenticate",
   "displayToken": "<issued-display-token>",
   "coordinateVersion": "toyosu-2026-08-28.1",
-  "campusGraphVersion": "toyosu-graph-2026-10-26.1.draft",
-  "threeDMapVersion": "toyosu-3dmap-2026-10-26"
+  "campusGraphVersion": "toyosu-graph-2026-10-29.1.draft",
+  "threeDMapVersion": "toyosu-3dmap-2026-10-30"
 }
 ```
 
@@ -291,7 +291,8 @@ WebPはVP8Lの過大割り当てを修正した公式`x/image v0.47.0`を使い�
 経路生成は写真を撮影時刻順に並べ、隣接するready写真の対についてCampusGraph上で接続する。両端ともチェックポイント（または混合でGPSアンカー+チェックポイントノード解決）ならノード間/最短経路で区間を作成し、`algorithmVersion`を`checkpoint-dijkstra-1`とする。両端とも旧GPS由来なら従来のスナップ推定（`photo-edges-dijkstra-1`）を維持する。ノード解決不能（旧GPSの精度不足・経路不在など）は`confidence:low, path:[]`で記録し、撮影順は変更しない。到着イベント確定のトランザクション内で、セッションにready写真が残る場合のみ、最後の写真から到着チェックポイントへの区間を同じ方式で追加する（写真0枚の到着では区間を作らない、写真削除時も再計算で整合を保つ）。到着区間の`toPhotoMomentId`はnullになる。写真一覧には画像URLを含めません。既存の`photoSummary`はDBの実件数から計算します。
 写真が`ready`になると、撮影時刻順の隣り合う写真ごとに`RouteSegment`を同一DBトランザクションで作成します。個別削除要求では`deleting`になった写真をただちに除外して残る前後の写真間を再計算し、画像消去完了・失敗時にも整合させます。写真0枚・1枚なら区間は空のままで到着/終了を妨げません。既存写真を保持するDBへ移行したときは本人memory取得時に欠損区間を再計算します。
 
-CampusGraphは`internal/route/campus_graph.json`へ固定同梱します。正本は[TRACE_F #61のコミット`93ad81fc417d7cb327ba54749ae13cc86541a2b2`](https://github.com/Mino829/TRACE_F/blob/93ad81fc417d7cb327ba54749ae13cc86541a2b2/models/trace/campus_graph.json)で、JSON全体を取り込み、版名だけを書き換えていません。`coordinateVersion`=`toyosu-2026-08-28.1`、`campusGraphVersion`=`toyosu-graph-2026-10-26.1.draft`、`threeDMapVersion`=`toyosu-3dmap-2026-10-26`を描画機・設定例と一致させています。三つが設定と一致しない場合、描画/写真メタデータ/写真ストレージを用いるAPI・清掃ジョブの起動を拒否します。承認済みの地図・描画機・Backendを同じbundleで配布し、受付停止と旧revision停止の移行窓で切り替えてください。既存MemorySessionや写真の保存Graph版は書き換えず、旧版のSessionには新Graphの写真地点を追加できません。旧版の保存経路を新Graphの座標へ読み替えず、版不一致区間は従来どおり解決不能として本人閲覧・削除を維持します。このbundle更新自体に追加のDB migrationはありません。
+CampusGraphは`internal/route/campus_graph.json`へ固定同梱します。正本は[TRACE_F `fix/76-walk-through-walls`のコミット`826aa0797e26f4ade4eaf44589a57fd81c50fffd`](https://github.com/Mino829/TRACE_F/blob/826aa0797e26f4ade4eaf44589a57fd81c50fffd/models/trace/campus_graph.json)です。Backend #50とFrontend #81を含む10月30日bundleは718点・754辺、Graph blob SHAは`7d11cdf9b7e38042512a5412b3400dad32a965f4`で、JSON全体を取り込み、版名だけを書き換えていません。`coordinateVersion`=`toyosu-2026-08-28.1`、`campusGraphVersion`=`toyosu-graph-2026-10-29.1.draft`、`threeDMapVersion`=`toyosu-3dmap-2026-10-30`を描画機・設定例と一致させます。同じGraph版名でもMap 10-29の612点bundleとは異なるため、版名だけでなく固定commitとJSON全体を照合してください。三つが設定と一致しない場合、描画/写真メタデータ/写真ストレージを用いるAPI・清掃ジョブの起動を拒否します。承認済みの地図・描画機・Backendを同じbundleで配布し、受付停止と旧revision停止の移行窓で切り替えてください。既存MemorySessionや写真の保存Graph版は書き換えず、旧版のSessionには新Graphの写真地点を追加できません。旧版の保存経路を新Graphの座標へ読み替えず、版不一致区間は従来どおり解決不能として本人閲覧・削除を維持します。このbundle更新自体に追加のDB migrationはありません。
+マージ順はBackend #50→対応Frontend main PRです。Frontend #81は機能branchへのマージでありmainへの反映ではありません。マージとBackend配備は別操作ですが、Frontend mainは自動配備されるため、停止窓・保持中Sessionと待機/再生・API/cleanup同時更新を事前に調整します。[診断と切替条件](docs/google-cloud.md#qr到着後に経路が出ない場合のbundle確認)を参照してください。
 
 写真の新規受付には`PhotoCheckpointNode`で`selectable:true`を要求し、保存済み写真・経路・到着地点の解決には`NodeIndex`を使います。選択不可の内部ノードも経路途中や署名済み到着地点として使用でき、写真として新規登録できることは意味しません。以前の`role=="checkpoint"`判定で既に受理された写真は、保存Graph版が一致する限り本人の閲覧・同内容の再送・削除と経路/展示への投影を維持します。その地点に別の写真を追加する要求は新しい`selectable`判定で拒否し、削除済みIDの再送は404のまま復活させません。旧`CheckpointNode`は残さず、写真受付と内部ノード解決を分離しています。
 

@@ -86,9 +86,11 @@ set +a
 
 runtime例の参加者originは既存preview Workerです。同意版は未承認の現行draft、本文は受付停止noticeであり、承認済み参加同意ではありません。旧GPS版`2026-memory-01`は無効です。新GPS入力は廃止済みなので未確認のキャンパス境界を作らず、未使用の旧geofence/originはConfig.Defaultを維持します。全feature falseをscriptでも強制し、この例から参加受付を開きません。
 
-3つの空間版はFrontend #61と同じ固定bundleです。データを別Graphへ読み替えません。runtime YAMLは重複キーのないトップレベルのquoted stringだけを受け付け、秘密値、DB URL override、未置換値を拒否します。旧画像やPUT fenceが残る環境では、旧bucket/signerをAPI/cleanupの双方に残す必要があります。今回の空DB確認を他環境へ一般化しません。
+3つの空間版はBackend #50＋Frontend #81を含む10月30日固定bundle（coordinate `toyosu-2026-08-28.1`、Graph `toyosu-graph-2026-10-29.1.draft`、Map `toyosu-3dmap-2026-10-30`、718点・754辺）です。正本commitとGraph blobは[README](../README.md)を参照してください。データを別Graphへ読み替えません。runtime YAMLは重複キーのないトップレベルのquoted stringだけを受け付け、秘密値、DB URL override、未置換値を拒否します。旧画像やPUT fenceが残る環境では、旧bucket/signerをAPI/cleanupの双方に残す必要があります。過去の空DB確認を現在値や他環境へ一般化しません。
 
 ### リポジトリ間の反映順と実施前条件
+
+以下は旧schema003の閉鎖staging向け手順です。10月30日bundleのマージ/稼働環境切替は後述の「QR到着後に経路が出ない場合のbundle確認」を優先し、#77や閉鎖profileの条件を現在の公開環境へ適用しません。
 
 1. SQL転送・失敗伝播の修正をレビューし、Backendのrelease commitを確定します。Frontend #77はまだマージしません。
 2. 対象を既存の閉鎖stagingと明示し、旧Session/写真/署名PUT fenceの現在値、必要なbucket/signer、稼働revision・タグ・実行中清掃を確認します。過去の空DB記録で省略しません。
@@ -161,6 +163,25 @@ unset TRACE_STAGING_EDGE_SHARED_SECRET
 指定済みのWeb client ID、運営メール、`https://trace-log.async5855.workers.dev`はruntime例に保持しています。[PR #37のコメント](https://github.com/Mino829/TRACE_B/pull/37#issuecomment-6461440141)と[描画契約](../README.md#描画websocket既定無効)を参照してください。Googleの承認済みJavaScript originには`/display`を含めません。
 
 閉鎖profileはTRACE_DISPLAY_ENABLED=falseとTRACE_OPERATOR_ENABLED=falseを強制し、描画/到着署名鍵を配布しません。実Google設定・直接HTTPS/WSS・署名鍵/Accessor・運営入口の配備は別途承認が必要です。個人operator資格は独立のGoogle audience/メール/Origin設定から発行し、描画資格で運営操作はできません。初期許可者はasync5855@gmail.comのみです。会場PCの認証付きloopback brokerはEdge keyをサーバー側だけに保持し、資格取得/失効・QR発行を中継します。ブラウザへ長期鍵を渡さず、WSSは中継しません。ローカル検証を実Google/staging/機材確認済みとしません。
+
+### QR到着後に経路が出ない場合のbundle確認
+
+2026-10-30の実画面で、`/display`の`LINK · つなげません：版が合いません`と`運営 · 到着QR発行可`が同時に出る障害を確認しました。QR発行と描画WSSは独立しているため、QRが出ることは描画機の接続成功を意味しません。配信中Frontend main `d0150a1f4d6fcd64b2eb6982cfcf72dae8c8600d`はGraph 10-29・Map 10-29の612点bundle、Backend公開設定はGraph/Mapとも10-26でした。
+
+本件はBackend #50とFrontend #81を含むMap 10-30・718点/754辺bundleへの一本化です。Frontend #81は`fix/76-walk-through-walls`へマージされたもので、main反映済みではありません。READMEの固定commitとGraph blobを正本とし、Go同梱JSON・起動設定・公開config・Frontendモデル・最初のWSS認証の三版を照合します。WSSの4409拒否や経路の版検証は緩和しません。Backend #51のMap 10-29向け修正と混在させません。
+
+PR #51の実Go/PostgreSQL・実Google認証・直接WSS・写真1枚から到着/実3D描画/completed/QR復帰までのスモーク実績は、Map 10-29・612点bundleに対する記録です。本件10-30 bundleの検証済み証跡には流用しません。本件の受入には実Go/PostgreSQLと対応Frontendの実ブラウザで、`display.snapshot`・`renderer.primary.granted`、正規QR proofによる到着、`arrival.replay.started`、経路/ARRIVAL描画、本人`replayStatus=completed`、終了後QR復帰、再接続、旧版の拒否と本人閲覧/削除を確認し、対象commit・結果・合成データの削除を記録します。スマートフォンのカメラ読取・投影機材・本番配備は別の確認です。
+
+今回の10-30 bundleは使い捨てPostgreSQL 17で`make integration`（全Go package、race有効）・`go vet ./...`・サーバービルドが成功しました。対応Frontendのunit 70件・lint・型検査・静的exportも成功しています。展示ブラウザ試験31件では30件が初回成功し、期限切れ認証ケースの曖昧な表示選択を修正した後、その1件も個別再検証で成功しました。14ルートの再生試験は成功していますが、全経路の壁抜けの目視・Blender検査を今回実施したものではありません。
+
+同Frontendの静的exportを検証用Go/brokerへ接続し、実Google本人確認・正規資格発行・`display.snapshot`/主描画権取得から、写真1枚（本部棟5F）の正規QR proofによる到着200/queued、実3DのARRIVAL/進捗描画、本人`replayStatus=completed`、終了画面後のQR復帰を確認しました。写真0枚は到着カードだけでcompletedとなること、再読込・実Googleボタンからの再認証でsnapshot/主描画権を取り直せること、有効な描画資格でも旧Map 10-29の描画WebSocketは4409・状態配信0件で拒否することも確認済みです。両合成参加者は正規本人DELETE204・照会404で消去しています。Go/broker/静的配信はloopbackのHTTP/WSで、Cloudflare/Cloud RunのTLS経路をこの検証で確認したものではありません。到着送信はAPI境界からで、実スマホカメラ・投影機材・本番配備は未確認です。
+
+マージ順はBackend #50→対応Frontend main PRとし、Backend配備は別操作として承認します。Frontend mainへのマージは自動配備を伴うため、Backendの切替時刻と停止窓を先に調整します。bundle変更自体にDB migrationは不要ですが、配備直前に保持中Session・写真・旧PUT fence・待機/再生・実行中cleanupを再確認し、受付停止、キューの処理/明示skip、Schedulerと旧API/cleanupの停止・drain、backupを確保します。既存Memory/写真の保存Graph版・同意・資格・deleteAfterは書き換えず、旧版の本人閲覧・同内容再送・削除を維持します。版不一致の新写真は409、到着時の展示経路は空とし、新版座標への読み替えや参加者の自動削除は行いません。
+
+この切替は本番のGraph 10-26から本件bundleへ直接更新する前提です。Map 10-29の612点bundleは同じ`campusGraphVersion`を使うため、#51を途中で配備しないでください。写真metadataのGraph版だけではその中間bundleを区別できず、同じcheckpoint IDを新版の位置へ解釈する危険があります。中間bundleで作成された保持中Session/写真が見つかった場合は切替を止め、個別の互換・移行判断を先に行います。自動の版書換えやデータ削除で回避しません。
+
+稼働中の受付/metadata/display/operator/arrival/Push有効・旧画像アップロード/GPS無効という設定を、承認済みの停止操作以外で変更しません。API/cleanupは同じ修正版image digest・Graph三版へ同時更新し、承認済みMemory同意版/本文、保持期間、Origin/OAuth/運営許可者、Edge・DB・到着proof・描画署名鍵のSecret数値版参照とSA権限を維持します。Pushは`TRACE_PUSH_ENABLED=true`、既存VAPID公開鍵/秘密鍵/subjectと暗号化鍵をAPI/cleanup双方で同一のまま保持し、購読の復号不能化や無効起動による購読全消去を避けます。Cloud Runのmin1/max1・CPU常時割当、Scheduler設定、旧画像/fence用bucket/signerも保持します。第4～6節の`deploy.sh`は全feature無効・min0の閉鎖staging専用であり、現在の稼働環境へそのまま適用して設定を上書きしないでください。
+
 
 ## 6. 期限削除の補助ジョブ
 
