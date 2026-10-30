@@ -174,7 +174,7 @@ PR #51の実Go/PostgreSQL・実Google認証・直接WSS・写真1枚から到着
 
 今回の10-30 bundleは使い捨てPostgreSQL 17で`make integration`（全Go package、race有効）・`go vet ./...`・サーバービルドが成功しました。対応Frontendのunit 70件・lint・型検査・静的exportも成功しています。展示ブラウザ試験31件では30件が初回成功し、期限切れ認証ケースの曖昧な表示選択を修正した後、その1件も個別再検証で成功しました。14ルートの再生試験は成功していますが、全経路の壁抜けの目視・Blender検査を今回実施したものではありません。
 
-同Frontendの静的exportを検証用Go/brokerへ接続し、実Google本人確認・正規資格発行・`display.snapshot`/主描画権取得から、写真1枚（本部棟5F）の正規QR proofによる到着200/queued、実3DのARRIVAL/進捗描画、本人`replayStatus=completed`、終了画面後のQR復帰を確認しました。写真0枚は到着カードだけでcompletedとなること、再読込・実Googleボタンからの再認証でsnapshot/主描画権を取り直せること、有効な描画資格でも旧Map 10-29のWSSは4409・状態配信0件で拒否することも確認済みです。両合成参加者は正規本人DELETE204・照会404で消去しています。到着送信はAPI境界からで、実スマホカメラ・投影機材・本番配備は未確認です。
+同Frontendの静的exportを検証用Go/brokerへ接続し、実Google本人確認・正規資格発行・`display.snapshot`/主描画権取得から、写真1枚（本部棟5F）の正規QR proofによる到着200/queued、実3DのARRIVAL/進捗描画、本人`replayStatus=completed`、終了画面後のQR復帰を確認しました。写真0枚は到着カードだけでcompletedとなること、再読込・実Googleボタンからの再認証でsnapshot/主描画権を取り直せること、有効な描画資格でも旧Map 10-29の描画WebSocketは4409・状態配信0件で拒否することも確認済みです。両合成参加者は正規本人DELETE204・照会404で消去しています。Go/broker/静的配信はloopbackのHTTP/WSで、Cloudflare/Cloud RunのTLS経路をこの検証で確認したものではありません。到着送信はAPI境界からで、実スマホカメラ・投影機材・本番配備は未確認です。
 
 マージ順はBackend #50→対応Frontend main PRとし、Backend配備は別操作として承認します。Frontend mainへのマージは自動配備を伴うため、Backendの切替時刻と停止窓を先に調整します。bundle変更自体にDB migrationは不要ですが、配備直前に保持中Session・写真・旧PUT fence・待機/再生・実行中cleanupを再確認し、受付停止、キューの処理/明示skip、Schedulerと旧API/cleanupの停止・drain、backupを確保します。既存Memory/写真の保存Graph版・同意・資格・deleteAfterは書き換えず、旧版の本人閲覧・同内容再送・削除を維持します。版不一致の新写真は409、到着時の展示経路は空とし、新版座標への読み替えや参加者の自動削除は行いません。
 
