@@ -162,6 +162,17 @@ unset TRACE_STAGING_EDGE_SHARED_SECRET
 
 閉鎖profileはTRACE_DISPLAY_ENABLED=falseとTRACE_OPERATOR_ENABLED=falseを強制し、描画/到着署名鍵を配布しません。実Google設定・直接HTTPS/WSS・署名鍵/Accessor・運営入口の配備は別途承認が必要です。個人operator資格は独立のGoogle audience/メール/Origin設定から発行し、描画資格で運営操作はできません。初期許可者はasync5855@gmail.comのみです。会場PCの認証付きloopback brokerはEdge keyをサーバー側だけに保持し、資格取得/失効・QR発行を中継します。ブラウザへ長期鍵を渡さず、WSSは中継しません。ローカル検証を実Google/staging/機材確認済みとしません。
 
+### QR到着後に経路が出ない場合のbundle確認
+
+2026-10-30の実画面で、`/display`の`LINK · つなげません：版が合いません`と`運営 · 到着QR発行可`が同時に出る障害を確認しました。QR発行と描画WSSは独立しているため、QRが出ることは描画機の接続成功を意味しません。配信中Frontend main `d0150a1f4d6fcd64b2eb6982cfcf72dae8c8600d`はGraph `toyosu-graph-2026-10-29.1.draft`・Map `toyosu-3dmap-2026-10-29`、Backend公開設定はGraph/Mapとも10-26でした。
+
+修正は同Frontendの`models/trace/campus_graph.json`全体（612点・649辺）をBackendへ取り込み、`.env.example`・runtime例・描画認証例を同じ三版へ揃えるものです。coordinateは`toyosu-2026-08-28.1`のままです。WSSの4409拒否や経路の版検証を無効化しません。Frontend PR #81はmainではなく`fix/76-walk-through-walls`へマージされた変更で、Backend PR #50のMap 10-30・718点/754辺とは別bundleです。配信中Frontendを維持する修正と、それらの将来bundleへの同時更新を混同しないでください。
+
+使い捨てPostgreSQL 17で`make integration`（`go test -race -count=1 ./...`）、`go vet ./...`、サーバービルドが成功しました。さらに本番と同じFrontendを検証用Go/brokerへ接続し、実Google認証・正規資格発行・直接WSSで`display.snapshot`と`renderer.primary.granted`、写真1枚（本部棟5F）の正規QR proofによる到着200/queued、`arrival.replay.started`後の実3D描画・ARRIVAL表示・進捗、本人の`replayStatus=completed`、終了画面後のQR復帰を確認しました。到着はAPI境界から送信し、実スマートフォンのカメラ読取・投影機材の確認ではありません。ブラウザruntime errorは0、合成参加者は本人DELETE204・照会404で削除済みです。この記録時点では本番Backendは未更新です。
+
+bundle更新はDB migration不要ですが、既存Memory/写真の保存Graph版は変更しません。旧版でも本人閲覧・同内容再送・削除は維持し、新しい写真の追加は409、到着時の展示経路は空になります。新版座標への自動読み替えや既存参加者の自動削除は行いません。配備直前に保持中Session・待機/再生を集計し、必要な停止窓を確保してください。稼働中のPush・同意文・Secret参照・最小1/CPU常時割当は保持し、API/cleanupを同じ修正版image・Graph設定へ揃えます。閉鎖profileへ戻す配備手順をリハーサル環境へ流用しないでください。
+
+
 ## 6. 期限削除の補助ジョブ
 
 ready/configと権限確認後、同じEdge入力を用意して以下を明示実行します。
