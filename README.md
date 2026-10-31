@@ -160,11 +160,11 @@ POST /v1/operator/arrival-proofsへ許可Origin・個人operator Bearer・空bod
 
 proofはbase64url(JSON).base64url(HMAC-SHA256(proof key, base64url(JSON)))で、purpose:"arrival"、keyId、checkpointId、venue、issuedAt/expiresAt（Unix秒）、ランダムnonceを含み25秒有効です。参加者はMemory BearerとIdempotency-Key、{"checkpointToken":"...","clientTime":"..."}を到着APIへ送ります。clientTimeでなくサーバー時刻を正とし、用途・鍵ID・署名・会場・地点・時刻の不正は初回到着を400 INVALID_ARRIVAL_PROOFで拒否します。同一QRは有効期間内に別Memoryからも利用でき、一回限りの物理来場保証ではありません。
 
-同じMemoryの到着はArrivalEventを一度だけ作ります。同じキー/同じ内容、または別キーでの本人再送は、QR期限切れ・鍵切替後も同じ到着IDと現在のstatusを返し、過去のqueued応答に固定しません。同じキーの異なる内容は409 IDEMPOTENCY_CONFLICT。Memory削除時は到着/receiptも消え、演出skipで本人照会・削除期限を短縮しません。
+同じMemoryのArrivalEventは1行です。再生が終わった（completed/skipped）あとに有効なQRを新しいキーで送ると、その行を新しい到着ID・現在時刻のqueuedに戻し、何度でも再生を受け付けます。経路と描画に入る写真は到着時刻までに撮ったものだけで、それより後の写真は次の到着から入ります。待機中・再生中の到着、同じキー/同じ内容の再送、QR期限切れ・鍵切替後の本人再送は、現在の到着IDとstatusを返し、過去のqueued応答に固定しません。同じキーの異なる内容は409 IDEMPOTENCY_CONFLICT。Memory削除時は到着/receiptも消え、演出skipで本人照会・削除期限を短縮しません。
 
 旧Memoryの有効なExperienceLinkは照合し、到着と追跡中・来場前の対応Liveのarrived更新を同じtransactionで確定します。停止済みLiveは再開しません。旧位置書込み・on-site継続は廃止済みで本人照会・停止・削除は保持します。新Memoryはlinkなし・写真0枚でも到着できます。本人GETのreplayStatusは未到着null、到着後queued/playing/completed/skipped。待ち順・推定待ち時間・aliasは返しません。
 
-写真0枚でも到着を受け付け、1枚なら写真地点からShibaLabまでの経路を返します。pending写真があれば最大15秒だけ開始を遅らせ、後続は追い越しません。FIFO上限は有効なMemoryの待機50件（playingを除く）で、通常待機30秒ではskipしません。満杯時は503 ARRIVAL_QUEUE_FULLとRetry-After: 5を返し、到着・receipt・Push停止・旧Live更新を確定しません。空き回復後に再試行でき、初回には有効QRが必要です。Memoryの停止・失効・削除は待機/描画から除外します。本人arrival/skipは未再生だけを対象とします。
+写真0枚でも到着を受け付け、1枚なら写真地点からShibaLabまでの経路を返します。pending写真があれば最大15秒だけ開始を遅らせ、後続は追い越しません。FIFO上限は有効なMemoryの待機50件（playingを除く）で、通常待機30秒ではskipしません。満杯時は503 ARRIVAL_QUEUE_FULLとRetry-After: 5を返し、到着・receipt・Push停止・旧Live更新を確定しません。空き回復後に再試行でき、初回には有効QRが必要です。Memoryの停止・失効・削除は待機/描画から除外します。本人skipは未再生だけを、本人arrivalによる再受付は再生済み・skip済みだけを対象とします。
 
 運営候補GET・skip/retryも個人operator Bearerを使います。候補はFIFOのIDと写真件数だけです。retryは描画障害skipに限り、有効・未停止Memoryと空き枠が必要です。主描画機が先頭の開始を自動要求し、Backendはlease・先頭・写真待機・単一playingを検証します。先行開始や重複はrenderer.rejected。終了画面4秒とQR非表示はFrontendの責務です。失敗理由は固定分類renderer_failureで記録し、任意の例外文や個人情報は受け付けません。
 
