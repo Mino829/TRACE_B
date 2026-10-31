@@ -213,11 +213,37 @@ func (s *Store) RefreshMomentRoutes(ctx context.Context, memoryID string, now ti
 	})
 }
 
+// momentsUpToArrival are the photos the route to ShibaLab is drawn through: all
+// of them before an arrival, and those taken up to it after. A photo taken
+// later waits for the participant's next arrival, which moves the arrival time
+// on; until then the queued or finished replay keeps the route it had.
+func (s *Store) momentsUpToArrival(ctx context.Context, memoryID string) ([]PhotoMoment, error) {
+	moments, err := s.PhotoMoments(ctx, memoryID)
+	if err != nil {
+		return nil, err
+	}
+	var arrivedAt time.Time
+	err = s.q.QueryRowContext(ctx, `SELECT arrived_at FROM arrival_events WHERE memory_session_id=$1`, memoryID).Scan(&arrivedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return moments, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	kept := make([]PhotoMoment, 0, len(moments))
+	for _, p := range moments {
+		if !p.CapturedAt.After(arrivedAt) {
+			kept = append(kept, p)
+		}
+	}
+	return kept, nil
+}
+
 func (s *Store) reconcileMomentRoutes(ctx context.Context, memoryID string) error {
 	if _, err := s.q.ExecContext(ctx, `DELETE FROM moment_route_segments WHERE memory_session_id=$1`, memoryID); err != nil {
 		return err
 	}
-	moments, err := s.PhotoMoments(ctx, memoryID)
+	moments, err := s.momentsUpToArrival(ctx, memoryID)
 	if err != nil || len(moments) == 0 || s.routes == nil {
 		return err
 	}
@@ -284,9 +310,5 @@ func (s *Store) reconcileMomentRoutes(ctx context.Context, memoryID string) erro
 	if err != nil {
 		return err
 	}
-	last := moments[len(moments)-1]
-	if last.CapturedAt.After(arrivedAt) {
-		return nil
-	}
-	return write(last, nil, route.Endpoint{Checkpoint: checkpointID, CapturedAt: arrivedAt})
+	return write(moments[len(moments)-1], nil, route.Endpoint{Checkpoint: checkpointID, CapturedAt: arrivedAt})
 }

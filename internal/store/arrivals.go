@@ -63,8 +63,9 @@ func (s *Store) arrivalForMemory(ctx context.Context, memoryID string) (Arrival,
 	return a, err
 }
 
-// The projected QR is shared; replay prevention applies per MemorySession.
-// The queue lock bounds the number of durable queued entries under concurrency.
+// The projected QR is shared; each MemorySession has one arrival row, which a
+// fresh QR read after its replay has ended queues again. The queue lock
+// bounds the number of durable queued entries under concurrency.
 func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arrivalID, checkpointID, receiptKey, requestHash string, now time.Time) ([]byte, error) {
 	var body []byte
 	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
@@ -95,7 +96,12 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				return ErrConflict
 			}
 			a, err := tx.arrivalForMemory(ctx, memoryID)
-			if errors.Is(err, ErrNotFound) {
+			// A replay that has played or been skipped plays again when the
+			// participant reads a fresh booth QR under a new key. Retries of an
+			// earlier key, and codes that expired, still only read the state.
+			again := err == nil && (a.Status == "completed" || a.Status == "skipped") && checkpointID != "" &&
+				errors.Is(receiptErr, ErrNotFound) && !stopped.Valid && now.Before(expires)
+			if errors.Is(err, ErrNotFound) || again {
 				if checkpointID == "" {
 					return ErrInvalidArrivalProof
 				}
@@ -136,9 +142,18 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				}
 				a.ID, a.Status, a.CheckpointID = arrivalID, "queued", checkpointID
 				a.ArrivedAt, a.PhotoWaitUntil = now, now.Add(ArrivalPhotoWait)
-				_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_events
+				if again {
+					// The row starts over under a new ID, so renderers take it as a
+					// new arrival, and its time moves to now, so the photos taken
+					// since the last replay join the route.
+					_, err = tx.q.ExecContext(ctx, `UPDATE arrival_events SET id=$1,checkpoint_id=$3,replay_status='queued',
+ skip_reason=NULL,arrived_at=$4,photo_wait_until=$5,replay_started_at=NULL,replay_finished_at=NULL,renderer_lease_id=NULL
+ WHERE memory_session_id=$2`, a.ID, memoryID, checkpointID, now, a.PhotoWaitUntil)
+				} else {
+					_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_events
  (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until)
  VALUES ($1,$2,'qr',$3,'queued',$4,$5)`, a.ID, memoryID, checkpointID, now, a.PhotoWaitUntil)
+				}
 				if err != nil {
 					return err
 				}
@@ -238,7 +253,7 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
 	}
 	rows, err := s.q.QueryContext(ctx, `SELECT a.id,
  (SELECT COUNT(*) FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='ready')
- + (SELECT COUNT(*) FROM photo_moments p WHERE p.memory_session_id=a.memory_session_id)
+ + (SELECT COUNT(*) FROM photo_moments p WHERE p.memory_session_id=a.memory_session_id AND p.captured_at<=a.arrived_at)
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
  WHERE a.replay_status='queued' AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$1
  AND (SELECT mode='normal' FROM display_fallback_control WHERE singleton=TRUE)

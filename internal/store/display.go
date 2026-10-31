@@ -117,7 +117,7 @@ func (s *Store) projectDisplayArrival(ctx context.Context, a DisplayArrival, mem
 	if photoMode != PhotoModeDevice || s.routes == nil || graphVersion != s.routes.CampusGraphVersion {
 		return a, nil
 	}
-	moments, err := s.PhotoMoments(ctx, memoryID)
+	moments, err := s.momentsUpToArrival(ctx, memoryID)
 	if err != nil {
 		return a, err
 	}
