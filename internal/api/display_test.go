@@ -384,18 +384,24 @@ func TestDisplayDisconnectSkipsPlayingAndOperatorExplicitlyRetries(t *testing.T)
 	}
 	defer successor.Close()
 	snapshot := nextDisplay(t, successor, "display.snapshot")
-	if !strings.Contains(string(snapshot.Data), arrival.ID) {
-		t.Fatalf("explicitly retried arrival not restored: %s", snapshot.Data)
+	var restored struct {
+		Arrivals []struct {
+			ID string `json:"arrivalId"`
+		} `json:"arrivals"`
 	}
+	if err := json.Unmarshal(snapshot.Data, &restored); err != nil || len(restored.Arrivals) != 1 || restored.Arrivals[0].ID == arrival.ID {
+		t.Fatalf("explicit retry did not restore a fresh generation: %s %v", snapshot.Data, err)
+	}
+	replayID := restored.Arrivals[0].ID
 	displayInput(t, successor, cfg, "renderer.primary.acquire", "", "", "")
 	nextLease := nextDisplay(t, successor, "renderer.primary.granted")
 	var resumed struct {
 		ID string `json:"leaseId"`
 	}
 	_ = json.Unmarshal(nextLease.Data, &resumed)
-	displayInput(t, successor, cfg, "arrival.replay.started", "resume-start-0001", arrival.ID, resumed.ID)
+	displayInput(t, successor, cfg, "arrival.replay.started", "resume-start-0001", replayID, resumed.ID)
 	nextDisplay(t, successor, "renderer.ack")
-	displayInput(t, successor, cfg, "arrival.replay.failed", "renderer-failed-01", arrival.ID, resumed.ID)
+	displayInput(t, successor, cfg, "arrival.replay.failed", "renderer-failed-01", replayID, resumed.ID)
 	ack := nextDisplay(t, successor, "renderer.ack")
 	if !strings.Contains(string(ack.Data), "skipped") {
 		t.Fatalf("failure not persisted: %s", ack.Data)

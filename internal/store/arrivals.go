@@ -65,7 +65,7 @@ func (s *Store) arrivalForMemory(ctx context.Context, memoryID string) (Arrival,
 
 // The projected QR is shared; replay prevention applies per MemorySession.
 // The queue lock bounds the number of durable queued entries under concurrency.
-func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arrivalID, checkpointID, receiptKey, requestHash string, now time.Time) ([]byte, error) {
+func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arrivalID, checkpointID, proofFingerprint, receiptKey, requestHash string, now time.Time) ([]byte, error) {
 	var body []byte
 	err := s.Transaction(ctx, "display:lease", func(tx *Store) error {
 		if err := tx.lockTransaction(ctx, "arrival:queue"); err != nil {
@@ -96,7 +96,7 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			}
 			a, err := tx.arrivalForMemory(ctx, memoryID)
 			if errors.Is(err, ErrNotFound) {
-				if checkpointID == "" {
+				if checkpointID == "" || proofFingerprint == "" {
 					return ErrInvalidArrivalProof
 				}
 				if stopped.Valid || !now.Before(expires) {
@@ -134,11 +134,14 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 				if count >= ArrivalQueueLimit {
 					return ErrArrivalQueueFull
 				}
+				if err := tx.consumeArrivalProof(ctx, memoryID, proofFingerprint); err != nil {
+					return err
+				}
 				a.ID, a.Status, a.CheckpointID = arrivalID, "queued", checkpointID
 				a.ArrivedAt, a.PhotoWaitUntil = now, now.Add(ArrivalPhotoWait)
 				_, err = tx.q.ExecContext(ctx, `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until)
- VALUES ($1,$2,'qr',$3,'queued',$4,$5)`, a.ID, memoryID, checkpointID, now, a.PhotoWaitUntil)
+ (id,replay_id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,queued_at,photo_wait_until)
+ VALUES ($1,$1,$2,'qr',$3,'queued',$4,$4,$5)`, a.ID, memoryID, checkpointID, now, a.PhotoWaitUntil)
 				if err != nil {
 					return err
 				}
@@ -236,7 +239,7 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
 	if err := s.RefreshDisplay(ctx, now); err != nil {
 		return nil, err
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT a.id,
+	rows, err := s.q.QueryContext(ctx, `SELECT a.replay_id,
  (SELECT COUNT(*) FROM photos p WHERE p.memory_session_id=a.memory_session_id AND p.status='ready')
  + (SELECT COUNT(*) FROM photo_moments p WHERE p.memory_session_id=a.memory_session_id)
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
@@ -247,9 +250,9 @@ func (s *Store) ReplayCandidates(ctx context.Context, now time.Time) ([]ReplayCa
  AND NOT EXISTS (
  SELECT 1 FROM arrival_events earlier JOIN memory_sessions em ON em.id=earlier.memory_session_id
  WHERE earlier.replay_status='queued' AND em.deleting=FALSE AND em.stopped_at IS NULL AND em.expires_at>$1
- AND (earlier.arrived_at,earlier.id)<(a.arrived_at,a.id) AND earlier.photo_wait_until>$1
+ AND (earlier.queued_at,earlier.id)<(a.queued_at,a.id) AND earlier.photo_wait_until>$1
  AND EXISTS (SELECT 1 FROM photos p WHERE p.memory_session_id=earlier.memory_session_id AND p.status='pending'))
- ORDER BY a.arrived_at,a.id LIMIT $2`, now, ArrivalQueueLimit)
+ ORDER BY a.queued_at,a.id LIMIT $2`, now, ArrivalQueueLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +277,7 @@ func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error
 			return err
 		}
 		result, err := tx.q.ExecContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason='operator',replay_finished_at=$2
- WHERE id=$1 AND replay_status IN ('queued','playing')`, id, now)
+ WHERE replay_id=$1 AND replay_status IN ('queued','playing')`, id, now)
 		if err != nil {
 			return err
 		}
@@ -287,7 +290,7 @@ func (s *Store) SkipArrival(ctx context.Context, id string, now time.Time) error
 		outcome := "skipped"
 		if n, _ := result.RowsAffected(); n == 0 {
 			var status string
-			err = tx.q.QueryRowContext(ctx, `SELECT replay_status FROM arrival_events WHERE id=$1`, id).Scan(&status)
+			err = tx.q.QueryRowContext(ctx, `SELECT replay_status FROM arrival_events WHERE replay_id=$1`, id).Scan(&status)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -330,7 +333,7 @@ func (s *Store) SkipOwnArrival(ctx context.Context, memoryID string, now time.Ti
 		var id string
 		err := tx.q.QueryRowContext(ctx, `UPDATE arrival_events SET replay_status='skipped',
  skip_reason='participant_request',replay_finished_at=$2
- WHERE memory_session_id=$1 AND replay_status='queued' RETURNING id`, memoryID, now).Scan(&id)
+ WHERE memory_session_id=$1 AND replay_status='queued' RETURNING replay_id`, memoryID, now).Scan(&id)
 		if err == nil {
 			_, err = tx.AppendDisplayEvent(ctx, "arrival.replay.skipped", map[string]string{"arrivalId": id, "reason": "participant_request"}, now)
 			return err

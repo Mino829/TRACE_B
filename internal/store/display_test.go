@@ -35,7 +35,7 @@ func TestDisplayLeaseTimeoutSkipsAndFencesOldPrimary(t *testing.T) {
 	f.Store.EnableDisplay()
 	now := time.Now().UTC()
 	v := fixtureExperience(t, f, now)
-	if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash, "arrival-lease", "booth", "receipt", "request", now); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash, "arrival-lease", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt", "request", now); err != nil {
 		t.Fatal(err)
 	}
 	acquired, err := f.Store.AcquireDisplayLease(t.Context(), "renderer-one", "lease-one", now)
@@ -129,7 +129,7 @@ func TestStoppedMemoryRejectsNewArrivalAndRendererRetry(t *testing.T) {
 	if _, err := f.Store.StopMemory(t.Context(), first, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Store.AcceptArrival(t.Context(), first, "", "must-not-arrive", "booth", "key", "request", now); !errors.Is(err, store.ErrConflict) {
+	if _, err := f.Store.AcceptArrival(t.Context(), first, "", "must-not-arrive", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "key", "request", now); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("stopped memory first arrival: %v", err)
 	}
 	second := fifoArrival(t, f, "stopped-retry", now)
@@ -139,7 +139,7 @@ func TestStoppedMemoryRejectsNewArrivalAndRendererRetry(t *testing.T) {
 	if _, err := f.Store.StopMemory(t.Context(), "fifo-memory-stopped-retry", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Store.RetryDisplayArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), second, now); !errors.Is(err, store.ErrConflict) {
+	if err := f.Store.RetryDisplayArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), second, "retry-generation", now); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("stopped renderer failure requeued: %v", err)
 	}
 }

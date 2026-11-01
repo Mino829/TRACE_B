@@ -20,7 +20,7 @@ Cloudflare Web＋Google Cloud東京は[設計PR #22](https://github.com/Mino829/
 1. stagingとproductionのCloud Run、Cloud SQL、Secret Manager、Worker、ドメイン、データを分離する。
 2. Web側の`TRACE_BACKEND_URL`とGo側のsecretを揃え、Worker configとEdge付きGo configは成功、EdgeなしのGo configは403を確認する。healthと描画認証の専用例外を混同しない。
 3. `TRACE_REGISTRATION_OPEN=false`で起動し、写真の端末内保存とサーバーメタデータ、旧写真の各`deleteAfter`までの閲覧を含むMemory同意版・文面、連絡先、保存期間を設計Issue #23/#9で承認する。既定の旧クラウド写真草案を再利用しない。
-4. 旧両API/Schedulerを停止し、清掃とタグ付き経路を残さず、停止後backup→003から004～018→runtime権限→同一digestのpreview/cleanupへ切り替える。FIFO移行前に待機/再生を整理し、旧写真/fenceのbucket/signerと各deleteAfterの本人閲覧・清掃を維持する。旧upload版を復活させない。
+4. 旧両API/Schedulerを停止し、清掃とタグ付き経路を残さず、停止後backup→003から004～019→runtime権限→同一digestのpreview/cleanupへ切り替え、その後に新Frontendを配備する。019のNOT NULL列は旧INSERTと非互換のため、旧書込みと新schemaを混在させない。FIFO移行前に待機/再生を整理し、旧写真/fenceのbucket/signerと各deleteAfterの本人閲覧・清掃を維持する。旧upload版を復活させない。
 5. Frontend/Workerの実配備で/v2とMemory停止、旧本人read/delete・Live照会/停止を確認する。写真0枚と1枚の到着区間、用途/key IDの不正拒否、期限後の同一到着ID/最新状態回復、個人運営の権限分離/資格失効も確認する。ローカルの実Workerポリシー→Go HTTPと合成Googleのブラウザ検証は済んでいるが、Cloudflare TLS/IAM・実Google・機材の確認は別とする。端末画像の存在/消去をBackendで保証しない。
 6. 期限削除ジョブ、DB接続上限、共有NATと429、障害時の受付停止、旧GPS/旧画像受付を復活させない修正版への復旧手順を確認する。
 

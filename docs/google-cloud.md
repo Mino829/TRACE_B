@@ -26,7 +26,7 @@ APIの接続プールは最大5。実DBの`max_connections=25`に対し、Job・
 ### 2026-10-28の配備前確認
 
 - 2 APIは旧`manual-20261021-1311-144cc03`。mainのmergeだけでは更新されていません。
-- 実DBは連続001～003で、当時のアプリ用7テーブルは0件、migration履歴は3件でした。本変更の必要最終版は018ですが、実DBを更新した記録ではありません。
+- 実DBは連続001～003で、当時のアプリ用7テーブルは0件、migration履歴は3件でした。本変更の必要最終版は019ですが、実DBを更新した記録ではありません。
 - `trace_app`は非superuser、CREATEDB/CREATEROLEなし、publicへのCREATEなし、migration表はSELECTのみ。
 - 既存バックアップは1世代、PITR無効、保存先`asia`。保持・処理地域・復元後消去の承認を省略できません。既存ポリシーを自動変更しません。
 - `trace-build`、preview/cleanup/migration/Schedulerの実行SAは存在します。GitHub用deploy SAは未作成、Actions variables/secretsは未設定です。
@@ -94,7 +94,7 @@ runtime例の参加者originは既存preview Workerです。同意版は未承�
 
 1. SQL転送・失敗伝播の修正をレビューし、Backendのrelease commitを確定します。Frontend #77はまだマージしません。
 2. 対象を既存の閉鎖stagingと明示し、旧Session/写真/署名PUT fenceの現在値、必要なbucket/signer、稼働revision・タグ・実行中清掃を確認します。過去の空DB記録で省略しません。
-3. 次のbuildで得る不変digest、停止窓、復旧点、実行責任者と費用・変更承認を確定します。旧003イメージを018対応の候補やrollback先へ流用しません。
+3. 次のbuildで得る不変digest、停止窓、復旧点、実行責任者と費用・変更承認を確定します。旧003イメージを019対応の候補やrollback先へ流用しません。
 4. 承認後だけ、以下の順で実施します：新イメージbuild → Scheduler/両API停止・drain確認 → 停止後の明示backup → 番号順migration → runtime grants/実SQL権限確認 → 同一digestのpreview/cleanup更新 → 閉鎖状態のready/config/清掃確認。詳細は第5～6節に従います。
 5. Workerの接続先・環境用途を承認してから既存Edge secretの数値版参照と安全に同期します。`trace-log`をstaging正本へ無断接続したり、IAM非公開APIを公開して解決したりしません。Front mainの自動配備を含めた切替順をレビューした後にだけ#77をマージし、Worker経由の閉鎖configと/v2・停止・本人権利を確認します。
 
@@ -135,7 +135,7 @@ export GCP_QUIESCED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 ```sh
 gcloud sql backups create --instance=trace-postgres --project="$GCP_PROJECT_ID" \
-  --location=asia-northeast1 --description="reviewed schema003-to018 maintenance"
+  --location=asia-northeast1 --description="reviewed schema003-to019 maintenance"
 gcloud sql backups list --instance=trace-postgres --project="$GCP_PROJECT_ID" \
   --format='table(id,type,status,startTime,endTime,location)'
 # Select the completed backup from THIS maintenance, never an old scheduled backup.
@@ -144,7 +144,7 @@ bash deploy/gcp/deploy.sh migrate
 bash deploy/gcp/deploy.sh runtime-grants
 ```
 
-backup ID・対象instance・ON_DEMAND/SUCCESSFUL・停止以後の開始/完了時刻を検証します。migrateは連続003または適用済み現行版から004～018を番号順に適用し、連続001～018を確認します。017の参加停止/receipt所有と018の個人運営資格/監査も必要です。成功後の再実行は適用済み版を飛ばします。001/002や不整合履歴はこの手順で自動処理しません。
+backup ID・対象instance・ON_DEMAND/SUCCESSFUL・停止以後の開始/完了時刻を検証します。migrateは連続003または適用済み現行版から004～019を番号順に適用し、連続001～019を確認します。017の参加停止/receipt所有、018の個人運営資格/監査、019の再視聴ID/FIFO時刻/Memory所有receipt・proof消費も必要です。019のNOT NULL列は旧Backend INSERTと非互換です。旧書込みを停止→migration→runtime権限→新Backend起動を一体で行い、その後に新Frontendを配備し、旧新版の書込みを混在させません。成功後の再実行は適用済み版を飛ばします。001/002や不整合履歴はこの手順で自動処理しません。今回の実装作業では本番deployを行いません。
 
 次に既存Edge keyを、画面非表示入力でこのシェルの環境だけへ読み込みます。ファイルや引数へ渡しません。
 

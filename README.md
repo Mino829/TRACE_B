@@ -76,6 +76,7 @@ Backend担当から採用方針の明示を受けた移行実装です。設計I
 | GET | /v1/live-presence-sessions/{liveSessionId} |
 | POST | /v1/memory-sessions/{memorySessionId}/stop |
 | POST | /v1/memory-sessions/{memorySessionId}/arrival |
+| POST | /v1/memory-sessions/{memorySessionId}/arrival/replay |
 | POST | /v1/memory-sessions/{memorySessionId}/arrival/skip |
 | DELETE | /v1/memory-sessions/{memorySessionId} |
 | DELETE | /v1/live-presence-sessions/{liveSessionId} |
@@ -162,15 +163,23 @@ proofはbase64url(JSON).base64url(HMAC-SHA256(proof key, base64url(JSON)))で、
 
 同じMemoryの到着はArrivalEventを一度だけ作ります。同じキー/同じ内容、または別キーでの本人再送は、QR期限切れ・鍵切替後も同じ到着IDと現在のstatusを返し、過去のqueued応答に固定しません。同じキーの異なる内容は409 IDEMPOTENCY_CONFLICT。Memory削除時は到着/receiptも消え、演出skipで本人照会・削除期限を短縮しません。
 
+本人が`completed`後に新しいQRを読み直した場合だけ、`POST /v1/memory-sessions/{memorySessionId}/arrival/replay`へMemory Bearer、Idempotency-Key、`{"checkpointToken":"...","clientTime":"..."}`を送ります。成功は200 `{"arrivalId":"新しい公開再生ID","status":"queued"}`。再視聴は`queued_at`を現在時刻としてFIFO末尾へ入り、初回の到着ID・arrived_at・経路終端・Memory期限・Push停止を変更しません。queued/playing/skipped、本人停止・期限切れ・削除中は409 STATE_CONFLICTです。queued/playing競合時は本人GETで現状態に合流し、追加予約・割込みをしません。
+
+初回到着と再視聴の冪等性記録は分離します。受理済み再視聴の同じキー・同じbodyはQR期限後も保存済みの同一成功応答を返し、再enqueueしません（異なるbodyは409 IDEMPOTENCY_CONFLICT）。新規操作はfreshな有効proofが必要で、初回到着で使ったproofも含めMemoryごと一度だけです。使用済みproofは400 INVALID_ARRIVAL_PROOF。同じQRを他Memoryが使うことは可能です。DBにはSHA-256 fingerprintだけを保存し、raw proof・Bearerは保存しません。満杯・競合ではproof消費・receiptを確定しません。
+
+描画の`arrivalId`は初回のみroot到着IDと一致し、再視聴・運営retryで新しい`replay_id`になります。`participant.arrived`の全metadata投影→`arrival.replay.requested`を同じtransactionで配信し、snapshot・写真変更・skipも現世代IDを使います。旧世代のrenderer完了/失敗は409相当のrenderer.rejectedで拒否し、rootへのfallbackはありません。
+
 旧Memoryの有効なExperienceLinkは照合し、到着と追跡中・来場前の対応Liveのarrived更新を同じtransactionで確定します。停止済みLiveは再開しません。旧位置書込み・on-site継続は廃止済みで本人照会・停止・削除は保持します。新Memoryはlinkなし・写真0枚でも到着できます。本人GETのreplayStatusは未到着null、到着後queued/playing/completed/skipped。待ち順・推定待ち時間・aliasは返しません。
 
 写真0枚でも到着を受け付け、1枚なら写真地点からShibaLabまでの経路を返します。pending写真があれば最大15秒だけ開始を遅らせ、後続は追い越しません。FIFO上限は有効なMemoryの待機50件（playingを除く）で、通常待機30秒ではskipしません。満杯時は503 ARRIVAL_QUEUE_FULLとRetry-After: 5を返し、到着・receipt・Push停止・旧Live更新を確定しません。空き回復後に再試行でき、初回には有効QRが必要です。Memoryの停止・失効・削除は待機/描画から除外します。本人arrival/skipは未再生だけを対象とします。
 
-運営候補GET・skip/retryも個人operator Bearerを使います。候補はFIFOのIDと写真件数だけです。retryは描画障害skipに限り、有効・未停止Memoryと空き枠が必要です。主描画機が先頭の開始を自動要求し、Backendはlease・先頭・写真待機・単一playingを検証します。先行開始や重複はrenderer.rejected。終了画面4秒とQR非表示はFrontendの責務です。失敗理由は固定分類renderer_failureで記録し、任意の例外文や個人情報は受け付けません。
+運営候補GET・skip/retryも個人operator Bearerを使います。候補はFIFOの公開再生IDと写真件数だけです。retryは描画障害skipに限り、有効・未停止Memoryと空き枠が必要で、新公開再生IDと現在のmetadataを発行してFIFO末尾へ入れます。主描画機が先頭の開始を自動要求し、Backendはlease・先頭・写真待機・単一playingを検証します。先行開始や重複はrenderer.rejected。終了画面4秒とQR非表示はFrontendの責務です。失敗理由は固定分類renderer_failureで記録し、任意の例外文や個人情報は受け付けません。
 
 `013_arrival_fifo_queue.sql`で`replay_deadline`と関連制約・indexを撤去し、`playing`が全体で最大1件となる部分一意indexを追加します。既存の複数`playing`は自動修復せずmigrationを拒否するため、切替前に運営操作で整理してください。**受付停止→既存の待機・再生を処理/明示skipしてキューを空にする→旧API/清掃revisionを停止→バックアップ→明示migration→実行権限再適用→新revisionのready確認**の順に切り替えます。`012`は変更しない履歴であり、未適用環境ではその10件/30秒skipが`013`より先に実行されます。既存待機を残したまま更新しないでください。既にskipされた演出は`013`でも復活させません。schema非互換のため旧バイナリへ直接ロールバックしないでください。旧Live/位置APIの移行方針は冒頭のBackend #26を参照してください。
 
-旧schemaからは018まで欠番なく明示適用しruntime-grants.sqlを再適用します。013のFIFO移行、014～016の運営制御、017の参加停止/receipt所有、018の個人資格/監査が必要です。旧API・清掃revisionを停止してから適用し、旧Session/写真のGraph版・本人資格・同意・deleteAfterを書き換えません。ローカル検証を実staging・実Googleログイン・公開承認の代わりにしません（[配備手順](docs/google-cloud.md#3-dbユーザーと秘密情報)）。
+旧schemaからは019まで欠番なく明示適用しruntime-grants.sqlを再適用します。013のFIFO移行、014～016の運営制御、017の参加停止/receipt所有、018の個人資格/監査、019の再視聴公開ID/FIFO時刻/Memory所有receipt・proof消費が必要です。019は既存行を`replay_id=id, queued_at=arrived_at`でbackfillし両列をNOT NULLにします。旧API・清掃revisionを停止してから適用し、旧Session/写真のGraph版・本人資格・同意・deleteAfterを書き換えません。ローカル検証を実staging・実Googleログイン・公開承認の代わりにしません（[配備手順](docs/google-cloud.md#3-dbユーザーと秘密情報)）。
+
+再視聴切替時は既存Backendの書込みを止め、`019` migration→runtime権限再適用→新Backend起動を一体で行い、その後に新Frontendを配備します。NOT NULLの`replay_id`/`queued_at`を持たない旧BackendのINSERTとは互換ではないため、旧Backendを動かしたままmigrationせず、旧版と新版の書込みを混在させません。shim/triggerで旧書込みを延命せず、今回の変更で本番deployは行いません。
 
 ### 運営状態照会
 

@@ -36,7 +36,7 @@ func TestMemoryStatusSeparatesReplayFromParticipationAndRetention(t *testing.T) 
 				}
 			}
 			assertState(now, "main", nil)
-			if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "lifecycle-arrival", "booth", "receipt", "request", now); err != nil {
+			if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "lifecycle-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt", "request", now); err != nil {
 				t.Fatal(err)
 			}
 			queued := "queued"
@@ -77,7 +77,7 @@ func TestMemoryStopSkipsQueuedAndPlayingAndAdvancesPendingFallback(t *testing.T)
 			f.Store.EnableDisplay()
 			now := time.Now().UTC().Truncate(time.Microsecond)
 			v := lifecycleMemory(t, f, now)
-			if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "lifecycle-arrival", "booth", "receipt", "request", now); err != nil {
+			if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "lifecycle-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt", "request", now); err != nil {
 				t.Fatal(err)
 			}
 			if ok, err := f.Store.AcquireDisplayLease(t.Context(), "holder", "lease", now); err != nil || !ok {
@@ -130,7 +130,7 @@ func TestMemoryStopSerializesWithFirstArrivalAndReplayStart(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Microsecond)
 			v := lifecycleMemory(t, f, now)
 			if operation == "replay" {
-				if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "race-arrival", "booth", "receipt", "request", now); err != nil {
+				if _, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "race-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt", "request", now); err != nil {
 					t.Fatal(err)
 				}
 				if ok, err := f.Store.AcquireDisplayLease(t.Context(), "holder", "lease", now); err != nil || !ok {
@@ -152,7 +152,7 @@ func TestMemoryStopSerializesWithFirstArrivalAndReplayStart(t *testing.T) {
 				<-start
 				var err error
 				if operation == "arrival" {
-					_, err = f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "race-arrival", "booth", "receipt", "request", now)
+					_, err = f.Store.AcceptArrival(t.Context(), v.MemorySessionID, "", "race-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt", "request", now)
 				} else {
 					_, err = f.Store.DisplayReplay(t.Context(), "holder", "lease", "race-start", "race-arrival", "arrival.replay.started", now)
 				}

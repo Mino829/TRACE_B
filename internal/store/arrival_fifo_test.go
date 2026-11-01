@@ -27,7 +27,7 @@ func fifoArrival(t *testing.T, f *testdb.Fixture, id string, now time.Time) stri
 	t.Helper()
 	memoryID := fifoExperience(t, f, id, now)
 	arrivalID := "fifo-arrival-" + id
-	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", arrivalID, "booth", "receipt-"+id, "request", now); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", arrivalID, "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt-"+id, "request", now); err != nil {
 		t.Fatal(err)
 	}
 	return arrivalID
@@ -102,14 +102,14 @@ func TestArrivalQueueAcceptsFiftyAndRetriesAfterCapacityReturns(t *testing.T) {
 		fifoArrival(t, f, fmt.Sprintf("capacity-%02d", i), now.Add(time.Duration(i)*time.Microsecond))
 	}
 	memoryID := fifoExperience(t, f, "overflow", now)
-	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "overflow-arrival", "booth", "overflow-receipt", "request", now.Add(time.Second)); err != store.ErrArrivalQueueFull {
+	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "overflow-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "overflow-receipt", "request", now.Add(time.Second)); err != store.ErrArrivalQueueFull {
 		t.Fatalf("queue-full request: %v", err)
 	}
 	var stopped bool
 	if err := f.SQL.QueryRowContext(t.Context(), `SELECT push_stopped FROM memory_sessions WHERE id=$1`, memoryID).Scan(&stopped); err != nil || stopped {
 		t.Fatalf("full queue stopped push: %t %v", stopped, err)
 	}
-	for _, table := range []string{"arrival_events", "arrival_receipts"} {
+	for _, table := range []string{"arrival_events", "arrival_receipts", "arrival_proof_uses"} {
 		var count int
 		if err := f.SQL.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+table+" WHERE memory_session_id=$1", memoryID).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("full queue persisted %s: %d %v", table, count, err)
@@ -118,7 +118,7 @@ func TestArrivalQueueAcceptsFiftyAndRetriesAfterCapacityReturns(t *testing.T) {
 	if err := f.Store.SkipArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), "fifo-arrival-capacity-00", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "overflow-arrival", "booth", "overflow-receipt", "request", now.Add(2*time.Second)); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "overflow-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "overflow-receipt", "request", now.Add(2*time.Second)); err != nil {
 		t.Fatalf("same-key retry after capacity recovery: %v", err)
 	}
 }
@@ -139,7 +139,7 @@ func TestConcurrentArrivalsCannotExceedFifty(t *testing.T) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			_, err := f.Store.AcceptArrival(t.Context(), id, "", fmt.Sprintf("race-arrival-%d", i), "booth", "race-receipt", "request", now.Add(time.Second))
+			_, err := f.Store.AcceptArrival(t.Context(), id, "", fmt.Sprintf("race-arrival-%d", i), "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "race-receipt", "request", now.Add(time.Second))
 			results <- err
 		}()
 	}
@@ -239,7 +239,7 @@ func TestStoppedMemoryDoesNotOccupyQueueCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	memoryID := fifoExperience(t, f, "active-capacity", now)
-	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "active-capacity-arrival", "booth", "active-receipt", "request", now); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "active-capacity-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "active-receipt", "request", now); err != nil {
 		t.Fatalf("stopped arrival retained queue capacity: %v", err)
 	}
 }

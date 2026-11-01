@@ -182,7 +182,7 @@ func TestFallbackContinuesAcceptingArrivalsUnderExistingQueueLimit(t *testing.T)
 		fifoArrival(t, f, fmt.Sprintf("fallback-capacity-%02d", i), now.Add(time.Duration(i)*time.Microsecond))
 	}
 	memoryID := fifoExperience(t, f, "fallback-overflow", now)
-	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "fallback-overflow", "booth", "receipt-overflow", "request", now.Add(time.Second)); !errors.Is(err, store.ErrArrivalQueueFull) {
+	if _, err := f.Store.AcceptArrival(t.Context(), memoryID, "", "fallback-overflow", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt-overflow", "request", now.Add(time.Second)); !errors.Is(err, store.ErrArrivalQueueFull) {
 		t.Fatalf("fallback queue limit: %v", err)
 	}
 	snapshot, err := f.Store.DisplaySnapshot(t.Context(), now.Add(time.Second))
@@ -292,7 +292,7 @@ func TestFallbackDeadlinePersistsAndLateCompletionCommitsTimeout(t *testing.T) {
 				t.Fatal(err)
 			}
 			fallbackArrivalState(t, f, playing, "skipped", "operator")
-			if err := restarted.RetryDisplayArrival(t.Context(), playing, resumedAt); !errors.Is(err, store.ErrConflict) {
+			if err := restarted.RetryDisplayArrival(t.Context(), playing, "retry-generation", resumedAt); !errors.Is(err, store.ErrConflict) {
 				t.Fatalf("operator timeout became renderer retry: %v", err)
 			}
 			fallbackReplay(t, restarted, "deadline-resume-next", queued, "started", "playing", resumedAt)

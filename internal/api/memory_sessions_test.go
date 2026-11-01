@@ -109,7 +109,7 @@ func TestMemoryStopIsTerminalButRetainsOwnerReadsAndDeletion(t *testing.T) {
 	if _, err := f.Store.PatchPush(t.Context(), owner.Memory.SessionID, nil, &status, time.Now().UTC()); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("stopped participant patched push: %v", err)
 	}
-	if _, err := f.Store.AcceptArrival(t.Context(), owner.Memory.SessionID, "", "late-arrival", "booth", "late-key", "late-request", time.Now().UTC()); !errors.Is(err, store.ErrConflict) {
+	if _, err := f.Store.AcceptArrival(t.Context(), owner.Memory.SessionID, "", "late-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "late-key", "late-request", time.Now().UTC()); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("stopped participant first arrival succeeded: %v", err)
 	}
 	response := request(t, api.New(cfg, f.Store, nil), "POST", photoPath, devicePhotoBody("after-stop", "cp-a", time.Now().UTC()), map[string]string{"Authorization": headers["Authorization"], "Idempotency-Key": "photo-after-stop"})

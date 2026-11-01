@@ -21,26 +21,25 @@ func TestRendererRetryAfterThirtySecondsStillRequiresActiveMemory(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Store.AcceptArrival(t.Context(), "retry-memory", "", "retry-arrival", "booth",
-		"retry-receipt", "same-body", now); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), "retry-memory", "", "retry-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "retry-receipt", "same-body", now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE arrival_events SET replay_status='skipped',
  skip_reason='renderer_failure',replay_finished_at=$1 WHERE id='retry-arrival'`, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Store.RetryDisplayArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), "retry-arrival", now.Add(2*time.Minute)); err != nil {
+	if err := f.Store.RetryDisplayArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), "retry-arrival", "retry-generation", now.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	candidates, err := f.Store.ReplayCandidates(t.Context(), now.Add(2*time.Minute))
-	if err != nil || len(candidates) != 1 || candidates[0].ArrivalID != "retry-arrival" {
+	if err != nil || len(candidates) != 1 || candidates[0].ArrivalID != "retry-generation" {
 		t.Fatalf("retry lost its waiting arrival: %+v %v", candidates, err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `UPDATE arrival_events SET replay_status='skipped',
  skip_reason='renderer_failure',replay_finished_at=$1 WHERE id='retry-arrival'`, now.Add(30*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Store.RetryDisplayArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), "retry-arrival", now.Add(time.Hour)); !errors.Is(err, store.ErrConflict) {
+	if err := f.Store.RetryDisplayArrival(store.WithOperatorActor(t.Context(), "trusted-test-operator"), "retry-generation", "retry-expired", now.Add(time.Hour)); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("retry after memory expiry: %v", err)
 	}
 }
@@ -50,13 +49,11 @@ func TestArrivalAfterLongWaitWithNewReceiptRemainsQueued(t *testing.T) {
 	f.Store.EnableDisplay()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	v := fixtureExperience(t, f, now)
-	first, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash,
-		"arrival-once", "booth", "receipt-first", "request", now)
+	first, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash, "arrival-once", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt-first", "request", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash,
-		"arrival-duplicate", "booth", "receipt-second", "request", now.Add(30*time.Second))
+	second, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash, "arrival-duplicate", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt-second", "request", now.Add(30*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +75,7 @@ func TestArrivalAfterLongWaitWithNewReceiptRemainsQueued(t *testing.T) {
 	if status != "queued" || reason != "" {
 		t.Fatalf("waiting arrival was skipped: %s/%s", status, reason)
 	}
-	repeated, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash,
-		"arrival-duplicate", "booth", "receipt-first", "request", now.Add(31*time.Second))
+	repeated, err := f.Store.AcceptArrival(t.Context(), v.MemorySessionID, v.LinkTokenHash, "arrival-duplicate", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt-first", "request", now.Add(31*time.Second))
 	if err != nil || string(repeated) != string(first) {
 		t.Fatalf("original idempotency receipt changed: %s (%v)", repeated, err)
 	}
@@ -100,8 +96,7 @@ func TestArrivalRetriesResolveCurrentStateWithoutNewProof(t *testing.T) {
 			f.Store.EnableDisplay()
 			now := time.Now().UTC().Truncate(time.Microsecond)
 			owner := fixtureExperience(t, f, now)
-			if _, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, owner.LinkTokenHash,
-				"current-arrival", "booth", "original-key", "original-request", now); err != nil {
+			if _, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, owner.LinkTokenHash, "current-arrival", "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "original-key", "original-request", now); err != nil {
 				t.Fatal(err)
 			}
 			// Existing receipts may still contain the old serialized queued body.
@@ -133,8 +128,7 @@ func TestArrivalRetriesResolveCurrentStateWithoutNewProof(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, key := range []string{"original-key", "new-key"} {
-				body, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, "", "not-a-new-arrival", "",
-					key, "original-request", later.Add(2*time.Second))
+				body, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, "", "not-a-new-arrival", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", key, "original-request", later.Add(2*time.Second))
 				if err != nil {
 					t.Fatalf("retry %s: %v", key, err)
 				}
@@ -149,8 +143,7 @@ func TestArrivalRetriesResolveCurrentStateWithoutNewProof(t *testing.T) {
 					t.Fatalf("retired on-site choice exposed: %s", body)
 				}
 			}
-			if _, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, "", "not-a-new-arrival", "",
-				"original-key", "changed-request", later); !errors.Is(err, store.ErrIdempotencyConflict) {
+			if _, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, "", "not-a-new-arrival", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "original-key", "changed-request", later); !errors.Is(err, store.ErrIdempotencyConflict) {
 				t.Fatalf("same key changed request: %v", err)
 			}
 			var events, arrivals int
@@ -168,8 +161,7 @@ func TestInvalidNewArrivalDoesNotPersistOrStopPush(t *testing.T) {
 	f := testdb.Open(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	owner := fixtureExperience(t, f, now)
-	if _, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, owner.LinkTokenHash,
-		"invalid-arrival", "", "invalid-key", "invalid-request", now); !errors.Is(err, store.ErrInvalidArrivalProof) {
+	if _, err := f.Store.AcceptArrival(t.Context(), owner.MemorySessionID, owner.LinkTokenHash, "invalid-arrival", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "invalid-key", "invalid-request", now); !errors.Is(err, store.ErrInvalidArrivalProof) {
 		t.Fatalf("invalid new proof: %v", err)
 	}
 	var arrivals, receipts int
@@ -190,7 +182,7 @@ func TestOperatorArrivalMutationsRequireTrustedActorAndAuditIt(t *testing.T) {
 	if err := f.Store.SkipArrival(t.Context(), id, now); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("untrusted skip: %v", err)
 	}
-	if err := f.Store.RetryDisplayArrival(t.Context(), id, now); !errors.Is(err, store.ErrConflict) {
+	if err := f.Store.RetryDisplayArrival(t.Context(), id, "retry-generation", now); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("untrusted retry: %v", err)
 	}
 	var status string
@@ -240,7 +232,7 @@ func TestArrivalOperatorAuditFailureRollsBackMutationAndEvents(t *testing.T) {
 			if action == "arrival.skip" {
 				mutationErr = f.Store.SkipArrival(trusted, id, now)
 			} else {
-				mutationErr = f.Store.RetryDisplayArrival(trusted, id, now)
+				mutationErr = f.Store.RetryDisplayArrival(trusted, id, "retry-generation", now)
 			}
 			if mutationErr == nil {
 				t.Fatal("operator mutation succeeded without its audit")
