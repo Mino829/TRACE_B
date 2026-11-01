@@ -84,7 +84,7 @@ func (s *Store) advanceFallback(ctx context.Context, now time.Time) (FallbackSta
 		var id string
 		err := s.q.QueryRowContext(ctx, `UPDATE arrival_events
  SET replay_status='skipped',skip_reason='operator',replay_finished_at=$1
- WHERE replay_status='playing' RETURNING id`, now).Scan(&id)
+ WHERE replay_status='playing' RETURNING replay_id`, now).Scan(&id)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return state, err
 		}

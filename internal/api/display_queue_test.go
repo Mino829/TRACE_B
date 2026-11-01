@@ -27,7 +27,7 @@ func TestArrivalQueueFullHTTPIsRetryableWithoutPartialArrival(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.Store.AcceptArrival(t.Context(), id, "", fmt.Sprintf("full-arrival-%02d", i), "booth", "full-receipt", "request", now); err != nil {
+		if _, err := f.Store.AcceptArrival(t.Context(), id, "", fmt.Sprintf("full-arrival-%02d", i), "booth", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "full-receipt", "request", now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -44,7 +44,7 @@ func TestArrivalQueueFullHTTPIsRetryableWithoutPartialArrival(t *testing.T) {
 	if err := f.SQL.QueryRowContext(t.Context(), `SELECT push_stopped FROM memory_sessions WHERE id=$1`, owner.Memory.SessionID).Scan(&stopped); err != nil || stopped {
 		t.Fatalf("queue full stopped push: %t %v", stopped, err)
 	}
-	for _, table := range []string{"arrival_events", "arrival_receipts"} {
+	for _, table := range []string{"arrival_events", "arrival_receipts", "arrival_proof_uses"} {
 		var count int
 		if err := f.SQL.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+table+" WHERE memory_session_id=$1", owner.Memory.SessionID).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("partial %s: %d %v", table, count, err)
@@ -105,7 +105,7 @@ func TestDisplayWebSocketWaitsAndReplaysInOrder(t *testing.T) {
 	// Age queued requests without sleeping or extending their session lifetime.
 	now := time.Now().UTC()
 	for i, id := range ids {
-		if _, err := f.SQL.ExecContext(t.Context(), `UPDATE arrival_events SET arrived_at=$2,photo_wait_until=$2 WHERE id=$1`, id, now.Add(-2*time.Minute).Add(time.Duration(i)*time.Second)); err != nil {
+		if _, err := f.SQL.ExecContext(t.Context(), `UPDATE arrival_events SET arrived_at=$2,queued_at=$2,photo_wait_until=$2 WHERE id=$1`, id, now.Add(-2*time.Minute).Add(time.Duration(i)*time.Second)); err != nil {
 			t.Fatal(err)
 		}
 	}

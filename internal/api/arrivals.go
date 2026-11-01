@@ -135,10 +135,56 @@ func (s *Server) arrive(w http.ResponseWriter, r *http.Request) {
 	receiptKey := hash(key + "\x00" + token)
 	checkpointID, _ := s.verifyCheckpoint(input.CheckpointToken, now)
 	result, err := s.store.AcceptArrival(r.Context(), memoryID, hash(input.ExperienceLinkToken), randomID("arrival"), checkpointID,
-		receiptKey, hashBytes(body), now)
+		hash(input.CheckpointToken), receiptKey, hashBytes(body), now)
 	if err != nil {
 		if errors.Is(err, store.ErrInvalidArrivalProof) {
 			s.writeError(w, requestID(r), &apiError{Code: "INVALID_ARRIVAL_PROOF", Message: "arrival proof is invalid or expired", Status: http.StatusBadRequest})
+			return
+		}
+		s.writeStoreError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(result)
+}
+
+func (s *Server) replayArrival(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.ArrivalEnabled || !s.cfg.DisplayEnabled {
+		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "arrival replay is unavailable", Status: http.StatusServiceUnavailable})
+		return
+	}
+	memoryID := r.PathValue("memorySessionId")
+	if err := s.authenticateMemory(r, memoryID); err != nil {
+		s.writeError(w, requestID(r), err)
+		return
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if len(key) == 0 || len(key) > 200 {
+		s.writeError(w, requestID(r), &apiError{Code: "IDEMPOTENCY_KEY_REQUIRED", Message: "a valid Idempotency-Key header is required", Status: http.StatusBadRequest})
+		return
+	}
+	body, inputErr := readBody(w, r)
+	if inputErr != nil {
+		s.writeError(w, requestID(r), inputErr)
+		return
+	}
+	var input struct {
+		CheckpointToken string `json:"checkpointToken"`
+		ClientTime      string `json:"clientTime"`
+	}
+	if err := decodeBytes(body, &input); err != nil {
+		s.writeError(w, requestID(r), err)
+		return
+	}
+	now := s.now().UTC()
+	checkpointID, _ := s.verifyCheckpoint(input.CheckpointToken, now)
+	token, _ := bearerToken(r)
+	result, err := s.store.ReplayArrival(r.Context(), memoryID, randomID("arrival"), checkpointID,
+		hash(input.CheckpointToken), hash(key+"\x00"+token), hashBytes(body), now)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidArrivalProof) {
+			s.writeError(w, requestID(r), &apiError{Code: "INVALID_ARRIVAL_PROOF", Message: "arrival proof is invalid, expired, or already used", Status: http.StatusBadRequest})
 			return
 		}
 		s.writeStoreError(w, r, err)
@@ -186,7 +232,7 @@ func (s *Server) operatorRetryArrival(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, requestID(r), &apiError{Code: "NOT_AVAILABLE", Message: "display is disabled", Status: http.StatusServiceUnavailable})
 		return
 	}
-	if err := s.store.RetryDisplayArrival(r.Context(), r.PathValue("arrivalId"), s.now().UTC()); err != nil {
+	if err := s.store.RetryDisplayArrival(r.Context(), r.PathValue("arrivalId"), randomID("arrival"), s.now().UTC()); err != nil {
 		s.writeStoreError(w, r, err)
 		return
 	}

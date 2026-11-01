@@ -69,10 +69,10 @@ func (s *Store) DisplaySnapshot(ctx context.Context, now time.Time) (DisplayStat
 		if err != nil {
 			return err
 		}
-		rows, err := tx.q.QueryContext(ctx, `SELECT a.id,a.replay_status,
+		rows, err := tx.q.QueryContext(ctx, `SELECT a.replay_id,a.replay_status,
  a.memory_session_id,m.photo_mode,COALESCE(m.campus_graph_version,'') FROM arrival_events a
  JOIN memory_sessions m ON m.id=a.memory_session_id
- WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$1 ORDER BY a.arrived_at,a.id`, now)
+ WHERE a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$1 ORDER BY a.queued_at,a.id`, now)
 		if err != nil {
 			return err
 		}
@@ -175,7 +175,7 @@ func (s *Store) appendDisplayPhotoChange(ctx context.Context, memoryID, kind str
 	}
 	var a DisplayArrival
 	var photoMode, graphVersion string
-	err := s.q.QueryRowContext(ctx, `SELECT a.id,a.replay_status,m.photo_mode,COALESCE(m.campus_graph_version,'')
+	err := s.q.QueryRowContext(ctx, `SELECT a.replay_id,a.replay_status,m.photo_mode,COALESCE(m.campus_graph_version,'')
  FROM arrival_events a JOIN memory_sessions m ON m.id=a.memory_session_id
  WHERE a.memory_session_id=$1 AND a.replay_status IN ('queued','playing') AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$2`,
 		memoryID, now).Scan(&a.ArrivalID, &a.ReplayStatus, &photoMode, &graphVersion)
@@ -302,7 +302,7 @@ func (s *Store) expireDisplayLease(ctx context.Context, now time.Time) error {
 }
 func (s *Store) clearDisplayLease(ctx context.Context, lease string, now time.Time) error {
 	rows, err := s.q.QueryContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason='renderer_failure',replay_finished_at=$2
- WHERE replay_status='playing' AND renderer_lease_id=$1 RETURNING id`, lease, now)
+ WHERE replay_status='playing' AND renderer_lease_id=$1 RETURNING replay_id`, lease, now)
 	if err != nil {
 		return err
 	}
@@ -345,7 +345,12 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
 		var savedLease, savedAction, savedArrival string
 		err = tx.q.QueryRowContext(ctx, `SELECT lease_id,kind,arrival_id,result FROM display_renderer_receipts WHERE event_id=$1`, eventID).Scan(&savedLease, &savedAction, &savedArrival, &status)
 		if err == nil {
-			if savedLease != lease || savedAction != action || savedArrival != arrivalID {
+			var currentID string
+			currentErr := tx.q.QueryRowContext(ctx, `SELECT replay_id FROM arrival_events WHERE replay_id=$1`, arrivalID).Scan(&currentID)
+			if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
+				return currentErr
+			}
+			if currentErr != nil || savedLease != lease || savedAction != action || savedArrival != arrivalID {
 				rejected = true
 				return nil
 			}
@@ -385,14 +390,14 @@ func (s *Store) DisplayReplay(ctx context.Context, holder, lease, eventID, arriv
  replay_started_at=CASE WHEN $2='playing' THEN $4 ELSE replay_started_at END,
  replay_finished_at=CASE WHEN $2<>'playing' THEN $4 ELSE replay_finished_at END,
  skip_reason=CASE WHEN $2='skipped' THEN 'renderer_failure' ELSE skip_reason END
- WHERE id=$1 AND replay_status=$5 AND (renderer_lease_id IS NULL OR renderer_lease_id=$3)
+ WHERE replay_id=$1 AND replay_status=$5 AND (renderer_lease_id IS NULL OR renderer_lease_id=$3)
  AND ($2<>'playing' OR (
  EXISTS (SELECT 1 FROM memory_sessions m WHERE m.id=arrival_events.memory_session_id
  AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$4)
  AND NOT EXISTS (SELECT 1 FROM arrival_events playing WHERE playing.replay_status='playing')
  AND id=(SELECT head.id FROM arrival_events head JOIN memory_sessions m ON m.id=head.memory_session_id
  WHERE head.replay_status='queued' AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$4
- ORDER BY head.arrived_at,head.id LIMIT 1)
+ ORDER BY head.queued_at,head.id LIMIT 1)
  AND (photo_wait_until<=$4 OR NOT EXISTS
  (SELECT 1 FROM photos p WHERE p.memory_session_id=arrival_events.memory_session_id AND p.status='pending'))))`
 		result, err := tx.q.ExecContext(ctx, query, arrivalID, next, lease, now, previous)

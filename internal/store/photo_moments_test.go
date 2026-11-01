@@ -172,8 +172,8 @@ func TestPhotoMomentQuotaArrivalAndExpiry(t *testing.T) {
 		t.Fatalf("quota did not recover while sequence stayed stable: %+v %v", p, err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,photo_wait_until)
- VALUES ('device-arrived',$1,'qr','cp-b','queued',$2,$2)`, id, now.Add(time.Minute)); err != nil {
+ (id,replay_id,memory_session_id,source,checkpoint_id,replay_status,arrived_at,queued_at,photo_wait_until)
+ VALUES ('device-arrived','device-arrived',$1,'qr','cp-b','queued',$2,$2,$2)`, id, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Store.RefreshMomentRoutes(t.Context(), id, now); err != nil {
@@ -265,7 +265,7 @@ func TestDeviceArrivalReconcilesZeroAndOnePhoto(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	v := deviceExperience(t, f, now)
 	id := v.MemorySessionID
-	if _, err := f.Store.AcceptArrival(t.Context(), id, "", "arrival-1", "mid", "receipt-1", "hash-1", now.Add(time.Minute)); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), id, "", "arrival-1", "mid", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt-1", "hash-1", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := f.Store.MomentRouteSegments(t.Context(), id)
@@ -355,7 +355,7 @@ func TestPreviouslyAcceptedNonSelectableMomentRetainsReplayAndRoute(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Store.AcceptArrival(t.Context(), id, "", "arrival-selection", "mid", "receipt-selection", "hash-selection", now.Add(2*time.Minute)); err != nil {
+	if _, err := f.Store.AcceptArrival(t.Context(), id, "", "arrival-selection", "mid", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "receipt-selection", "hash-selection", now.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := f.Store.MomentRouteSegments(t.Context(), id)

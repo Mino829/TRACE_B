@@ -82,6 +82,7 @@ func New(cfg config.Config, db *store.Store, photos *photo.Service, sender ...*p
 	mux.HandleFunc("POST /v1/live-presence-sessions/{liveSessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopLive)))
 	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/stop", server.limitedSession("session", server.atomic((*Server).stopMemory)))
 	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/arrival", server.limitedSession("session", server.arrive))
+	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/arrival/replay", server.limitedSession("session", server.replayArrival))
 	mux.HandleFunc("POST /v1/memory-sessions/{memorySessionId}/arrival/skip", server.limitedSession("session", server.skipOwnArrival))
 	mux.HandleFunc("DELETE /v1/memory-sessions/{memorySessionId}", server.limitedSession("session", server.prepareMemoryPhotoDeletion(server.atomic((*Server).deleteMemory))))
 	mux.HandleFunc("DELETE /v1/live-presence-sessions/{liveSessionId}", server.limitedSession("session", server.atomic((*Server).deleteLive)))

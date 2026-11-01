@@ -722,8 +722,8 @@ func TestPhotoMemoryReturnsCheckpointAndArrivalSegment(t *testing.T) {
 	// One photo pair plus one arrival segment; drivers stay versioned.
 	var arrivedAt = time.Now().UTC()
 	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
- VALUES ('arr',$1,'qr','cp-b','skipped','operator',$2,$2)`, c.Memory.SessionID, arrivedAt); err != nil {
+ (id,replay_id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,queued_at,photo_wait_until)
+ VALUES ('arr','arr',$1,'qr','cp-b','skipped','operator',$2,$2,$2)`, c.Memory.SessionID, arrivedAt); err != nil {
 		t.Fatal(err)
 	}
 	r = request(t, h, "GET", "/v1/memory-sessions/"+c.Memory.SessionID+"/memory", "", map[string]string{"Authorization": "Bearer " + c.Memory.ParticipantToken})
@@ -771,8 +771,8 @@ func TestPhotoMemoryWithoutRoutableArrivalSegment(t *testing.T) {
 			readyPhoto(t, h, c, photoJPEG(t), "before-arrival")
 			arrivedAt := time.Now().UTC()
 			if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
- VALUES ('arr',$1,'qr',$2,'skipped','operator',$3,$3)`, c.Memory.SessionID, tc.arrivalCheckpoint, arrivedAt); err != nil {
+ (id,replay_id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,queued_at,photo_wait_until)
+ VALUES ('arr','arr',$1,'qr',$2,'skipped','operator',$3,$3,$3)`, c.Memory.SessionID, tc.arrivalCheckpoint, arrivedAt); err != nil {
 				t.Fatal(err)
 			}
 			if tc.latePhoto {

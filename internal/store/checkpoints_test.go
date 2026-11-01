@@ -153,8 +153,8 @@ func TestArrivalCheckpointExtendsRoute(t *testing.T) {
 	id := fixtureExperience(t, f, now).MemorySessionID
 	insert_arrival := func(arrivedAt time.Time) {
 		if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
- VALUES ('arr-1',$1,'qr','cp-b','skipped','operator',$2,$2)`, id, arrivedAt); err != nil {
+ (id,replay_id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,queued_at,photo_wait_until)
+ VALUES ('arr-1','arr-1',$1,'qr','cp-b','skipped','operator',$2,$2,$2)`, id, arrivedAt); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -196,8 +196,8 @@ func TestArrivalWithUnresolvableCheckpointKeepsNoSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := f.SQL.ExecContext(t.Context(), `INSERT INTO arrival_events
- (id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,photo_wait_until)
- VALUES ('arr-2',$1,'qr','retired-checkpoint','skipped','operator',$2,$2)`, id, now.Add(time.Hour)); err != nil {
+ (id,replay_id,memory_session_id,source,checkpoint_id,replay_status,skip_reason,arrived_at,queued_at,photo_wait_until)
+ VALUES ('arr-2','arr-2',$1,'qr','retired-checkpoint','skipped','operator',$2,$2,$2)`, id, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Store.RefreshRoutes(t.Context(), id, now.Add(time.Hour)); err != nil {

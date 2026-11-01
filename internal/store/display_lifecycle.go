@@ -23,7 +23,7 @@ func (s *Store) stopMemoryDisplay(ctx context.Context, memoryID string, now time
 
 func (s *Store) removeMemoryDisplayWithReason(ctx context.Context, memoryID, reason string, now time.Time) error {
 	var arrivalID, status string
-	err := s.q.QueryRowContext(ctx, `SELECT id,replay_status FROM arrival_events WHERE memory_session_id=$1 FOR UPDATE`, memoryID).Scan(&arrivalID, &status)
+	err := s.q.QueryRowContext(ctx, `SELECT replay_id,replay_status FROM arrival_events WHERE memory_session_id=$1 FOR UPDATE`, memoryID).Scan(&arrivalID, &status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -31,7 +31,7 @@ func (s *Store) removeMemoryDisplayWithReason(ctx context.Context, memoryID, rea
 		return err
 	}
 	if status == "queued" || status == "playing" {
-		_, err = s.q.ExecContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason=$3,replay_finished_at=$2 WHERE id=$1`, arrivalID, now, reason)
+		_, err = s.q.ExecContext(ctx, `UPDATE arrival_events SET replay_status='skipped',skip_reason=$3,replay_finished_at=$2 WHERE replay_id=$1`, arrivalID, now, reason)
 		if err != nil {
 			return err
 		}
@@ -84,7 +84,7 @@ func (s *Store) removeExpiredMemoryDisplay(ctx context.Context, now time.Time) e
 }
 
 // A renderer failure is requeued only by an explicitly authenticated operator.
-func (s *Store) RetryDisplayArrival(ctx context.Context, id string, now time.Time) error {
+func (s *Store) RetryDisplayArrival(ctx context.Context, id, replayID string, now time.Time) error {
 	if OperatorActor(ctx) == "" {
 		return ErrConflict
 	}
@@ -101,19 +101,19 @@ func (s *Store) RetryDisplayArrival(ctx context.Context, id string, now time.Tim
 		if count >= ArrivalQueueLimit {
 			return ErrArrivalQueueFull
 		}
-		result, err := tx.q.ExecContext(ctx, `UPDATE arrival_events a SET replay_status='queued',skip_reason=NULL,replay_started_at=NULL,
- replay_finished_at=NULL,renderer_lease_id=NULL,photo_wait_until=$2
- FROM memory_sessions m WHERE a.id=$1 AND a.memory_session_id=m.id AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$2
- AND a.replay_status='skipped' AND a.skip_reason='renderer_failure'`,
-			id, now)
+		var memoryID string
+		err := tx.q.QueryRowContext(ctx, `UPDATE arrival_events a SET replay_status='queued',skip_reason=NULL,replay_started_at=NULL,
+ replay_finished_at=NULL,renderer_lease_id=NULL,photo_wait_until=$2,queued_at=$2,replay_id=$3
+ FROM memory_sessions m WHERE a.replay_id=$1 AND a.memory_session_id=m.id AND m.deleting=FALSE AND m.stopped_at IS NULL AND m.expires_at>$2
+ AND a.replay_status='skipped' AND a.skip_reason='renderer_failure' RETURNING a.memory_session_id`,
+			id, now, replayID).Scan(&memoryID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrConflict
+		}
 		if err != nil {
 			return err
 		}
-		n, _ := result.RowsAffected()
-		if n != 1 {
-			return ErrConflict
-		}
-		_, err = tx.AppendDisplayEvent(ctx, "arrival.replay.requested", map[string]string{"arrivalId": id}, now)
+		err = tx.appendReplayRequest(ctx, memoryID, replayID, now)
 		if err != nil {
 			return err
 		}

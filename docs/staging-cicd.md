@@ -25,7 +25,7 @@ HTTP probeにGoogle IDトークンは不要です。既存previewはIAM public-i
 
 ## 2. 作業前の確認
 
-- [手動移行手順](google-cloud.md#5-マイグレーション--権限付与--api)で連続schema001～018とruntime権限・ready・清掃を実環境で確認すること。2026-10-28時点の実DB003を、本機能実装だけで更新済みとみなさないこと。
+- [手動移行手順](google-cloud.md#5-マイグレーション--権限付与--api)で連続schema001～019とruntime権限・ready・清掃を実環境で確認すること。2026-10-28時点の実DB003を、本機能実装だけで更新済みとみなさないこと。
 - `trace-backend-preview`と`trace-cleanup`が同一immutable digestを使い、最新ready revisionへ100%配信すること。
 - APIは`trace-preview-runtime`、cleanupは`trace-runtime`。DBは`trace_app`、app-passwordは同じ数値版。所有者資格は渡さないこと。
 - `trace-backend`はmanual 0・反映完了・タグなし。2 APIを同時稼働させないこと。
@@ -177,14 +177,14 @@ GitHub Actionsの設定だけでなく、Google側でも特定リポジトリ・
 
 1. `Mino829/TRACE_B` → Settings → Secrets and variables → Actions → Variables を開く。
 2. Repository variable `GCP_WORKLOAD_IDENTITY_PROVIDER` に、上で控えたproviderのフル名を設定する。
-3. STAGING_DEPLOY_ENABLEDは未設定/falseに保ち、[manual rollout](google-cloud.md#5-マイグレーション--権限付与--api)で旧両API/Scheduler停止、停止後backup、004～018、runtime-grants、preview/cleanup更新と実権限・清掃・Edge/Worker疎通を確認する。
+3. STAGING_DEPLOY_ENABLEDは未設定/falseに保ち、[manual rollout](google-cloud.md#5-マイグレーション--権限付与--api)で旧両API/Scheduler停止、停止後backup、004～019、runtime-grants、preview/cleanup更新と実権限・清掃・Edge/Worker疎通を確認する。019は旧INSERTと非互換のため、旧書込み停止→schema/新Backend一体切替→新Frontendの順とする。
 4. 実DBへ適用・検証したschemaと権限に対応する **mainのフルコミットSHA** をRepository variable `STAGING_SCHEMA_BASELINE` に設定する。旧version 1のSHAやPRのSHAを、検証済みの代わりに設定しない。未設定・不正値ならCIはクラウド操作前に停止する。
 5. その状態でレビュー済みの変更をmainへpushし、`test`ジョブの成功を確認する。Repository variable `STAGING_DEPLOY_ENABLED` を文字列 `true` にするのは、手動配備の疎通とrollback確認が済んだ後だけにする。
 6. 現在のmainに対するpush実行を再実行するか、次のレビュー済み変更をmainへpushする。PR実行の再実行ではデプロイされない。
 7. Actionsの `Deploy staging after tests` が成功し、Summaryにコミット・digest・リビジョンが表示されることを確認する。
 8. Cloud Runの配信先がそのリビジョンであること、削除ジョブが同じdigestで動くことを確認する。
 
-STAGING_SCHEMA_BASELINEは常に明示設定が必要です。migration/権限SQLが変われば自動化停止→停止窓の手動適用→実権限・ready・互換性・復旧確認後、そのschemaに対応するmainのフルSHAへ更新します。003を018適用済みとみなす設定や、mergeだけのbaseline更新は禁止です。
+STAGING_SCHEMA_BASELINEは常に明示設定が必要です。migration/権限SQLが変われば自動化停止→停止窓の手動適用→実権限・ready・互換性・復旧確認後、そのschemaに対応するmainのフルSHAへ更新します。003を019適用済みとみなす設定や、mergeだけのbaseline更新は禁止です。
 GitHub Environmentの有料プラン機能には依存していません。利用できる場合はmainの保護ルールとCIファイルへのレビュー要件を追加してください。
 依存Actionsは検証時のコミットSHAで固定しているため、更新はレビューして行います。
 
