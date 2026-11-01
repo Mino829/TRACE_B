@@ -14,57 +14,58 @@ import (
 )
 
 type Config struct {
-	Address                    string
-	DatabaseURL                string
-	DatabaseMaxConnections     int
-	AllowedOrigins             []string
-	EdgeSharedSecret           string
-	RegistrationOpen           bool
-	PhotoEnabled               bool
-	PhotoMetadataEnabled       bool
-	ArrivalEnabled             bool
-	OperatorEnabled            bool
-	OperatorGoogleClientID     string
-	OperatorEmails             []string
-	OperatorAllowedOrigins     []string
-	ArrivalProofKey            string
-	ArrivalProofKeyID          string
-	ArrivalVenue               string
-	ArrivalCheckpointID        string
-	DisplayEnabled             bool
-	DisplayGoogleClientID      string
-	DisplayOperatorEmails      []string
-	DisplayAllowedOrigins      []string
-	DisplayTokenKey            string
-	PhotoBucket                string
-	PhotoSignerEmail           string
-	PushEnabled                bool
-	PushVAPIDPublicKey         string
-	PushVAPIDPrivateKey        string
-	PushVAPIDSubject           string
-	PushEncryptionKey          string
-	MemoryConsentVersion       string
-	LiveConsentVersion         string
-	OnSiteConsentVersion       string
-	ConsentLanguage            string
-	ConsentBody                string
-	Contact                    string
-	PositionIntervalSeconds    int
-	LivePositionTTL            time.Duration
-	MemorySessionTTL           time.Duration
-	LiveSessionTTL             time.Duration
-	DataRetention              time.Duration
-	CoordinateVersion          string
-	CampusGraphVersion         string
-	ThreeDMapVersion           string
-	MinLatitude                float64
-	MaxLatitude                float64
-	MinLongitude               float64
-	MaxLongitude               float64
-	OriginLatitude             float64
-	OriginLongitude            float64
-	PositionQuantizationMeters float64
-	MaxPositionAccuracyMeters  float64
+	Address                        string
+	DatabaseURL                    string
+	DatabaseMaxConnections         int
+	AllowedOrigins                 []string
+	EdgeSharedSecret               string
+	RegistrationOpen               bool
+	PhotoEnabled                   bool
+	PhotoMetadataEnabled           bool
+	ArrivalEnabled                 bool
+	OperatorEnabled                bool
+	OperatorGoogleClientID         string
+	OperatorEmails                 []string
+	OperatorAllowedOrigins         []string
+	ArrivalProofKey                string
+	ArrivalProofKeyID              string
+	ArrivalVenue                   string
+	ArrivalCheckpointID            string
+	DisplayEnabled                 bool
+	DisplayGoogleClientID          string
+	DisplayOperatorEmails          []string
+	DisplayAllowedOrigins          []string
+	DisplayTokenKey                string
+	PhotoBucket                    string
+	PhotoSignerEmail               string
+	PushEnabled                    bool
+	PushVAPIDPublicKey             string
+	PushVAPIDPrivateKey            string
+	PushVAPIDSubject               string
+	PushEncryptionKey              string
+	MemoryConsentVersion           string
+	PushAfterArrivalConsentVersion string
+	LiveConsentVersion             string
+	OnSiteConsentVersion           string
+	ConsentLanguage                string
+	ConsentBody                    string
+	Contact                        string
+	PositionIntervalSeconds        int
+	LivePositionTTL                time.Duration
+	MemorySessionTTL               time.Duration
+	LiveSessionTTL                 time.Duration
+	DataRetention                  time.Duration
+	CoordinateVersion              string
+	CampusGraphVersion             string
+	ThreeDMapVersion               string
+	MinLatitude                    float64
+	MaxLatitude                    float64
+	MinLongitude                   float64
+	MaxLongitude                   float64
+	OriginLatitude                 float64
+	OriginLongitude                float64
+	PositionQuantizationMeters     float64
+	MaxPositionAccuracyMeters      float64
 }
 
 func FromEnv() (Config, error) {
@@ -106,12 +107,22 @@ func FromEnv() (Config, error) {
 		cfg.DatabaseMaxConnections = n
 	}
 	cfg.MemoryConsentVersion = env("TRACE_MEMORY_CONSENT_VERSION", cfg.MemoryConsentVersion)
+	cfg.PushAfterArrivalConsentVersion = os.Getenv("TRACE_PUSH_AFTER_ARRIVAL_CONSENT_VERSION")
 	cfg.LiveConsentVersion = env("TRACE_LIVE_CONSENT_VERSION", cfg.LiveConsentVersion)
 	cfg.OnSiteConsentVersion = env("TRACE_ON_SITE_CONSENT_VERSION", cfg.OnSiteConsentVersion)
 	cfg.ConsentLanguage = env("TRACE_CONSENT_LANGUAGE", cfg.ConsentLanguage)
 	cfg.ConsentBody = env("TRACE_CONSENT_BODY", cfg.ConsentBody)
 	if cfg.MemoryConsentVersion == "2026-memory-01" {
 		return Config{}, fmt.Errorf("TRACE_MEMORY_CONSENT_VERSION must not reuse the retired GPS consent version")
+	}
+	if cfg.PushAfterArrivalConsentVersion != "" {
+		if cfg.PushAfterArrivalConsentVersion != cfg.MemoryConsentVersion {
+			return Config{}, fmt.Errorf("TRACE_PUSH_AFTER_ARRIVAL_CONSENT_VERSION must match TRACE_MEMORY_CONSENT_VERSION")
+		}
+		if os.Getenv("TRACE_MEMORY_CONSENT_VERSION") == "" || os.Getenv("TRACE_CONSENT_BODY") == "" ||
+			cfg.MemoryConsentVersion == Default().MemoryConsentVersion || cfg.ConsentBody == Default().ConsentBody {
+			return Config{}, fmt.Errorf("push after arrival requires a separately configured, reviewed memory consent version and body")
+		}
 	}
 	cfg.CoordinateVersion = env("TRACE_COORDINATE_VERSION", cfg.CoordinateVersion)
 	cfg.CampusGraphVersion = env("TRACE_CAMPUS_GRAPH_VERSION", cfg.CampusGraphVersion)

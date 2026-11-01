@@ -81,10 +81,10 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 			}
 			var expires time.Time
 			var stopped sql.NullTime
-			var deleting bool
+			var deleting, pushAfterArrival bool
 			var photoMode, graphVersion string
-			err := tx.q.QueryRowContext(ctx, `SELECT expires_at,stopped_at,deleting,photo_mode,COALESCE(campus_graph_version,'')
- FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &stopped, &deleting, &photoMode, &graphVersion)
+			err := tx.q.QueryRowContext(ctx, `SELECT expires_at,stopped_at,deleting,photo_mode,COALESCE(campus_graph_version,''),push_after_arrival
+ FROM memory_sessions WHERE id=$1 FOR UPDATE`, memoryID).Scan(&expires, &stopped, &deleting, &photoMode, &graphVersion, &pushAfterArrival)
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -122,8 +122,10 @@ func (s *Store) AcceptArrival(ctx context.Context, memoryID, linkTokenHash, arri
 						a.LivePresencePhase = "arrived"
 					}
 				}
-				if err := tx.EndPushForMemory(ctx, memoryID); err != nil {
-					return err
+				if !pushAfterArrival {
+					if err := tx.EndPushForMemory(ctx, memoryID); err != nil {
+						return err
+					}
 				}
 				var count int
 				if err := tx.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM arrival_events a

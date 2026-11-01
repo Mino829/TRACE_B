@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Mino829/trace_Backend/internal/api"
 	"github.com/Mino829/trace_Backend/internal/config"
@@ -112,4 +113,93 @@ func TestPushUnavailableByDefault(t *testing.T) {
 	if r.Code != 503 {
 		t.Fatalf("disabled push status %d", r.Code)
 	}
+}
+
+func TestPushAfterArrivalConsentIsEnrollmentSnapshot(t *testing.T) {
+	f := testdb.Open(t)
+	cfg, sender, public, auth := testPushConfig(t)
+	operator := arrivalConfig(t, f)
+	cfg.ArrivalEnabled = true
+	cfg.ArrivalProofKey, cfg.ArrivalProofKeyID = operator.ArrivalProofKey, operator.ArrivalProofKeyID
+	cfg.ArrivalVenue, cfg.ArrivalCheckpointID = operator.ArrivalVenue, operator.ArrivalCheckpointID
+	cfg.OperatorEnabled, cfg.OperatorGoogleClientID = operator.OperatorEnabled, operator.OperatorGoogleClientID
+	cfg.OperatorEmails, cfg.OperatorAllowedOrigins = operator.OperatorEmails, operator.OperatorAllowedOrigins
+	cfg.MemoryConsentVersion = "2026-10-31-v1"
+	cfg.ConsentBody = "写真撮影の通知は到着時に終了します。"
+	original := api.New(cfg, f.Store, nil, sender)
+	oldArrived := createExperience(t, original, cfg)
+	oldWaiting := createExperience(t, original, cfg)
+	body := fmt.Sprintf(`{"consent":true,"subscription":{"endpoint":"https://fcm.googleapis.com/fcm/send/arrival-private-token","keys":{"p256dh":%q,"auth":%q}},"intervalMinutes":30}`, public, auth)
+	toggle := func(h http.Handler, owner createdExperience, method, input string, want int) {
+		t.Helper()
+		path := "/v1/memory-sessions/" + owner.Memory.SessionID + "/push-subscription"
+		r := request(t, h, method, path, input, map[string]string{"Authorization": "Bearer " + owner.Memory.ParticipantToken})
+		if r.Code != want {
+			t.Fatalf("%s push: got %d, want %d: %s", method, r.Code, want, r.Body.String())
+		}
+		if bytes.Contains(r.Body.Bytes(), []byte("arrival-private-token")) || bytes.Contains(r.Body.Bytes(), []byte(auth)) {
+			t.Fatal("push response exposed subscription credentials")
+		}
+	}
+	arrive := func(h http.Handler, owner createdExperience, key string) {
+		t.Helper()
+		if r := arriveRequest(t, h, owner, projectedProof(t, h), key); r.code != http.StatusOK {
+			t.Fatalf("arrival: %d %s", r.code, r.body)
+		}
+	}
+	assertSnapshot := func(owner createdExperience, wantPolicy, wantStopped bool) {
+		t.Helper()
+		var policy, stopped bool
+		if err := f.SQL.QueryRowContext(t.Context(), `SELECT push_after_arrival,push_stopped FROM memory_sessions WHERE id=$1`, owner.Memory.SessionID).Scan(&policy, &stopped); err != nil || policy != wantPolicy || stopped != wantStopped {
+			t.Fatalf("enrollment snapshot policy=%t stopped=%t, want %t/%t: %v", policy, stopped, wantPolicy, wantStopped, err)
+		}
+	}
+	toggle(original, oldArrived, http.MethodPut, body, http.StatusOK)
+	toggle(original, oldWaiting, http.MethodPut, body, http.StatusOK)
+	arrive(original, oldArrived, "old-before-rollout")
+	assertSnapshot(oldArrived, false, true)
+
+	cfg.MemoryConsentVersion = "2026-11-01-photo-after-arrival-v2"
+	cfg.ConsentBody = "写真撮影の通知は到着後も継続します。通知は任意で停止できます。"
+	cfg.PushAfterArrivalConsentVersion = cfg.MemoryConsentVersion
+	reviewed := api.New(cfg, f.Store, nil, sender)
+	mismatch := fmt.Sprintf(`{"memoryConsentVersion":"2026-10-31-v1","consentLanguage":%q,"clientTime":%q}`, cfg.ConsentLanguage, time.Now().UTC().Format(time.RFC3339Nano))
+	if r := request(t, reviewed, http.MethodPost, "/v1/experiences", mismatch, nil); r.Code != http.StatusConflict || !bytes.Contains(r.Body.Bytes(), []byte("CONSENT_VERSION_MISMATCH")) {
+		t.Fatalf("old consent accepted after rollout: %d %s", r.Code, r.Body.String())
+	}
+	enrolled := createExperience(t, reviewed, cfg)
+	waitingEnrolled := createExperience(t, reviewed, cfg)
+	toggle(reviewed, waitingEnrolled, http.MethodPut, body, http.StatusOK)
+	assertSnapshot(enrolled, true, false)
+	var count int
+	if err := f.SQL.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM push_subscriptions WHERE memory_session_id=$1`, enrolled.Memory.SessionID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("policy enrolled push without explicit opt-in: count=%d err=%v", count, err)
+	}
+	toggle(reviewed, enrolled, http.MethodPut, body, http.StatusOK)
+	arrive(reviewed, enrolled, "reviewed-after-rollout")
+	toggle(reviewed, enrolled, http.MethodPut, body, http.StatusOK)
+	toggle(reviewed, enrolled, http.MethodPatch, `{"status":"paused"}`, http.StatusOK)
+	toggle(reviewed, enrolled, http.MethodPatch, `{"status":"active","intervalMinutes":30}`, http.StatusOK)
+	assertSnapshot(enrolled, true, false)
+	arrive(reviewed, oldWaiting, "old-after-rollout")
+	for _, owner := range []createdExperience{oldArrived, oldWaiting} {
+		toggle(reviewed, owner, http.MethodPut, body, http.StatusConflict)
+		toggle(reviewed, owner, http.MethodPatch, `{"status":"paused"}`, http.StatusConflict)
+		toggle(reviewed, owner, http.MethodPatch, `{"status":"active"}`, http.StatusConflict)
+		assertSnapshot(owner, false, true)
+	}
+
+	cfg.PushAfterArrivalConsentVersion = ""
+	restarted := api.New(cfg, f.Store, nil, sender)
+	arrive(restarted, waitingEnrolled, "reviewed-before-policy-disabled")
+	toggle(restarted, waitingEnrolled, http.MethodPut, body, http.StatusOK)
+	toggle(restarted, waitingEnrolled, http.MethodPatch, `{"status":"active"}`, http.StatusOK)
+	assertSnapshot(waitingEnrolled, true, false)
+	toggle(restarted, enrolled, http.MethodPut, body, http.StatusOK)
+	toggle(restarted, enrolled, http.MethodPatch, `{"status":"active"}`, http.StatusOK)
+	assertSnapshot(enrolled, true, false)
+	withoutPolicy := createExperience(t, restarted, cfg)
+	toggle(restarted, withoutPolicy, http.MethodPut, body, http.StatusOK)
+	arrive(restarted, withoutPolicy, "reviewed-version-policy-disabled")
+	assertSnapshot(withoutPolicy, false, true)
 }

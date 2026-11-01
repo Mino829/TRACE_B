@@ -306,6 +306,7 @@ func (s *Server) createExperience(w http.ResponseWriter, r *http.Request) {
 		ExperienceID: experienceID, MemorySessionID: memoryID,
 		MemoryTokenHash:    hash(memoryToken),
 		MemoryConsent:      input.MemoryConsentVersion,
+		PushAfterArrival:   s.cfg.PushAfterArrivalConsentVersion != "" && s.cfg.PushAfterArrivalConsentVersion == input.MemoryConsentVersion,
 		ConsentLanguage:    input.ConsentLanguage,
 		CampusGraphVersion: s.cfg.CampusGraphVersion,
 		CreatedAt:          now, MemoryExpiresAt: memoryExpires, MemoryDeleteAfter: memoryDeleteAfter,
