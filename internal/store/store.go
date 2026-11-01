@@ -62,6 +62,7 @@ type NewExperience struct {
 	CreatedAt, MemoryExpiresAt, MemoryDeleteAfter        time.Time
 	LiveExpiresAt, LiveDeleteAfter                       time.Time
 	LivePresence                                         bool
+	PushAfterArrival                                     bool
 }
 type ExperienceState struct {
 	ExperienceID, MemorySessionID, LiveSessionID string
@@ -188,8 +189,8 @@ func (s *Store) CreateExperience(ctx context.Context, v NewExperience) error {
 			graphVersion = v.CampusGraphVersion
 		}
 		_, err := tx.q.ExecContext(ctx, `INSERT INTO memory_sessions
-  (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after,campus_graph_version,photo_mode)
-  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, v.MemorySessionID, v.MemoryConsent, v.ConsentLanguage, v.MemoryTokenHash, v.CreatedAt, v.MemoryExpiresAt, v.MemoryDeleteAfter, graphVersion, photoMode(v.PhotoMode))
+  (id,consent_version,consent_language,token_hash,created_at,expires_at,delete_after,campus_graph_version,photo_mode,push_after_arrival)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, v.MemorySessionID, v.MemoryConsent, v.ConsentLanguage, v.MemoryTokenHash, v.CreatedAt, v.MemoryExpiresAt, v.MemoryDeleteAfter, graphVersion, photoMode(v.PhotoMode), v.PushAfterArrival)
 		if err != nil {
 			return err
 		}
@@ -564,7 +565,11 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 			return err
 		}
 		for _, query := range []string{
-			"DELETE FROM push_subscriptions WHERE expires_at<=$1 OR memory_session_id IN (SELECT e.memory_session_id FROM experiences e JOIN live_presence_sessions l ON l.id=e.live_session_id WHERE l.expires_at<=$1 OR l.tracking_status<>'tracking' OR l.presence_phase IN ('arrived','on_site'))",
+			`DELETE FROM push_subscriptions WHERE expires_at<=$1 OR memory_session_id IN (
+ SELECT m.id FROM memory_sessions m WHERE m.expires_at<=$1 OR m.deleting OR m.push_stopped OR m.stopped_at IS NOT NULL
+ OR EXISTS (SELECT 1 FROM experiences e JOIN live_presence_sessions l ON l.id=e.live_session_id
+ WHERE e.memory_session_id=m.id AND (l.expires_at<=$1 OR l.tracking_status<>'tracking'
+ OR (NOT m.push_after_arrival AND l.presence_phase IN ('arrived','on_site')))))`,
 			"UPDATE live_presence_sessions SET tracking_status='expired',presence_phase='ended' WHERE expires_at<=$1 AND tracking_status='tracking'",
 			"DELETE FROM experience_links WHERE expires_at<=$1",
 			"DELETE FROM experiences WHERE delete_after<=$1",

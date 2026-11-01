@@ -137,7 +137,19 @@ IPはWorker経由なら共有シークレット検証後の`X-Trace-Client-IP`�
 
 Memory Bearer tokenで`PUT /v1/memory-sessions/{memorySessionId}/push-subscription`へ`{"consent":true,"subscription":{"endpoint":"https://...","keys":{"p256dh":"base64url","auth":"base64url"}},"intervalMinutes":30}`を送ります。許可・説明後の参加者操作だけで`consent:true`を送信してください。endpointは許可したHTTPS Push serviceだけを受け付け、外部URLを無条件にフェッチしません。`PATCH`は`{"intervalMinutes":30}`または`{"status":"paused"}` / `{"status":"active"}`を受け付け、`DELETE`（空body）は204で未送信予定と鍵を消去します。PUT/PATCHは`status`、`intervalMinutes`、`nextSendAt`、`expiresAt`だけを返し、endpointや鍵は返しません。
 
-10秒ごとに最大50件を抽出し、DB内のMemoryロックと状態再確認のもと、5秒以内にプロバイダへ送信します。送信時刻は厳密には保証しません。payloadは固定の一般文面と相対URL`/photo`だけで、位置・写真・セッションID・参加記号を含みません。正常2xxでは次回を間隔後へ、404/410では鍵を削除、その他の失敗は1分後に再試行します。Web Pushに配信のexactly-once保証はなく、プロバイダ受理後DB commit失敗時には重複し得ます。写真の初回`ready`時は同じトランザクションで次回を延期します。Memory削除準備・Memory/Live削除・Live停止・到着確定・期限清掃は購読も削除します。到着時は同じMemory Storeトランザクション内で`push_stopped=true`を確定し、再購読を禁止します。単純解除は再購読可能です。
+10秒ごとに最大50件を抽出し、DB内のMemoryロックと状態再確認のもと、5秒以内にプロバイダへ送信します。送信時刻は厳密には保証しません。payloadは固定の一般文面と相対URL`/photo`だけで、位置・写真・セッションID・参加記号を含みません。正常2xxでは次回を間隔後へ、404/410では鍵を削除、その他の失敗は1分後に再試行します。Web Pushに配信のexactly-once保証はなく、プロバイダ受理後DB commit失敗時には重複し得ます。写真の初回`ready`時は同じトランザクションで次回を延期します。Memory削除準備・Memory/Live削除・参加/Live停止・期限清掃は購読も削除します。単純解除は再購読可能ですが、参加停止は再開しません。到着で停止するかは新規参加時の同意方針で固定し、既定と既存Memoryは従来どおり到着時に同じtransactionで`push_stopped=true`を確定して購読を削除・再購読を禁止します。
+
+### 到着後も継続する同意方針
+
+Frontend #94に対応する到着後通知は、`TRACE_PUSH_AFTER_ARRIVAL_CONSENT_VERSION`を空以外に設定した場合だけ、新規参加に適用できます。現行の`TRACE_MEMORY_CONSENT_VERSION`との完全一致と、明示設定された非既定の同意版・本文を必須にします。本文の意味や正式な承認をコードが判定するものではありません。到着後も期限まで通知すること、任意性、解除・参加停止・削除で止まることをレビューし、従来の「到着で停止」と異なる新しい版・文面を用意してください。本番の既存同意版をそのまま継続用として再利用しないでください。
+
+`020_push_after_arrival.sql`で`memory_sessions.push_after_arrival BOOLEAN NOT NULL DEFAULT FALSE`を追加します。作成APIが受け付けた同意版と継続用同意版が一致した新しいMemoryにだけtrueを保存します。公開APIの入力・応答形は変更せず、クライアントがこの値を指定する入力も追加しません。migrationは既存行をtrueにせず、既存の同意・期限・資格・`push_stopped`を変更しません。設定の後付けやPushのPUT/PATCHでは既存Memoryを昇格できません。
+
+保存済みtrueのMemoryでは、到着・`arrived`/`on_site`だけを理由に購読を終了・清掃しません。新たな明示的Push同意とブラウザの通知許可は従来どおり必要で、到着だけで購読を作成・復元しません。本人の参加/Live停止、追跡停止、期限、削除、通知解除、providerの404/410、運営の全通知停止は引き続き配信を止めます。一度確定した`push_stopped`は解除しません。保存済み方針は設定切替後も参加期限まで維持し、継続用設定を空に戻しても既存trueをfalseへ書き換えません。全通知の即時停止は既存の運営操作または`TRACE_PUSH_ENABLED=false`を使います。
+
+配備は別承認です。既存の単一revision切替手順・バックアップのもとmigration 020を適用し、runtime権限の検証をschema 20で行い、API・通知dispatcher・cleanupを同じ対応版へ更新してください。継続用設定は全実行元の更新が終わるまで空にし、レビュー済みの新同意版・本文と合わせて有効化します。旧版cleanupを混在させると継続対象の購読も削除されます。以前の到着で消えた購読を復元したり、旧参加者へ無条件に通知を延長したりしません。Frontend #94の表示だけでは既存参加の同意方針は変わらず、旧MemoryでON表示と実際の配信が一致しない場合は同意を保護するBackendの停止が優先します。
+
+検証は隔離PostgreSQLでの到着・購読・更新・配信・清掃・停止・migration回帰と、実Go HTTPサーバーの変更前後smokeで行います。ローカルTLS配信sinkはOS/ブラウザの実Web Push受信ではなく、実機での許可・配信確認や新同意文の承認を代替しません。
 
 ## 個人別Google運営認証（既定無効）
 

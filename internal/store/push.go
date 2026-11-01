@@ -50,7 +50,8 @@ func (s *Store) pushEligible(ctx context.Context, id string, now time.Time) (tim
    (SELECT l.expires_at FROM experiences e JOIN live_presence_sessions l ON l.id=e.live_session_id
     WHERE e.memory_session_id=m.id),m.expires_at)),m.deleting,m.push_stopped OR m.stopped_at IS NOT NULL OR
   EXISTS (SELECT 1 FROM experiences e JOIN live_presence_sessions l ON l.id=e.live_session_id
-    WHERE e.memory_session_id=m.id AND (l.tracking_status<>'tracking' OR l.expires_at<=$2 OR l.presence_phase IN ('arrived','on_site')))
+    WHERE e.memory_session_id=m.id AND (l.tracking_status<>'tracking' OR l.expires_at<=$2
+    OR (NOT m.push_after_arrival AND l.presence_phase IN ('arrived','on_site'))))
   FROM memory_sessions m WHERE m.id=$1 FOR UPDATE`, id, now).Scan(&expires, &deleting, &stopped)
 	if errors.Is(err, sql.ErrNoRows) {
 		return expires, ErrNotFound
@@ -111,14 +112,16 @@ func (s *Store) PostponePush(ctx context.Context, id string, now time.Time) erro
 }
 
 // StopPushForMemory removes credentials but allows the participant to subscribe
-// again. Arrival and participation/Live stop must instead use EndPushForMemory.
+// again if otherwise eligible. Participation/Live stop and arrival without the
+// stored continuation policy must instead use EndPushForMemory.
 func (s *Store) StopPushForMemory(ctx context.Context, id string) error {
 	_, err := s.q.ExecContext(ctx, `DELETE FROM push_subscriptions WHERE memory_session_id=$1`, id)
 	return err
 }
 
-// EndPushForMemory terminally fences arrival and participation/Live stop. Call
-// on the same Store tx committing that transition, even without a Live session.
+// EndPushForMemory terminally fences participation/Live stop and arrival without
+// the stored continuation policy. Call on the same Store tx committing that
+// transition, even without a Live session. A later policy change never resets it.
 func (s *Store) EndPushForMemory(ctx context.Context, id string) error {
 	result, err := s.q.ExecContext(ctx, `UPDATE memory_sessions SET push_stopped=TRUE WHERE id=$1`, id)
 	if err != nil {

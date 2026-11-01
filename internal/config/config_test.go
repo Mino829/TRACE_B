@@ -13,6 +13,7 @@ func baseEnv(t *testing.T) {
 	}
 	for _, key := range []string{"TRACE_PHOTO_ENABLED", "TRACE_PHOTO_METADATA_ENABLED", "TRACE_PHOTO_BUCKET", "TRACE_PHOTO_SIGNER_EMAIL",
 		"TRACE_PUSH_ENABLED", "TRACE_PUSH_VAPID_PUBLIC_KEY", "TRACE_PUSH_VAPID_PRIVATE_KEY", "TRACE_PUSH_VAPID_SUBJECT", "TRACE_PUSH_ENCRYPTION_KEY",
+		"TRACE_PUSH_AFTER_ARRIVAL_CONSENT_VERSION",
 		"TRACE_ARRIVAL_ENABLED", "TRACE_ARRIVAL_ISSUER_KEY", "TRACE_ARRIVAL_PROOF_KEY", "TRACE_ARRIVAL_VENUE", "TRACE_ARRIVAL_CHECKPOINT_ID",
 		"TRACE_ARRIVAL_PROOF_KEY_ID", "TRACE_OPERATOR_ENABLED", "TRACE_OPERATOR_GOOGLE_CLIENT_ID", "TRACE_OPERATOR_EMAILS", "TRACE_OPERATOR_ALLOWED_ORIGINS",
 		"TRACE_DISPLAY_ENABLED", "TRACE_DISPLAY_GOOGLE_CLIENT_ID", "TRACE_DISPLAY_OPERATOR_EMAILS", "TRACE_DISPLAY_ALLOWED_ORIGINS", "TRACE_DISPLAY_TOKEN_KEY"} {
@@ -146,6 +147,42 @@ func TestDevicePhotosKeepIntakeClosedUntilConsentIsConfigured(t *testing.T) {
 	t.Setenv("TRACE_PHOTO_ENABLED", "true")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("device mode reopened server image uploads")
+	}
+}
+func TestPushAfterArrivalRequiresExplicitReviewedMatchingConsent(t *testing.T) {
+	const reviewedVersion = "2026-11-01-photo-after-arrival-v2"
+	const reviewedBody = "写真撮影の通知は到着後も継続します。通知は任意で停止できます。"
+	for _, tc := range []struct {
+		name, version, body, target, wantError string
+	}{
+		{name: "disabled by default"},
+		{name: "reviewed consent without policy", version: reviewedVersion, body: reviewedBody},
+		{name: "mismatched version", version: reviewedVersion, body: reviewedBody, target: "other-version", wantError: "must match"},
+		{name: "implicit default version", body: reviewedBody, target: Default().MemoryConsentVersion, wantError: "reviewed memory consent"},
+		{name: "explicit default version", version: Default().MemoryConsentVersion, body: reviewedBody, target: Default().MemoryConsentVersion, wantError: "reviewed memory consent"},
+		{name: "implicit default body", version: reviewedVersion, target: reviewedVersion, wantError: "reviewed memory consent"},
+		{name: "explicit default body", version: reviewedVersion, body: Default().ConsentBody, target: reviewedVersion, wantError: "reviewed memory consent"},
+		{name: "reviewed policy with intake closed", version: reviewedVersion, body: reviewedBody, target: reviewedVersion},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			baseEnv(t)
+			t.Setenv("TRACE_MEMORY_CONSENT_VERSION", tc.version)
+			t.Setenv("TRACE_CONSENT_BODY", tc.body)
+			t.Setenv("TRACE_PUSH_AFTER_ARRIVAL_CONSENT_VERSION", tc.target)
+			cfg, err := FromEnv()
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("expected %q configuration error, got %v", tc.wantError, err)
+				}
+				if strings.Contains(err.Error(), reviewedBody) {
+					t.Fatal("configuration error exposed consent body")
+				}
+				return
+			}
+			if err != nil || cfg.PushAfterArrivalConsentVersion != tc.target || cfg.RegistrationOpen || cfg.PushEnabled {
+				t.Fatalf("policy configuration unexpectedly changed intake or push: %v", err)
+			}
+		})
 	}
 }
 
